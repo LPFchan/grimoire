@@ -1,0 +1,51 @@
+.../server/webui/src/lib/services/chat.service.ts  | 26 +++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/webui/src/lib/services/chat.service.ts b/tools/server/webui/src/lib/services/chat.service.ts
+index 52d7ea6..0b15b76 100644
+--- a/tools/server/webui/src/lib/services/chat.service.ts
++++ b/tools/server/webui/src/lib/services/chat.service.ts
+@@ -476,11 +476,15 @@ export class ChatService {
+ 
+ 		try {
+ 			let chunk = '';
++			let streamEnded = false;
+ 			while (true) {
+ 				if (abortSignal?.aborted) break;
+ 
+ 				const { done, value } = await reader.read();
+-				if (done) break;
++				if (done) {
++					streamEnded = true;
++					break;
++				}
+ 
+ 				if (abortSignal?.aborted) break;
+ 
+@@ -550,6 +554,26 @@ export class ChatService {
+ 
+ 			if (abortSignal?.aborted) return;
+ 
++			// Flush decoder and process any remaining buffered data
++			chunk += decoder.decode();
++			if (chunk) {
++				const remainingLines = chunk.split('\n');
++				for (const line of remainingLines) {
++					if (abortSignal?.aborted) break;
++					if (line.startsWith(UrlProtocol.DATA)) {
++						const data = line.slice(6);
++						if (data === '[DONE]') {
++							streamFinished = true;
++							continue;
++						}
++					}
++				}
++			}
++
++			if (!streamFinished && streamEnded) {
++				streamFinished = true;
++			}
++
+ 			if (streamFinished) {
+ 				finalizeOpenToolCallBatch();
+
