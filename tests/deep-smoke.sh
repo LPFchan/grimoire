@@ -97,7 +97,7 @@ chat_once() {
     header "chat with $model"
     local resp=$(curl -sf -H "Authorization: Bearer ${KEY}" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}],\"max_tokens\":32,\"stream\":false}" \
+        -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}],\"max_tokens\":256,\"stream\":false}" \
         "${BASE}/v1/chat/completions" 2>&1)
     local code=$?
     if [ "$code" != "0" ]; then

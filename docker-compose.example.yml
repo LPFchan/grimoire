@@ -10,6 +10,7 @@ services:
       - grimoire_state:/var/lib/grimoire
     environment:
       - GRIMOIRE_API_KEY=changeme
+      - TURBO_AUTO_ASYMMETRIC=0
       - STRUCTURED_COT=0
       - STRUCTURED_TOOL=0
       - STRUCTURED_TOOL_FALLBACK=0
