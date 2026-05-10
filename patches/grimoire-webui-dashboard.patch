@@ -134,7 +134,7 @@ index 0000000..edc22f2
 +		return `${w.toFixed(1)} W`;
 +	}
 +
-+	type Sparkline = { line: string; area: string };
++	type Sparkline = { line: string; area: string; lo: number; hi: number };
 +
 +	function buildSparkline(
 +		raw: Array<number | null> | undefined,
@@ -142,7 +142,7 @@ index 0000000..edc22f2
 +		height: number
 +	): Sparkline {
 +		const values = raw ?? [];
-+		if (values.length === 0) return { line: '', area: '' };
++		if (values.length === 0) return { line: '', area: '', lo: 0, hi: 1 };
 +		let lo = Number.POSITIVE_INFINITY;
 +		let hi = Number.NEGATIVE_INFINITY;
 +		for (const v of values) {
@@ -170,11 +170,48 @@ index 0000000..edc22f2
 +			if (isNum) lastY = y;
 +		}
 +		const area = `${line} L${width.toFixed(2)},${height.toFixed(2)} L0,${height.toFixed(2)} Z`;
-+		return { line, area };
++		return { line, area, lo, hi };
 +	}
 +
 +	function gpuLabel(idx: number, suffix: string): string {
 +		return `GPU${idx} ${suffix}`;
++	}
++
++	type HoverInfo = { idx: number; x: number; value: number };
++	let hoverState = $state<Record<string, HoverInfo | undefined>>({});
++
++	function handleSparkMouseMove(
++		e: MouseEvent,
++		cardKey: string,
++		values: Array<number | null>,
++		lo: number,
++		hi: number
++	) {
++		const svg = e.currentTarget as SVGSVGElement;
++		const rect = svg.getBoundingClientRect();
++		const scaleX = SPARK_W / rect.width;
++		const svgX = (e.clientX - rect.left) * scaleX;
++		if (values.length === 0) return;
++		const dx = values.length > 1 ? SPARK_W / (values.length - 1) : 0;
++		let bestIdx = 0;
++		let bestDist = Infinity;
++		for (let i = 0; i < values.length; i++) {
++			const dist = Math.abs(i * dx - svgX);
++			if (dist < bestDist) { bestDist = dist; bestIdx = i; }
++		}
++		const val = values[bestIdx];
++		if (val == null || !Number.isFinite(val)) {
++			hoverState = { ...hoverState, [cardKey]: undefined };
++			return;
++		}
++		hoverState = {
++			...hoverState,
++			[cardKey]: { idx: bestIdx, x: bestIdx * dx, value: val }
++		};
++	}
++
++	function clearHover(cardKey: string) {
++		hoverState = { ...hoverState, [cardKey]: undefined };
 +	}
 +
 +	const SPARK_W = 280;
@@ -242,23 +279,46 @@ index 0000000..edc22f2
 +	</section>
 +
 +	<section class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-+		{#snippet statCard(title: string, value: string, series: Array<number | null> | undefined, accent: string)}
++		{#snippet statCard(title: string, value: string, series: Array<number | null> | undefined, accent: string, formatFn: (n: number) => string)}
 +			{@const spark = buildSparkline(series, SPARK_W, SPARK_H)}
++			{@const values = series ?? []}
++			{@const hov = hoverState[title]}
 +			<div class="flex flex-col rounded-xl border bg-card/40 p-4">
 +				<div class="text-xs font-medium uppercase tracking-widest text-muted-foreground">
 +					{title}
 +				</div>
-+				<div class="my-2 text-3xl font-semibold tabular-nums">{value}</div>
++				<div class="my-2 text-3xl font-semibold tabular-nums transition-colors" class:text-primary={hov != null}>
++					{hov != null ? formatFn(hov.value) : value}
++				</div>
 +				<svg
 +					viewBox={`0 0 ${SPARK_W} ${SPARK_H}`}
-+					class="h-14 w-full"
++					class="h-14 w-full cursor-crosshair"
 +					preserveAspectRatio="none"
 +					style:color={accent}
-+					aria-hidden="true"
++					onmousemove={(e) => handleSparkMouseMove(e, title, values, spark.lo, spark.hi)}
++					onmouseleave={() => clearHover(title)}
 +				>
 +					{#if spark.area}
 +						<path d={spark.area} fill="currentColor" fill-opacity="0.18" />
 +						<path d={spark.line} fill="none" stroke="currentColor" stroke-width="1.5" />
++					{/if}
++					{#if hov != null}
++						{@const dotY = SPARK_H - ((hov.value - spark.lo) / (spark.hi - spark.lo)) * SPARK_H}
++						<line
++							x1={hov.x} y1="0"
++							x2={hov.x} y2={SPARK_H}
++							stroke="currentColor"
++							stroke-width="1"
++							stroke-dasharray="3 3"
++							opacity="0.5"
++						/>
++						<circle
++							cx={hov.x} cy={dotY}
++							r="4"
++							fill="currentColor"
++							stroke="var(--background)"
++							stroke-width="1.5"
++						/>
 +					{/if}
 +				</svg>
 +			</div>
@@ -268,14 +328,16 @@ index 0000000..edc22f2
 +			'Input tokens',
 +			fmtTokens(data?.tokens.input.current),
 +			data?.tokens.input.series,
-+			'oklch(0.72 0.16 252)'
++			'oklch(0.72 0.16 252)',
++			fmtTokens
 +		)}
 +
 +		{@render statCard(
 +			'Output tokens',
 +			fmtTokens(data?.tokens.output.current),
 +			data?.tokens.output.series,
-+			'oklch(0.74 0.16 152)'
++			'oklch(0.74 0.16 152)',
++			fmtTokens
 +		)}
 +
 +		{#each cardsForGpus as gpu (gpu.index)}
@@ -283,13 +345,15 @@ index 0000000..edc22f2
 +				gpuLabel(gpu.index, 'temp'),
 +				fmtTemp(gpu.temp.current),
 +				gpu.temp.series,
-+				'oklch(0.72 0.18 30)'
++				'oklch(0.72 0.18 30)',
++				fmtTemp
 +			)}
 +			{@render statCard(
 +				gpuLabel(gpu.index, 'power'),
 +				fmtPower(gpu.power.current),
 +				gpu.power.series,
-+				'oklch(0.78 0.16 80)'
++				'oklch(0.78 0.16 80)',
++				fmtPower
 +			)}
 +		{/each}
 +
@@ -297,7 +361,8 @@ index 0000000..edc22f2
 +			'CPU temp',
 +			fmtTemp(data?.cpu.temp.current),
 +			data?.cpu.temp.series,
-+			'oklch(0.72 0.16 320)'
++			'oklch(0.72 0.16 320)',
++			fmtTemp
 +		)}
 +	</section>
 +</div>
