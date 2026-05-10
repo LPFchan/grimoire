@@ -207,7 +207,7 @@
 </svelte:head>
 
 <div class="flex h-full w-full flex-col overflow-auto px-6 py-6 md:px-10 md:py-8">
-	<header class="mb-6 flex flex-wrap items-center justify-end gap-4">
+	<header class="sticky top-0 z-10 -mx-6 -mt-6 mb-4 flex flex-wrap items-center justify-end gap-4 bg-background/80 px-6 py-3 backdrop-blur-sm">
 		<div class="inline-flex rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Window">
 			{#each WINDOWS as w}
 				<button
@@ -331,6 +331,22 @@
 			fmtTokens
 		)}
 
+		{@render statCard(
+			'CPU temp',
+			fmtTemp(data?.cpu.temp.current),
+			data?.cpu.temp.series,
+			'oklch(0.72 0.16 320)',
+			fmtTemp
+		)}
+
+		{@render statCard(
+			'CPU power',
+			fmtPower(data?.cpu.power.current),
+			data?.cpu.power.series,
+			'oklch(0.75 0.18 120)',
+			fmtPower
+		)}
+
 		{#each cardsForGpus as gpu (gpu.index)}
 			{@render statCard(
 				gpuLabel(gpu.index, 'temp'),
@@ -361,22 +377,6 @@
 				fmtTps
 			)}
 		{/each}
-
-		{@render statCard(
-			'CPU temp',
-			fmtTemp(data?.cpu.temp.current),
-			data?.cpu.temp.series,
-			'oklch(0.72 0.16 320)',
-			fmtTemp
-		)}
-
-		{@render statCard(
-			'CPU power',
-			fmtPower(data?.cpu.power.current),
-			data?.cpu.power.series,
-			'oklch(0.75 0.18 120)',
-			fmtPower
-		)}
 
 		{@render statCard(
 			'Fan 1',
