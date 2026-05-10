@@ -37,7 +37,7 @@ def build_cmd(cfg, port, ctx_size_override=None):
     cmd = [
         LLAMA_SERVER_BIN,
         "--model", model_path,
-        "--host", "0.0.0.0",
+        "--host", "127.0.0.1",
         "--port", str(port),
         "--ctx-size", str(ctx_size),
         "--n-gpu-layers", "999",

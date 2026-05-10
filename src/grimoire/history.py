@@ -39,6 +39,7 @@ class HistoryStore:
 
     def _connect(self):
         conn = sqlite3.connect(self.path)
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.row_factory = sqlite3.Row
         return conn
 

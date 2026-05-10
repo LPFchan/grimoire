@@ -97,7 +97,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     GRIMOIRE_MODELS_DIR=/models \
-    GRIMOIRE_REGISTRY_PATH=/etc/grimoire/models.json \
+    GRIMOIRE_REGISTRY_PATH=/var/lib/grimoire/models.json \
+    GRIMOIRE_REGISTRY_SEED_PATH=/etc/grimoire/models.json \
     LD_LIBRARY_PATH=/opt/model-a-llama-cpp/lib:/opt/model-a-llama-cpp/lib64 \
     PATH=/opt/grimoire-venv/bin:$PATH
 

@@ -12,8 +12,10 @@ from threading import RLock
 logger = logging.getLogger(__name__)
 
 MODELS_DIR = os.environ.get("GRIMOIRE_MODELS_DIR", "/models")
-DEFAULT_REGISTRY_PATH = "/etc/grimoire/models.json"
+DEFAULT_REGISTRY_PATH = "/var/lib/grimoire/models.json"
+DEFAULT_REGISTRY_SEED_PATH = "/etc/grimoire/models.json"
 REGISTRY_PATH = os.environ.get("GRIMOIRE_REGISTRY_PATH", DEFAULT_REGISTRY_PATH)
+REGISTRY_SEED_PATH = os.environ.get("GRIMOIRE_REGISTRY_SEED_PATH", DEFAULT_REGISTRY_SEED_PATH)
 
 
 class ModelRegistry:
@@ -26,8 +28,9 @@ class ModelRegistry:
     }
     """
 
-    def __init__(self, path=None):
+    def __init__(self, path=None, seed_path=None):
         self.path = path or REGISTRY_PATH
+        self.seed_path = REGISTRY_SEED_PATH if seed_path is None else seed_path
         self._lock = RLock()
         self._stamp = None
         self._data = {"models": {}, "fixed": {}}
@@ -46,8 +49,11 @@ class ModelRegistry:
         return {**data, "models": models, "fixed": fixed}
 
     def _load(self):
+        path = self.path
+        if not os.path.exists(path) and self.seed_path and os.path.exists(self.seed_path):
+            path = self.seed_path
         try:
-            with open(self.path) as f:
+            with open(path) as f:
                 return self._normalize(json.load(f))
         except FileNotFoundError:
             return {"models": {}, "fixed": {}}

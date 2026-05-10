@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+import signal
 import subprocess
 import urllib.parse
 from datetime import datetime, timezone
@@ -46,9 +47,37 @@ def _env_int(name, default):
         return default
 
 
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 DEFAULT_STARTUP_TIMEOUT = _env_int("GRIMOIRE_STARTUP_TIMEOUT", 600)
 MAX_HISTORY_CAPTURE_BYTES = _env_int("GRIMOIRE_HISTORY_CAPTURE_BYTES", 2 * 1024 * 1024)
+MAX_USAGE_CAPTURE_BYTES = _env_int("GRIMOIRE_USAGE_CAPTURE_BYTES", 1024 * 1024)
 LEGACY_STATS_PATH = os.environ.get("GRIMOIRE_LEGACY_STATS_PATH", "/var/lib/grimoire/token-stats.json")
+ALLOW_ANONYMOUS = _env_bool("GRIMOIRE_ALLOW_ANONYMOUS", False)
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+SENSITIVE_PROXY_HEADERS = {
+    "authorization",
+    "cookie",
+    "x-grimoire-token",
+    "x-api-key",
+}
 
 
 def parse_args():
@@ -74,6 +103,8 @@ def _valid_cookie(request):
 def require_api(request):
     """Require the shared API key for public API and history endpoints."""
     if not API_KEY:
+        if not ALLOW_ANONYMOUS:
+            raise HTTPException(status_code=503, detail="GRIMOIRE_API_KEY or GATEWAY_API_KEY is required")
         return "anonymous", identity_hash("anonymous")
     token = _request_token(request)
     if token and hmac.compare_digest(token, API_KEY):
@@ -99,6 +130,11 @@ def require_admin(request):
     return token, identity_hash(token)
 
 
+def _require_login_enabled():
+    if not API_KEY and not ALLOW_ANONYMOUS:
+        raise HTTPException(status_code=503, detail="GRIMOIRE_API_KEY or GATEWAY_API_KEY is required")
+
+
 def _resolve_config_path(path, base_dir=MODELS_DIR):
     if not path:
         return None
@@ -112,6 +148,26 @@ def _extend_optional_arg(cmd, cfg, key, flag=None):
     value = cfg.get(key)
     if value is not None:
         cmd.extend([flag or f"--{key}", str(value)])
+
+
+def _backend_request_headers(headers):
+    """Return request headers safe to forward to an unauthenticated backend."""
+    clean = {}
+    blocked = HOP_BY_HOP_HEADERS | SENSITIVE_PROXY_HEADERS
+    for key, value in headers.items():
+        if key.lower() in blocked:
+            continue
+        clean[key] = value
+    return clean
+
+
+def _backend_response_headers(headers):
+    clean = {}
+    for key, value in headers.items():
+        if key.lower() in HOP_BY_HOP_HEADERS:
+            continue
+        clean[key] = value
+    return clean
 
 
 def _cost_by_model():
@@ -132,7 +188,7 @@ def build_cmd(cfg, port):
     cmd = [
         LLAMA_SERVER_BIN,
         "--model", model_path,
-        "--host", "0.0.0.0",
+        "--host", "127.0.0.1",
         "--port", str(port),
         "--ctx-size", str(cfg.get("ctx-size", DEFAULT_CTX_SIZE)),
         "--n-gpu-layers", str(cfg.get("n-gpu-layers", DEFAULT_N_GPU_LAYERS)),
@@ -242,11 +298,21 @@ class ActiveModel:
         if not self.process:
             return
         if self.process.poll() is None:
-            self.process.terminate()
+            try:
+                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                self.process.terminate()
             try:
                 self.process.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.process.kill()
+                try:
+                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    self.process.kill()
                 self.process.wait()
         logger.info(f"Stopped {self.name}")
         self.process = None
@@ -330,7 +396,7 @@ class ModelManager:
                     if registry.is_fixed(name):
                         raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {gpu}")
                     logger.info(f"Evicting {name} from GPU {gpu} for pinned model {model_name}")
-                    active.stop()
+                    await asyncio.to_thread(active.stop)
                     del self.active[name]
             else:
                 gpu = self._find_free_gpu()
@@ -339,7 +405,7 @@ class ModelManager:
                     if not victim:
                         raise RuntimeError("All GPUs occupied by pinned models")
                     logger.info(f"Evicting {victim.name} from GPU {victim.gpu} (oldest load)")
-                    victim.stop()
+                    await asyncio.to_thread(victim.stop)
                     del self.active[victim.name]
                     gpu = victim.gpu
 
@@ -354,7 +420,7 @@ class ModelManager:
                     startup_timeout = DEFAULT_STARTUP_TIMEOUT
                 await active.wait_ready(timeout=startup_timeout)
             except Exception:
-                active.stop()
+                await asyncio.to_thread(active.stop)
                 raise
 
             self.active[model_name] = active
@@ -363,11 +429,12 @@ class ModelManager:
 
     async def stop_model(self, model_name):
         """Stop an active model."""
+        model_name = registry.resolve(model_name) or model_name
         async with self._lock:
             active = self.active.pop(model_name, None)
             if not active:
                 return False
-            active.stop()
+            await asyncio.to_thread(active.stop)
             logger.info(f"Stopped {model_name}")
             return True
 
@@ -388,7 +455,7 @@ class ModelManager:
         async with self._lock:
             for name, active in list(self.active.items()):
                 logger.info(f"Shutting down {name}")
-                active.stop()
+                await asyncio.to_thread(active.stop)
             self.active.clear()
 
 
@@ -441,12 +508,16 @@ form{display:grid;gap:14px;width:min(360px,calc(100vw - 32px));padding:28px;bord
 input,button{font:inherit;border-radius:10px;padding:11px 13px}input{border:1px solid #403d4d;background:#111018;color:#fff}button{border:0;background:#e89b41;color:#15100a;font-weight:700;cursor:pointer}.err{color:#ff8c8c}
 </style></head><body><form method="post" action="/login"><h1>Grimoire</h1><input name="key" type="password" placeholder="API key" autofocus><button>Login</button>{error}</form></body></html>"""
 
+
+def _render_login_html(error=""):
+    return LOGIN_HTML.replace("{error}", error)
+
 APP_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Grimoire</title><style>
 body{margin:0;background:#0f1117;color:#f4f4f5;font-family:Inter,ui-sans-serif,system-ui,sans-serif}.shell{display:grid;grid-template-columns:300px 1fr;min-height:100vh}.side{border-right:1px solid #272a36;background:#151823;padding:18px;display:flex;flex-direction:column;gap:14px}.main{padding:24px;display:grid;gap:16px;align-content:start}select,textarea,input,button{font:inherit;border-radius:10px;border:1px solid #333747;background:#10131c;color:#f4f4f5;padding:10px}button{cursor:pointer;background:#d99a45;color:#16120b;border:0;font-weight:700}.row{display:flex;gap:8px;align-items:center}.card{border:1px solid #2c3040;border-radius:14px;padding:14px;background:#171b27}.history{display:grid;gap:8px;overflow:auto}.hist{border:1px solid #2c3040;border-radius:10px;padding:10px;background:#10131c;cursor:pointer}.muted{color:#9ca3af;font-size:13px}textarea{min-height:160px;width:100%;box-sizing:border-box}@media(max-width:760px){.shell{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid #272a36}}
 </style></head><body><div class="shell"><aside class="side"><h1>Grimoire</h1><select id="model"></select><button id="switch">Switch / Load</button><button id="new">New History</button><div class="muted" id="status"></div><div class="history" id="history"></div></aside><main class="main"><section class="card"><h2>Server-side History</h2><input id="title" placeholder="Conversation title"><textarea id="messages" placeholder='[{"role":"user","content":"Hello"}]'></textarea><div class="row"><button id="save">Save</button><button id="delete">Delete</button></div></section><section class="card"><h2>Active Models</h2><pre id="active"></pre></section></main></div><script>
-let currentId=null;async function j(url,opt){let r=await fetch(url,opt);if(!r.ok)throw new Error(await r.text());return r.status===204?null:await r.json()}async function loadModels(){let d=await j('/models');let s=document.getElementById('model');s.textContent='';(d.models||[]).forEach(m=>{let o=document.createElement('option');o.value=m;o.textContent=m+((d.active||[]).includes(m)?' *':'');s.appendChild(o)});document.getElementById('active').textContent=JSON.stringify(d,null,2)}async function loadHistory(){let d=await j('/history');let h=document.getElementById('history');h.textContent='';(d.conversations||[]).forEach(c=>{let el=document.createElement('div');el.className='hist';el.textContent=c.title+'\n'+(c.model||'');el.onclick=async()=>{let x=await j('/history/'+c.id);currentId=x.id;title.value=x.title;messages.value=JSON.stringify(x.messages.map(m=>({role:m.role,content:m.content})),null,2)};h.appendChild(el)})}switch.onclick=async()=>{status.textContent='loading...';await j('/switch/'+encodeURIComponent(model.value),{method:'POST'});status.textContent='loaded '+model.value;await loadModels()};new.onclick=async()=>{let c=await j('/history',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'New chat',model:model.value,messages:[]})});currentId=c.id;title.value=c.title;messages.value='[]';await loadHistory()};save.onclick=async()=>{let body={title:title.value,model:model.value,messages:JSON.parse(messages.value||'[]')};let url=currentId?'/history/'+currentId:'/history';let method=currentId?'PUT':'POST';let c=await j(url,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});currentId=c.id;await loadHistory()};delete.onclick=async()=>{if(!currentId)return;await fetch('/history/'+currentId,{method:'DELETE'});currentId=null;title.value='';messages.value='[]';await loadHistory()};loadModels().catch(e=>status.textContent=e);loadHistory().catch(e=>status.textContent=e);
+let currentId=null;const $=id=>document.getElementById(id);async function j(url,opt){let r=await fetch(url,opt);if(!r.ok)throw new Error(await r.text());return r.status===204?null:await r.json()}async function loadModels(){let d=await j('/models');let s=$('model');s.textContent='';(d.models||[]).forEach(m=>{let o=document.createElement('option');o.value=m;o.textContent=m+((d.active||[]).includes(m)?' *':'');s.appendChild(o)});$('active').textContent=JSON.stringify(d,null,2)}async function loadHistory(){let d=await j('/history');let h=$('history');h.textContent='';(d.conversations||[]).forEach(c=>{let el=document.createElement('div');el.className='hist';el.textContent=c.title+'\\n'+(c.model||'');el.onclick=async()=>{let x=await j('/history/'+c.id);currentId=x.id;$('title').value=x.title;$('messages').value=JSON.stringify(x.messages.map(m=>({role:m.role,content:m.content})),null,2)};h.appendChild(el)})}$('switch').onclick=async()=>{$('status').textContent='loading...';await j('/switch/'+encodeURIComponent($('model').value),{method:'POST'});$('status').textContent='loaded '+$('model').value;await loadModels()};$('new').onclick=async()=>{let c=await j('/history',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'New chat',model:$('model').value,messages:[]})});currentId=c.id;$('title').value=c.title;$('messages').value='[]';await loadHistory()};$('save').onclick=async()=>{let body={title:$('title').value,model:$('model').value,messages:JSON.parse($('messages').value||'[]')};let url=currentId?'/history/'+currentId:'/history';let method=currentId?'PUT':'POST';let c=await j(url,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});currentId=c.id;await loadHistory()};$('delete').onclick=async()=>{if(!currentId)return;await fetch('/history/'+currentId,{method:'DELETE'});currentId=null;$('title').value='';$('messages').value='[]';await loadHistory()};loadModels().catch(e=>$('status').textContent=e);loadHistory().catch(e=>$('status').textContent=e);
 </script></body></html>"""
 
 
@@ -455,20 +526,28 @@ async def root(request: Request):
     """Canonical Grimoire model switcher and server-side history UI."""
     if API_KEY and not _valid_cookie(request):
         return RedirectResponse(url="/login", status_code=302)
+    if not API_KEY and not ALLOW_ANONYMOUS:
+        return RedirectResponse(url="/login", status_code=302)
     return HTMLResponse(APP_HTML)
 
 
 @app.get("/login")
 async def login_page():
-    return HTMLResponse(LOGIN_HTML.format(error=""))
+    if not API_KEY and not ALLOW_ANONYMOUS:
+        return HTMLResponse(
+            _render_login_html('<p class="err">Set GRIMOIRE_API_KEY or GATEWAY_API_KEY before login.</p>'),
+            status_code=503,
+        )
+    return HTMLResponse(_render_login_html(""))
 
 
 @app.post("/login")
 async def login_submit(request: Request):
+    _require_login_enabled()
     form = urllib.parse.parse_qs((await request.body()).decode("utf-8"))
     key = (form.get("key") or [""])[0]
     if API_KEY and not hmac.compare_digest(key, API_KEY):
-        return HTMLResponse(LOGIN_HTML.format(error='<p class="err">Invalid key</p>'), status_code=401)
+        return HTMLResponse(_render_login_html('<p class="err">Invalid key</p>'), status_code=401)
     response = RedirectResponse(url="/", status_code=302)
     response.set_cookie(COOKIE_NAME, key, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
     return response
@@ -624,6 +703,16 @@ def _history_conversation_id(request, payload):
     return None
 
 
+def _validated_history_conversation_id(user_hash, conversation_id):
+    if not conversation_id:
+        return None
+    try:
+        history_store.get_conversation(user_hash, conversation_id)
+    except KeyError:
+        return None
+    return conversation_id
+
+
 def _extract_assistant_text(raw_bytes):
     text = raw_bytes.decode("utf-8", errors="ignore")
     pieces = []
@@ -715,11 +804,12 @@ def _extract_usage(raw_bytes):
     return found
 
 
-async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload):
+async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, record_history=True):
     captured = bytearray()
+    usage_tail = bytearray()
     try:
         messages = payload.get("messages") if isinstance(payload, dict) else None
-        if conversation_id and isinstance(messages, list):
+        if record_history and conversation_id and isinstance(messages, list):
             message = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") != "assistant"), None)
             if message:
                 try:
@@ -734,6 +824,10 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
                     conversation_id = None
 
         async for chunk in stream:
+            if MAX_USAGE_CAPTURE_BYTES > 0:
+                usage_tail.extend(chunk)
+                if len(usage_tail) > MAX_USAGE_CAPTURE_BYTES:
+                    del usage_tail[:len(usage_tail) - MAX_USAGE_CAPTURE_BYTES]
             if len(captured) < MAX_HISTORY_CAPTURE_BYTES:
                 remaining = MAX_HISTORY_CAPTURE_BYTES - len(captured)
                 captured.extend(chunk[:remaining])
@@ -741,6 +835,8 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
     finally:
         raw = bytes(captured)
         usage = _extract_usage(raw)
+        if not usage:
+            usage = _extract_usage(bytes(usage_tail))
         if usage:
             usage_store.record(
                 user_hash,
@@ -751,7 +847,7 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
             )
 
         assistant_text = _extract_assistant_text(raw)
-        if assistant_text and conversation_id:
+        if record_history and assistant_text and conversation_id:
             try:
                 history_store.append_message(user_hash, conversation_id, "assistant", assistant_text, model=model_name)
             except KeyError:
@@ -791,7 +887,15 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             stream = upstream.aiter_raw()
             stream = plugin_manager.wrap_response_stream(stream, active.name, model_cfg)
             if user_hash:
-                stream = _record_response_stream(stream, user_hash, conversation_id, active.name, model_cfg, payload)
+                stream = _record_response_stream(
+                    stream,
+                    user_hash,
+                    conversation_id,
+                    active.name,
+                    model_cfg,
+                    payload,
+                    record_history=upstream.status_code < 400,
+                )
             async for chunk in stream:
                 yield chunk
         finally:
@@ -826,12 +930,7 @@ async def chat_completions(request: Request):
     try:
         active = await manager.start_model(model_name)
         conversation_id = _history_conversation_id(request, payload)
-        if conversation_id:
-            try:
-                history_store.get_conversation(user_hash, conversation_id)
-            except KeyError:
-                history_store.create_conversation(user_hash, title=model_name, model=model_name, messages=[])
-                conversation_id = None
+        conversation_id = _validated_history_conversation_id(user_hash, conversation_id)
         return await _proxy_chat(requested_model, payload, active, user_hash=user_hash, conversation_id=conversation_id)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -865,12 +964,11 @@ async def proxy_v1(request: Request, path: str):
     if not model_name:
         raise HTTPException(status_code=404, detail="No target model resolved for proxy request")
 
+    client = None
     try:
         active = await manager.start_model(model_name)
         client = httpx.AsyncClient(timeout=None)
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        headers.pop("content-length", None)
+        headers = _backend_request_headers(request.headers)
 
         if isinstance(payload, dict):
             payload = copy.deepcopy(payload)
@@ -893,8 +991,12 @@ async def proxy_v1(request: Request, path: str):
 
         upstream = await client.send(req, stream=True)
     except HTTPException:
+        if client:
+            await client.aclose()
         raise
     except Exception as e:
+        if client:
+            await client.aclose()
         logger.error(f"Failed to proxy /v1/{path}: {e}")
         raise HTTPException(status_code=502, detail="Model server unavailable")
 
@@ -906,8 +1008,7 @@ async def proxy_v1(request: Request, path: str):
             await upstream.aclose()
             await client.aclose()
 
-    response_headers = dict(upstream.headers)
-    response_headers.pop("content-length", None)
+    response_headers = _backend_response_headers(upstream.headers)
     return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=response_headers)
 
 
