@@ -8,6 +8,8 @@ ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature-turboquant-kv-cache-b9079-69d8e4b
+# Bump to force rebuild of the build stage (e.g. after upstream force-push)
+ARG CACHE_BUST=1
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -46,8 +48,9 @@ ENV CCACHE_DIR=/root/.ccache \
     CCACHE_COMPRESS=1 \
     CCACHE_MAXSIZE=5G
 
-# Copy patches
-COPY patches/ /app/patches/
+# Copy only non-webui patches for the build stage
+RUN mkdir -p /app/patches
+COPY patches/prefill-thinking-fix.patch /app/patches/
 
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/llama-cpp-src \
@@ -56,35 +59,46 @@ RUN --mount=type=cache,target=/root/.ccache \
     if [ ! -d /app/.cache/llama-cpp-src/repo/.git ]; then \
         rm -rf /app/.cache/llama-cpp-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /app/.cache/llama-cpp-src/repo; \
+    else \
+        old_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
+        git -C /app/.cache/llama-cpp-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
+        git -C /app/.cache/llama-cpp-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
+        new_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse FETCH_HEAD); \
+        if [ "$old_ref" != "$new_ref" ] || [ ! -f /app/.cache/llama-cpp-build/.patched ]; then \
+            git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
+            git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
+            for patch in /app/patches/*.patch; do \
+                [ -f "$patch" ] || continue; \
+                echo "Applying $patch"; \
+                git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
+            done; \
+            rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
+            touch /app/.cache/llama-cpp-build/.patched; \
+        fi; \
     fi; \
-    git -C /app/.cache/llama-cpp-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
-    git -C /app/.cache/llama-cpp-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
-    git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
-    git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
-    # Apply non-webui patches (webui patches are applied in the webui stage)
-    for patch in /app/patches/*.patch; do \
-        case "$(basename "$patch")" in grimoire-webui-*) continue ;; esac; \
-        echo "Applying $patch"; \
-        git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
-    done; \
-    cmake -S /app/.cache/llama-cpp-src/repo -B /app/.cache/llama-cpp-build \
-        -DGGML_CUDA=ON \
-        -DGGML_CUDA_FA=ON \
-        -DGGML_NATIVE=OFF \
-        -DGGML_BUILD_EXAMPLES=OFF \
-        -DGGML_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_SERVER=ON \
-        -DLLAMA_BUILD_TOOLS=ON \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
-        -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_TOOLS_INSTALL=ON \
-        "-DCMAKE_CUDA_ARCHITECTURES=${GRIMOIRE_CMAKE_CUDA_ARCHITECTURES}" \
-        -DCMAKE_INSTALL_PREFIX=/opt/model-a-llama-cpp \
-        -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-        -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /app/.cache/llama-cpp-build --target install --parallel $(nproc) --verbose
+    if [ ! -f /app/.cache/llama-cpp-build/.built ]; then \
+        cmake -S /app/.cache/llama-cpp-src/repo -B /app/.cache/llama-cpp-build \
+            -G Ninja \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_FA=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BUILD_EXAMPLES=OFF \
+            -DGGML_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_TOOLS_INSTALL=ON \
+            "-DCMAKE_CUDA_ARCHITECTURES=${GRIMOIRE_CMAKE_CUDA_ARCHITECTURES}" \
+            -DCMAKE_INSTALL_PREFIX=/opt/model-a-llama-cpp \
+            -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_BUILD_TYPE=Release; \
+        cmake --build /app/.cache/llama-cpp-build --target install --parallel $(nproc); \
+        touch /app/.cache/llama-cpp-build/.built; \
+    fi
 
 
 # =============================================================================
@@ -117,16 +131,23 @@ RUN --mount=type=cache,target=/cache/webui-src \
     if [ ! -d /cache/webui-src/repo/.git ]; then \
         rm -rf /cache/webui-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /cache/webui-src/repo; \
+    else \
+        old_ref=$(git -C /cache/webui-src/repo rev-parse HEAD); \
+        git -C /cache/webui-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
+        git -C /cache/webui-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
+        new_ref=$(git -C /cache/webui-src/repo rev-parse FETCH_HEAD); \
+        if [ "$old_ref" != "$new_ref" ] || [ ! -f /cache/webui-src/.patched ]; then \
+            git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
+            git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
+            for patch in /src/patches/grimoire-webui-*.patch; do \
+                [ -f "$patch" ] || continue; \
+                echo "Applying webui patch: $patch"; \
+                git -C /cache/webui-src/repo apply "$patch"; \
+            done; \
+            rm -f /cache/webui-src/.built; \
+            touch /cache/webui-src/.patched; \
+        fi; \
     fi; \
-    git -C /cache/webui-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
-    git -C /cache/webui-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
-    git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
-    git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
-    for patch in /src/patches/grimoire-webui-*.patch; do \
-        [ -f "$patch" ] || continue; \
-        echo "Applying webui patch: $patch"; \
-        git -C /cache/webui-src/repo apply "$patch"; \
-    done; \
     cp -r /cache/webui-src/repo/tools /src/tools; \
     mkdir -p /src/tools/server/webui/src/routes/dashboard; \
     cp /src/dashboard/* /src/tools/server/webui/src/routes/dashboard/; \
