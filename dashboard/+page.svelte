@@ -207,7 +207,7 @@
 </svelte:head>
 
 <div class="flex h-full w-full flex-col overflow-auto px-6 py-6 md:px-10 md:py-8">
-	<header class="sticky top-0 z-10 -mx-6 -mt-6 mb-4 flex flex-wrap items-center justify-end gap-4 px-6 py-3">
+	<header class="sticky top-0 z-10 -mx-6 -mt-6 mb-8 flex flex-wrap items-center justify-end gap-4 px-6 py-3">
 		<div class="inline-flex rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Window">
 			{#each WINDOWS as w}
 				<button

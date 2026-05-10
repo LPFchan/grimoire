@@ -1133,7 +1133,7 @@ def _extract_chunk_tokens_per_sec(chunk):
     return _extract_tokens_per_sec(chunk)
 
 
-async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, record_history=True):
+async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, gpu_index=None, record_history=True):
     captured = bytearray()
     usage_tail = bytearray()
     try:
@@ -1174,6 +1174,13 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
                 usage["output_tokens"],
                 cost_rates=model_cfg.get("cost"),
             )
+
+        if gpu_index is not None:
+            tps = _extract_tokens_per_sec(raw)
+            if tps is None:
+                tps = _extract_tokens_per_sec(bytes(usage_tail))
+            if tps is not None and tps > 0:
+                telemetry_store.record(time.time(), [(gpu_index, "gpu_tokens_per_sec", tps)])
 
         assistant_text = _extract_assistant_text(raw)
         if record_history and assistant_text and conversation_id:
@@ -1225,6 +1232,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     active.name,
                     model_cfg,
                     payload,
+                    gpu_index=active.gpu,
                     record_history=upstream.status_code < 400,
                 )
             if non_streaming:
