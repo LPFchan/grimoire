@@ -9,6 +9,7 @@ services:
       - /home/yeowool/models:/models:ro
       - /home/yeowool/templates:/templates:ro
       - /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro
+      - /path/to/token-stats.json:/var/lib/grimoire/token-stats.json:ro
       - grimoire_state:/var/lib/grimoire
     environment:
       - GRIMOIRE_API_KEY=changeme
