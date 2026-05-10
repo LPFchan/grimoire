@@ -1,0 +1,72 @@
+.../webui/src/lib/components/app/chat/ChatScreen/ChatScreen.svelte      | 2 +-
+ .../webui/src/lib/components/app/chat/ChatSidebar/ChatSidebar.svelte    | 2 +-
+ .../webui/src/lib/components/app/server/ServerLoadingSplash.svelte      | 2 +-
+ tools/server/webui/src/routes/+page.svelte                              | 2 +-
+ tools/server/webui/src/routes/chat/[id]/+page.svelte                    | 2 +-
+ 5 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/tools/server/webui/src/lib/components/app/chat/ChatScreen/ChatScreen.svelte b/tools/server/webui/src/lib/components/app/chat/ChatScreen/ChatScreen.svelte
+index 290a277..d437936 100644
+--- a/tools/server/webui/src/lib/components/app/chat/ChatScreen/ChatScreen.svelte
++++ b/tools/server/webui/src/lib/components/app/chat/ChatScreen/ChatScreen.svelte
+@@ -427,7 +427,7 @@
+ 	>
+ 		<div class="w-full max-w-[48rem] px-4">
+ 			<div class="mb-10 text-center" in:fade={{ duration: 300 }}>
+-				<h1 class="mb-2 text-2xl font-semibold tracking-tight md:text-3xl">llama.cpp</h1>
++				<h1 class="mb-2 text-2xl font-semibold tracking-tight md:text-3xl">chat.lost.plus</h1>
+ 
+ 				<p class="text-muted-foreground md:text-lg">
+ 					{serverStore.props?.modalities?.audio
+diff --git a/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebar.svelte b/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebar.svelte
+index 751406b..a09ea3f 100644
+--- a/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebar.svelte
++++ b/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebar.svelte
+@@ -141,7 +141,7 @@
+ <ScrollArea class="h-[100vh]">
+ 	<Sidebar.Header class=" top-0 z-10 gap-4 bg-sidebar/50 p-4 pb-2 backdrop-blur-lg md:sticky">
+ 		<a href="#/" onclick={handleMobileSidebarItemClick}>
+-			<h1 class="inline-flex items-center gap-1 px-2 text-xl font-semibold">llama.cpp</h1>
++			<h1 class="inline-flex items-center gap-1 px-2 text-xl font-semibold">chat.lost.plus</h1>
+ 		</a>
+ 
+ 		<ChatSidebarActions {handleMobileSidebarItemClick} bind:isSearchModeActive bind:searchQuery />
+diff --git a/tools/server/webui/src/lib/components/app/server/ServerLoadingSplash.svelte b/tools/server/webui/src/lib/components/app/server/ServerLoadingSplash.svelte
+index 505325d..0e0e263 100644
+--- a/tools/server/webui/src/lib/components/app/server/ServerLoadingSplash.svelte
++++ b/tools/server/webui/src/lib/components/app/server/ServerLoadingSplash.svelte
+@@ -8,7 +8,7 @@
+ 		message?: string;
+ 	}
+ 
+-	let { class: className = '', message = 'Initializing connection to llama.cpp server...' }: Props =
++	let { class: className = '', message = 'Initializing connection to chat.lost.plus server...' }: Props =
+ 		$props();
+ </script>
+ 
+diff --git a/tools/server/webui/src/routes/+page.svelte b/tools/server/webui/src/routes/+page.svelte
+index e67a85a..43337c1 100644
+--- a/tools/server/webui/src/routes/+page.svelte
++++ b/tools/server/webui/src/routes/+page.svelte
+@@ -92,7 +92,7 @@
+ </script>
+ 
+ <svelte:head>
+-	<title>llama.cpp - AI Chat Interface</title>
++	<title>chat.lost.plus - AI Chat Interface</title>
+ </svelte:head>
+ 
+ <ChatScreen showCenteredEmpty />
+diff --git a/tools/server/webui/src/routes/chat/[id]/+page.svelte b/tools/server/webui/src/routes/chat/[id]/+page.svelte
+index c0b2e0c..2f0b8f2 100644
+--- a/tools/server/webui/src/routes/chat/[id]/+page.svelte
++++ b/tools/server/webui/src/routes/chat/[id]/+page.svelte
+@@ -166,7 +166,7 @@
+ </script>
+ 
+ <svelte:head>
+-	<title>{activeConversation()?.name || 'Chat'} - llama.cpp</title>
++	<title>{activeConversation()?.name || 'Chat'} - chat.lost.plus</title>
+ </svelte:head>
+ 
+ <ChatScreen />

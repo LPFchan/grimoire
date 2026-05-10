@@ -221,18 +221,11 @@ index 0000000..edc22f2
 +</script>
 +
 +<svelte:head>
-+	<title>Dashboard — llama.cpp</title>
++	<title>Dashboard — chat.lost.plus</title>
 +</svelte:head>
 +
 +<div class="flex h-full w-full flex-col overflow-auto px-6 py-6 md:px-10 md:py-8">
-+	<header class="mb-6 flex flex-wrap items-center justify-between gap-4">
-+		<div>
-+			<h1 class="text-2xl font-semibold tracking-tight">Dashboard</h1>
-+			<p class="text-sm text-muted-foreground">
-+				Token usage, equivalent cost, and live GPU / CPU telemetry.
-+			</p>
-+		</div>
-+
++	<header class="mb-6 flex flex-wrap items-center justify-end gap-4">
 +		<div class="inline-flex rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Window">
 +			{#each WINDOWS as w}
 +				<button
