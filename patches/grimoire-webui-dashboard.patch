@@ -35,7 +35,6 @@ index 0000000..edc22f2
 +++ b/tools/server/webui/src/routes/dashboard/+page.svelte
 @@ -0,0 +1,267 @@
 +<script lang="ts">
-+	import { onDestroy, onMount } from 'svelte';
 +	import { apiFetch } from '$lib/utils';
 +
 +	type Series = {
@@ -57,7 +56,8 @@ index 0000000..edc22f2
 +			series: Array<number>;
 +		};
 +		gpus: Array<{ index: number; temp: Series; power: Series }>;
-+		cpu: { temp: Series };
++		cpu: { temp: Series; power: Series };
++		fans: { fan1: Series; fan2: Series };
 +	};
 +
 +	const WINDOWS = [
@@ -71,11 +71,17 @@ index 0000000..edc22f2
 +		{ id: 'all', label: 'All' }
 +	] as const;
 +
++	const FREQUENCIES = [
++		{ ms: 1000, label: '1s' },
++		{ ms: 2000, label: '2s' },
++		{ ms: 5000, label: '5s' }
++	] as const;
++
 +	let selectedWindow = $state<(typeof WINDOWS)[number]['id']>('1h');
++	let pollingMs = $state<number>(5000);
 +	let data = $state<DashboardResponse | null>(null);
 +	let error = $state<string | null>(null);
 +	let loading = $state(false);
-+	let pollHandle: ReturnType<typeof setInterval> | null = null;
 +
 +	async function refresh() {
 +		loading = true;
@@ -97,14 +103,9 @@ index 0000000..edc22f2
 +		void refresh();
 +	});
 +
-+	onMount(() => {
-+		pollHandle = setInterval(() => {
-+			void refresh();
-+		}, 5000);
-+	});
-+
-+	onDestroy(() => {
-+		if (pollHandle) clearInterval(pollHandle);
++	$effect(() => {
++		const handle = setInterval(() => { void refresh(); }, pollingMs);
++		return () => clearInterval(handle);
 +	});
 +
 +	function fmtCost(n: number | null | undefined): string {
@@ -132,6 +133,12 @@ index 0000000..edc22f2
 +	function fmtPower(w: number | null | undefined): string {
 +		if (w == null) return '—';
 +		return `${w.toFixed(1)} W`;
++	}
++
++	function fmtRpm(n: number | null | undefined): string {
++		if (n == null) return '—';
++		if (n >= 1000) return `${(n / 1000).toFixed(1)}k RPM`;
++		return `${Math.round(n)} RPM`;
 +	}
 +
 +	type Sparkline = { line: string; area: string; lo: number; hi: number };
@@ -241,6 +248,22 @@ index 0000000..edc22f2
 +				</button>
 +			{/each}
 +		</div>
++
++		<div class="inline-flex items-center gap-1 rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Frequency">
++			{#each FREQUENCIES as f}
++				<button
++					type="button"
++					role="tab"
++					aria-selected={pollingMs === f.ms}
++					class="rounded-md px-3 py-1 text-sm transition {pollingMs === f.ms
++						? 'bg-background font-medium shadow-sm'
++						: 'text-muted-foreground hover:text-foreground'}"
++					onclick={() => (pollingMs = f.ms)}
++				>
++					{f.label}
++				</button>
++			{/each}
++		</div>
 +	</header>
 +
 +	{#if error}
@@ -271,7 +294,7 @@ index 0000000..edc22f2
 +		{/if}
 +	</section>
 +
-+	<section class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
++	<section class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
 +		{#snippet statCard(title: string, value: string, series: Array<number | null> | undefined, accent: string, formatFn: (n: number) => string)}
 +			{@const spark = buildSparkline(series, SPARK_W, SPARK_H)}
 +			{@const values = series ?? []}
@@ -356,6 +379,30 @@ index 0000000..edc22f2
 +			data?.cpu.temp.series,
 +			'oklch(0.72 0.16 320)',
 +			fmtTemp
++		)}
++
++		{@render statCard(
++			'CPU power',
++			fmtPower(data?.cpu.power.current),
++			data?.cpu.power.series,
++			'oklch(0.75 0.18 120)',
++			fmtPower
++		)}
++
++		{@render statCard(
++			'Fan 1',
++			fmtRpm(data?.fans.fan1.current),
++			data?.fans.fan1.series,
++			'oklch(0.68 0.16 190)',
++			fmtRpm
++		)}
++
++		{@render statCard(
++			'Fan 2',
++			fmtRpm(data?.fans.fan2.current),
++			data?.fans.fan2.series,
++			'oklch(0.68 0.14 250)',
++			fmtRpm
 +		)}
 +	</section>
 +</div>

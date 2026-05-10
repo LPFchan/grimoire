@@ -912,7 +912,14 @@ async def get_dashboard_stats(request: Request):
             ]),
         },
         "gpus": gpus,
-        "cpu": {"temp": _system("cpu_temp", -1)},
+        "cpu": {
+            "temp": _system("cpu_temp", 0),
+            "power": _system("cpu_power", 0),
+        },
+        "fans": {
+            "fan1": _system("fan1_rpm", 0),
+            "fan2": _system("fan2_rpm", 0),
+        },
     }
 
 

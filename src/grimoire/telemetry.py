@@ -1,9 +1,9 @@
 """System telemetry sampling (GPU + CPU) for the dashboard endpoint.
 
 Runs a 5-second background asyncio task that records GPU temperature and
-power draw from nvidia-smi, plus CPU temperature from /sys/class/hwmon, into
-a SQLite ring. The dashboard endpoint queries this ring binned to N points
-for the selected window.
+power draw from nvidia-smi, plus CPU temperature from /sys/class/hwmon and
+CPU power from RAPL /sys/class/powercap, into a SQLite ring. The dashboard
+endpoint queries this ring binned to N points for the selected window.
 """
 
 import asyncio
@@ -31,6 +31,10 @@ DEFAULT_BINS = 60
 
 CPU_HWMON_NAMES = ("k10temp", "coretemp", "zenpower")
 CPU_HWMON_LABELS = ("Tctl", "Tdie", "Package id 0", "Tccd1")
+FAN_HWMON_NAMES = ("nct6798", "nct6775", "nct6779", "it87", "w83627ehf")
+
+_RAPL_ENERGY_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj"
+_RAPL_STATE = {"last_ts": None, "last_energy_uj": None}
 
 
 class TelemetryStore:
@@ -203,12 +207,70 @@ def _read_cpu_temp():
     return None
 
 
+def _read_cpu_power():
+    """Read RAPL package energy counter, return instantaneous power in watts.
+
+    Reads /sys/class/powercap/intel-rapl:0/energy_uj (cumulative microjoules),
+    computes delta over time.  Returns None on first call or if the interface is
+    unavailable / unreadable.
+    """
+    try:
+        with open(_RAPL_ENERGY_PATH) as f:
+            energy_uj = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    now = time.time()
+    power = None
+    if _RAPL_STATE["last_ts"] is not None and _RAPL_STATE["last_energy_uj"] is not None:
+        dt = now - _RAPL_STATE["last_ts"]
+        if dt > 0:
+            delta_uj = energy_uj - _RAPL_STATE["last_energy_uj"]
+            if delta_uj < 0:
+                delta_uj += 65532610987
+            power = delta_uj / dt / 1e6
+    _RAPL_STATE["last_ts"] = now
+    _RAPL_STATE["last_energy_uj"] = energy_uj
+    return power
+
+
+def _read_fan_rpm():
+    """Read fan1_input and fan2_input from the main fan-controller hwmon chip.
+
+    Returns a list of (fan_index, metric, rpm) tuples, or empty list.
+    """
+    for hw_dir in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        try:
+            with open(os.path.join(hw_dir, "name")) as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if name not in FAN_HWMON_NAMES:
+            continue
+        fans = []
+        for fan_idx in (1, 2):
+            fan_path = os.path.join(hw_dir, f"fan{fan_idx}_input")
+            try:
+                with open(fan_path) as f:
+                    rpm = int(f.read().strip())
+                fans.append((fan_idx, f"fan{fan_idx}_rpm", rpm))
+            except (OSError, ValueError):
+                pass
+        if fans:
+            return fans
+    return []
+
+
 def collect_one_sample():
     """Synchronous one-shot sample. Returns the rows that were recorded."""
     rows = _read_gpu_samples()
     cpu_temp = _read_cpu_temp()
     if cpu_temp is not None:
-        rows.append((-1, "cpu_temp", cpu_temp))
+        rows.append((0, "cpu_temp", cpu_temp))
+    cpu_power = _read_cpu_power()
+    if cpu_power is not None and cpu_power >= 0:
+        rows.append((0, "cpu_power", cpu_power))
+    for fan_idx, metric, rpm in _read_fan_rpm():
+        rows.append((0, metric, rpm))
     if rows:
         telemetry_store.record(time.time(), rows)
     return rows
