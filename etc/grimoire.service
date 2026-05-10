@@ -1,0 +1,36 @@
+[Unit]
+Description=Grimoire multi-GPU llama.cpp gateway
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+TimeoutStartSec=900
+TimeoutStopSec=120
+Restart=always
+RestartSec=10
+
+EnvironmentFile=-/etc/grimoire/grimoire.env
+
+ExecStartPre=-/usr/bin/docker stop grimoire
+ExecStartPre=-/usr/bin/docker rm grimoire
+
+ExecStart=/usr/bin/docker run --rm --name grimoire \
+    --gpus all \
+    -p 9001:9001 \
+    --log-driver=journald --log-opt tag=grimoire \
+    -e GRIMOIRE_API_KEY=${GRIMOIRE_API_KEY} \
+    -e GRIMOIRE_ADMIN_TOKEN=${GRIMOIRE_ADMIN_TOKEN} \
+    -e GRIMOIRE_LEGACY_STATS_PATH=${GRIMOIRE_LEGACY_STATS_PATH} \
+    -v /home/yeowool/models:/models \
+    -v /home/yeowool/templates:/templates:ro \
+    -v /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro \
+    -v /home/yeowool/token-stats.json:/var/lib/grimoire/token-stats.json:ro \
+    -v grimoire-state:/var/lib/grimoire \
+    ghcr.io/lpfchan/grimoire:latest
+
+ExecStop=/usr/bin/docker stop grimoire
+
+[Install]
+WantedBy=multi-user.target

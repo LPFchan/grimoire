@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import copy
+import ctypes
 from contextlib import asynccontextmanager
 import hmac
 import json
@@ -78,6 +79,19 @@ SENSITIVE_PROXY_HEADERS = {
     "x-grimoire-token",
     "x-api-key",
 }
+
+PR_SET_PDEATHSIG = 1
+
+
+def _spawn_child_preexec():
+    """Detach into a new session so killpg works, then ask the kernel to SIGTERM
+    the child if grimoire dies — prevents orphan llama-server processes from
+    holding GPU VRAM after a gateway crash."""
+    os.setsid()
+    try:
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        pass
 
 
 def parse_args():
@@ -249,7 +263,7 @@ class ActiveModel:
         logger.info(f"Starting {self.name} on GPU {self.gpu}, port {self.port}")
         logger.info(f"Command: {' '.join(cmd)}")
 
-        self.process = subprocess.Popen(cmd, env=env, start_new_session=True)
+        self.process = subprocess.Popen(cmd, env=env, preexec_fn=_spawn_child_preexec)
         return self.process
 
     async def wait_ready(self, timeout=DEFAULT_STARTUP_TIMEOUT):

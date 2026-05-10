@@ -1,0 +1,80 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install .[test]
+      - run: pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Cache key tracks the inputs that invalidate the llama.cpp build stage:
+      # the pinned upstream ref, the patches directory, and the CUDA arch list.
+      # Anything else (python sources, README) only invalidates the runtime stage,
+      # which is ~5 min vs. ~60 min for the build stage.
+      - id: cache_key
+        run: |
+          REF=$(awk -F= '/^ARG GRIMOIRE_LLAMA_CPP_REF=/{print $2}' Dockerfile)
+          PATCH_HASH=$(sha256sum patches/*.patch | sha256sum | cut -c1-12)
+          ARCHES=$(awk -F= '/^ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=/{print $2}' Dockerfile | tr -d ';')
+          echo "key=llama-${REF}-p${PATCH_HASH}-a${ARCHES}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:${{ steps.cache_key.outputs.key }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:llama-buildkit
+          cache-to: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:${{ steps.cache_key.outputs.key }},mode=max
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:llama-buildkit,mode=max

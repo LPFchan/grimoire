@@ -148,3 +148,28 @@ Endpoints:
 ```bash
 docker build -t grimoire:latest .
 ```
+
+## Running As A Service
+
+A systemd unit ships at `etc/grimoire.service`. To install:
+
+```bash
+sudo install -d /etc/grimoire
+sudo install -m 600 /dev/stdin /etc/grimoire/grimoire.env <<'EOF'
+GRIMOIRE_API_KEY=change-me
+GRIMOIRE_ADMIN_TOKEN=change-me
+GRIMOIRE_LEGACY_STATS_PATH=/var/lib/grimoire/token-stats.json
+EOF
+sudo install -m 644 etc/grimoire.service /etc/systemd/system/grimoire.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now grimoire.service
+journalctl -u grimoire.service -f
+```
+
+The unit uses `--log-driver=journald --log-opt tag=grimoire`, so all gateway and
+child llama-server output goes through `journalctl -t grimoire` for the same
+post-mortem grep parity as the legacy `eastself-*` units.
+
+The unit also runs `docker run --rm`, so each restart starts from a clean
+container. State (model registry, history, usage) is held in the
+`grimoire-state` named volume.

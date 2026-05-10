@@ -37,7 +37,7 @@ RUN apt-get update \
 WORKDIR /app
 
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
-ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
+ARG GRIMOIRE_LLAMA_CPP_REF=feature-turboquant-kv-cache-b9079-69d8e4b
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
 ENV CCACHE_DIR=/root/.ccache \

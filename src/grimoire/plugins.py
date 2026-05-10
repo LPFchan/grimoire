@@ -72,6 +72,14 @@ class QwenStructuredCotPlugin(Plugin):
         self.enabled = env_flag("STRUCTURED_COT", True)
         self.tool_fallback = env_flag("STRUCTURED_TOOL_FALLBACK", False)
         self.grammar = self._load_grammar()
+        self._missing_warned = False
+        if self.enabled and not self.grammar:
+            logger.warning(
+                "STRUCTURED_COT is enabled but no grammar was found at "
+                "$GRIMOIRE_STRUCTURED_COT_GRAMMAR, /etc/grimoire/grammars/fsm_grammar.gbnf, or "
+                "/home/yeowool/structured-cot/grammars/fsm_grammar.gbnf — qwen requests will "
+                "run without structured CoT. Mount the grammar dir or set STRUCTURED_COT=0."
+            )
 
     def _load_grammar(self):
         paths = [
@@ -93,9 +101,17 @@ class QwenStructuredCotPlugin(Plugin):
         return None
 
     def before_request(self, payload, model_name, model_cfg):
-        if not self.enabled or not self.grammar:
+        if not self.enabled:
             return payload
         if model_cfg.get("family") != "qwen":
+            return payload
+        if not self.grammar:
+            if not self._missing_warned:
+                logger.warning(
+                    "Skipping structured CoT for qwen-family model %s: grammar not loaded.",
+                    model_name,
+                )
+                self._missing_warned = True
             return payload
         if "grammar" in payload:
             return payload
