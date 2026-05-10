@@ -13,14 +13,15 @@ from datetime import datetime, timezone
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+
+import httpx
 
 from grimoire.registry import registry, MODELS_DIR, REGISTRY_PATH
 
 logger = logging.getLogger(__name__)
 
 LLAMA_SERVER_BIN = "/opt/model-a-llama-cpp/bin/llama-server"
-DEFAULT_PORT = 8001
 DEFAULT_CTX_SIZE = 131072
 DEFAULT_N_GPU_LAYERS = 999
 DEFAULT_PREDICT = 16384
@@ -72,6 +73,7 @@ class ActiveModel:
         self.port = port
         self.gpu = gpu
         self.process = None
+        self.started = datetime.now(timezone.utc)
 
     def start(self):
         """Start the llama-server process."""
@@ -110,20 +112,43 @@ class ActiveModel:
 
 
 class ModelManager:
-    """Manage active models across multiple GPUs."""
+    """Manage active models across multiple GPUs.
 
-    def __init__(self):
+    GPU allocation priority:
+    1. Pinned models use their assigned GPU
+    2. Free GPUs are preferred
+    3. If no free GPU, evict the oldest-loaded non-pinned model
+    """
+
+    def __init__(self, gpu_count=2):
         self.active = {}  # {model_name: ActiveModel}
-        self.gpu_locks = {}  # {gpu_id: asyncio.Lock}
+        self.gpu_count = gpu_count
 
-    def _get_gpu_lock(self, gpu_id):
-        if gpu_id not in self.gpu_locks:
-            self.gpu_locks[gpu_id] = asyncio.Lock()
-        return self.gpu_locks[gpu_id]
+    def _find_free_gpu(self):
+        """Find a GPU that has no active model."""
+        used_gpus = {m.gpu for m in self.active.values()}
+        for gpu in range(self.gpu_count):
+            if gpu not in used_gpus:
+                return gpu
+        return None
 
-    def _find_available_port(self, base_port, gpu_id):
+    def _find_oldest_evictable(self):
+        """Find the GPU with the oldest-loaded non-pinned model."""
+        oldest = None
+        oldest_time = None
+        for name, active in self.active.items():
+            if registry.is_fixed(name):
+                continue  # Skip pinned models
+            if oldest is None or active.started < oldest_time:
+                oldest = name
+                oldest_time = active.started
+        if oldest:
+            return self.active[oldest]
+        return None
+
+    def _find_available_port(self, gpu_id):
         """Find an available port for a model on a given GPU."""
-        port = base_port + gpu_id * 10
+        port = 8001 + gpu_id * 10
         for _ in range(100):
             if not any(m.port == port for m in self.active.values()):
                 return port
@@ -131,28 +156,50 @@ class ModelManager:
         raise RuntimeError("No available ports found")
 
     async def start_model(self, model_name):
-        """Start a model (stops other models on same GPU)."""
+        """Start a model with GPU allocation priority: pinned → free → evict oldest."""
         cfg = registry.get(model_name)
         if not cfg:
             raise KeyError(f"Model '{model_name}' not found in registry")
 
-        gpu = cfg.get("gpu", 0)
-        lock = self._get_gpu_lock(gpu)
+        # Already active?
+        if model_name in self.active:
+            logger.info(f"{model_name} is already active")
+            return self.active[model_name]
 
-        async with lock:
-            # Stop other models on same GPU
+        # 1. Check if pinned
+        pinned_gpu = registry.get_fixed_gpu(model_name)
+        if pinned_gpu is not None:
+            gpu = pinned_gpu
+            # If another model is on this GPU, evict it (only non-pinned can be evicted)
             for name, active in list(self.active.items()):
-                if active.gpu == gpu and name != model_name:
-                    logger.info(f"Stopping {name} to free GPU {gpu}")
+                if active.gpu == gpu:
+                    if registry.is_fixed(name):
+                        raise RuntimeError(
+                            f"Cannot evict pinned model '{name}' from GPU {gpu}"
+                        )
+                    logger.info(f"Evicting {name} from GPU {gpu} for pinned model {model_name}")
                     active.stop()
                     del self.active[name]
+                    break
+        else:
+            # 2. Try to find a free GPU
+            gpu = self._find_free_gpu()
+            if gpu is None:
+                # 3. No free GPU — evict oldest non-pinned model
+                victim = self._find_oldest_evictable()
+                if not victim:
+                    raise RuntimeError("All GPUs occupied by pinned models")
+                logger.info(f"Evicting {victim.name} from GPU {victim.gpu} (oldest load)")
+                victim.stop()
+                del self.active[victim.name]
+                gpu = victim.gpu
 
-            port = self._find_available_port(DEFAULT_PORT, gpu)
-            active = ActiveModel(model_name, cfg, port, gpu)
-            active.start()
-            self.active[model_name] = active
-            logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
-            return active
+        port = self._find_available_port(gpu)
+        active = ActiveModel(model_name, cfg, port, gpu)
+        active.start()
+        self.active[model_name] = active
+        logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
+        return active
 
     async def stop_model(self, model_name):
         """Stop an active model."""
@@ -181,9 +228,24 @@ class ModelManager:
         self.active.clear()
 
 
-# Global model manager instance
-manager = ModelManager()
+def detect_gpu_count():
+    """Detect number of available GPUs."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--list-gpus"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            return len(result.stdout.strip().split("\n"))
+    except Exception:
+        pass
+    return 2  # Default
 
+
+# Global model manager
+manager = ModelManager(gpu_count=detect_gpu_count())
+
+logger.info(f"Grimoire starting with {manager.gpu_count} GPU(s)")
 
 # Create FastAPI gateway app
 app = FastAPI(title="Grimoire Gateway", version="0.1.0")
@@ -218,14 +280,15 @@ async def get_models():
     """Return registry and active model info."""
     return {
         "models": registry.list_all(),
+        "fixed": dict(registry._data.get("fixed", {})),
         "active": manager.list_active(),
-        "gpu_count": len(set(active.gpu for active in manager.active.values()))
+        "gpu_count": manager.gpu_count
     }
 
 
 @app.post("/switch/{model_name}")
 async def switch_model(model_name: str):
-    """Start a model (stops other models on same GPU)."""
+    """Start a model with GPU allocation."""
     try:
         active = await manager.start_model(model_name)
         return {
@@ -236,6 +299,8 @@ async def switch_model(model_name: str):
         }
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         logger.error(f"Failed to start {model_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -262,14 +327,13 @@ async def chat_completions(request: Request):
     if not requested_model or requested_model not in manager.active:
         raise HTTPException(
             status_code=404,
-            detail=f"Model '{requested_model}' is not active. Use /switch/{{model_name}} to start it."
+            detail=f"Model '{requested_model}' is not active. Use POST /switch/{{model_name}} to start it."
         )
 
     active = manager.get_active(requested_model)
     port = active.port
 
     # Forward to the active model's llama-server
-    import httpx
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
@@ -278,7 +342,6 @@ async def chat_completions(request: Request):
                 timeout=None,
                 stream=True
             )
-            from fastapi.responses import StreamingResponse
             return StreamingResponse(
                 resp.aiter_raw(),
                 media_type="text/event-stream",
@@ -296,7 +359,6 @@ async def ingest_model(request: Request):
     data = await request.json()
     model_alias = data.get("alias")
     model_url = data.get("url")
-    gpu = data.get("gpu", 0)
     ctx_size = data.get("ctx-size", DEFAULT_CTX_SIZE)
 
     if not model_alias or not model_url:
@@ -323,8 +385,6 @@ async def ingest_model(request: Request):
             "file": f"gguf/{model_filename}",
             "mmproj": None,
             "ctx-size": ctx_size,
-            "gpu": gpu,
-            "has-multimodal": False,
         })
         logger.info(f"Added model {model_alias} to registry")
         return {"status": "added", "model": model_alias}
@@ -335,23 +395,30 @@ async def ingest_model(request: Request):
 @app.get("/status")
 async def status():
     """Return system status."""
+    active_info = {}
+    for name, active in manager.active.items():
+        active_info[name] = {
+            "gpu": active.gpu,
+            "port": active.port,
+            "started": active.started.isoformat(),
+            "pinned": registry.is_fixed(name)
+        }
     return {
         "models": registry.list_all(),
-        "active": manager.list_active(),
-        "gpu_count": len(set(active.gpu for active in manager.active.values()))
+        "fixed": dict(registry._data.get("fixed", {})),
+        "active": active_info,
+        "gpu_count": manager.gpu_count
     }
 
 
 def main():
     args = parse_args()
 
-    # Start the gateway
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     # Start initial model if specified
     if args.model:
         try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
             loop.run_until_complete(manager.start_model(args.model))
         except Exception as e:
             logger.error(f"Failed to start initial model {args.model}: {e}")

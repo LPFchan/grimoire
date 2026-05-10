@@ -23,12 +23,12 @@ Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving.
 
 ## Features
 
-- **Multi-GPU support** - Run multiple models simultaneously, one per GPU
-- **Model registry** - JSON-based registry with model metadata, GPU assignment, and per-model settings
-- **Model ingestion** - Download and register new models via CLI or API
-- **OpenAI-compatible API** - Standard `/v1/chat/completions` endpoint with model routing
-- **Model switching** - Start/stop models on demand via `/switch/{model_name}`
-- **Health monitoring** - Built-in health checks and status endpoints
+- **Multi-GPU** — Run multiple models simultaneously, one per GPU
+- **Dynamic GPU allocation** — Free GPU preferred, oldest non-pinned model evicted when all GPUs busy
+- **Pinned models** — Fix specific models to specific GPUs via `fixed` section
+- **Model registry** — JSON-based registry with per-model settings
+- **Model ingestion** — Download and register new models via CLI or API
+- **OpenAI-compatible API** — Standard `/v1/chat/completions` with automatic routing
 
 ## Usage
 
@@ -41,7 +41,13 @@ docker run --gpus all -p 9001:9001 -v /path/to/models:/models \
 docker exec grimoire grimoire list
 
 # Ingest a new model
-docker exec grimoire grimoire ingest --alias "my-model" --url "https://..." --gpu 0
+docker exec grimoire grimoire ingest --alias "my-model" --url "https://..."
+
+# Pin a model to GPU 1
+docker exec grimoire grimoire pin gemma-4-31B 1
+
+# Unpin
+docker exec grimoire grimoire unpin gemma-4-31B
 
 # Switch models via API
 curl -X POST http://localhost:9001/switch/qwen-3.6-27B
@@ -54,46 +60,31 @@ curl -X POST http://localhost:9001/v1/chat/completions \
 
 ## Model Registry
 
-Models are defined in `/etc/grimoire/models.json`:
+`/etc/grimoire/models.json`:
 
 ```json
 {
-  "qwen-3.6-27B": {
-    "file": "gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf",
-    "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
-    "ctx-size": 262144,
-    "gpu": 0,
-    "cache-type-k": "turbo4",
-    "cache-type-v": "turbo4"
+  "models": {
+    "qwen-3.6-27B": {
+      "file": "gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
+      "ctx-size": 262144,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4"
+    }
   },
-  "gemma-4-31B": {
-    "file": "gguf/gemma-4-31B-it-UD-Q4_K_XL.gguf",
-    "mmproj": "gguf/mmproj-BF16.gguf",
-    "ctx-size": 131072,
-    "gpu": 1,
-    "cache-type-k": "turbo4",
-    "cache-type-v": "turbo4"
+  "fixed": {
+    "gemma-4-31B": 1
   }
 }
 ```
+
+- `models` — model definitions (no GPU assignment)
+- `fixed` — model alias → GPU ID (pinned, never evicted)
+- Models not in `fixed` use dynamic LRU allocation
 
 ## Building
 
 ```bash
 docker build -t grimoire:latest .
-```
-
-## Development
-
-```bash
-# Install dependencies
-pip install -e .
-
-# Run gateway locally
-python -m grimoire.entrypoint --port 9001
-
-# CLI commands
-grimoire list
-grimoire ingest --alias "test" --url "https://..." --gpu 0
-grimoire status
 ```
