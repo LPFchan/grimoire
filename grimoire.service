@@ -1,0 +1,16 @@
+[Unit]
+Description=Grimoire Multi-GPU AI Inference Gateway
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=yeowool
+WorkingDirectory=/home/yeowool/grimoire
+ExecStart=/usr/bin/docker compose up -d --build
+ExecStop=/usr/bin/docker compose down
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

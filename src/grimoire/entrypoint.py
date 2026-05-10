@@ -33,7 +33,7 @@ LLAMA_SERVER_BIN = "/opt/model-a-llama-cpp/bin/llama-server"
 DEFAULT_CTX_SIZE = 131072
 DEFAULT_N_GPU_LAYERS = 999
 DEFAULT_PREDICT = 16384
-API_KEY = os.environ.get("GRIMOIRE_API_KEY") or os.environ.get("GATEWAY_API_KEY") or ""
+API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
 ADMIN_TOKEN = os.environ.get("GRIMOIRE_ADMIN_TOKEN") or API_KEY
 COOKIE_NAME = "gw_session"
 
@@ -120,7 +120,7 @@ def require_api(request):
     """Require the shared API key for public API and history endpoints."""
     if not API_KEY:
         if not ALLOW_ANONYMOUS:
-            raise HTTPException(status_code=503, detail="GRIMOIRE_API_KEY or GATEWAY_API_KEY is required")
+            raise HTTPException(status_code=503, detail="GRIMOIRE_API_KEY is required")
         return "anonymous", identity_hash("anonymous")
     token = _request_token(request)
     if token and hmac.compare_digest(token, API_KEY):
@@ -148,7 +148,7 @@ def require_admin(request):
 
 def _require_login_enabled():
     if not API_KEY and not ALLOW_ANONYMOUS:
-        raise HTTPException(status_code=503, detail="GRIMOIRE_API_KEY or GATEWAY_API_KEY is required")
+        raise HTTPException(status_code=503, detail="GRIMOIRE_API_KEY is required")
 
 
 def _resolve_config_path(path, base_dir=MODELS_DIR):
@@ -609,10 +609,12 @@ async def get_v1_models(request: Request):
     active_names = set(manager.list_active())
     for item in data:
         name = item["id"]
+        cfg = registry.get(name) or {}
         item["active"] = name in active_names
         item["status"] = {"value": manager.get_status(name)}
         item["in_cache"] = True
-        item["path"] = (registry.get(name) or {}).get("file", "")
+        item["path"] = cfg.get("file", "")
+        item["context_window"] = cfg.get("ctx-size", DEFAULT_CTX_SIZE)
     return {"object": "list", "data": data}
 
 
@@ -1068,6 +1070,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         await client.aclose()
         raise
 
+    non_streaming = not payload.get("stream", True)
+
     async def body_iter():
         try:
             stream = upstream.aiter_raw()
@@ -1082,8 +1086,21 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     payload,
                     record_history=upstream.status_code < 400,
                 )
-            async for chunk in stream:
-                yield chunk
+            if non_streaming:
+                body = b""
+                async for chunk in stream:
+                    body += chunk
+                try:
+                    data = json.loads(body)
+                    if "choices" in data:
+                        data["context_window"] = model_cfg.get("ctx-size", DEFAULT_CTX_SIZE)
+                    body = json.dumps(data).encode()
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+                yield body
+            else:
+                async for chunk in stream:
+                    yield chunk
         finally:
             await upstream.aclose()
             await client.aclose()

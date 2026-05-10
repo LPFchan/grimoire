@@ -171,6 +171,9 @@ COPY --from=build /opt/model-a-llama-cpp /opt/model-a-llama-cpp
 # Copy built llama.cpp webui
 COPY --from=webui /opt/grimoire-webui /opt/grimoire-webui
 
+# Copy jinja chat templates (for huihui/super gemma variants)
+COPY templates/ /templates/
+
 # Create registry and state directories
 RUN mkdir -p /etc/grimoire /var/lib/grimoire
 COPY etc/models.json /etc/grimoire/models.json

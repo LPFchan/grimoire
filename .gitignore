@@ -7,3 +7,4 @@ dist/
 build/
 *.so
 *.egg
+docker-compose.yml

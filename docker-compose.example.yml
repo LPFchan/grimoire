@@ -1,0 +1,28 @@
+services:
+  grimoire:
+    build: .
+    image: grimoire:local
+    container_name: grimoire
+    ports:
+      - "9001:9001"
+    volumes:
+      - /home/yeowool/models:/models:ro
+      - grimoire_state:/var/lib/grimoire
+    environment:
+      - GRIMOIRE_API_KEY=changeme
+      - STRUCTURED_COT=0
+      - STRUCTURED_TOOL=0
+      - STRUCTURED_TOOL_FALLBACK=0
+      - TOOL_STRUCTURED_PLAN_TIMEOUT_S=8
+      - TOOL_STRUCTURED_PLAN_MAX_TOKENS=192
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  grimoire_state:
