@@ -1,0 +1,33 @@
+tools/server/server-common.cpp | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+--- Changes ---
+
+tools/server/server-common.cpp
+  @@ -1082,7 +1082,27 @@ json oaicompat_chat_params_parse(
+  -            throw std::invalid_argument("Assistant response prefill is incompatible with enable_thinking.");
+  +            /* Allow prefill when it already closes the thinking block —
+  +             * the user is explicitly signaling reasoning is done and the
+  +             * model should proceed directly to answer output.
+  +             * See: https://github.com/ggml-org/llama.cpp/issues/21889 */
+  +            bool prefill_closes_thinking = false;
+  +            if (!last_message.content.empty()) {
+  +                prefill_closes_thinking = last_message.content.find("</think>") != std::string::npos;
+  +            }
+  +            if (!prefill_closes_thinking && !last_message.content_parts.empty()) {
+  +                for (const auto & p : last_message.content_parts) {
+  +                    if (p.text.find("</think>") != std::string::npos) {
+  +                        prefill_closes_thinking = true;
+  +                        break;
+  +                    }
+  +                }
+  +            }
+  +            if (!prefill_closes_thinking) {
+  +                throw std::invalid_argument(
+  +                    "Assistant response prefill is incompatible with enable_thinking. "
+  +                    "To allow prefill, ensure the assistant content contains a closed <think>...</think> block.");
+  +            }
+           }
+   
+           inputs.add_generation_prompt = true;
+  +21 -1

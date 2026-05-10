@@ -1,0 +1,62 @@
+{
+  "qwen-3.6-27B": {
+    "file": "gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf",
+    "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
+    "ctx-size": 262144,
+    "gpu": 0,
+    "cache-type-k": "turbo4",
+    "cache-type-v": "turbo4"
+  },
+  "gemma-4-31B": {
+    "file": "gguf/gemma-4-31B-it-UD-Q4_K_XL.gguf",
+    "mmproj": "gguf/mmproj-BF16.gguf",
+    "ctx-size": 131072,
+    "gpu": 1,
+    "cache-type-k": "turbo4",
+    "cache-type-v": "turbo4"
+  },
+  "huihui-qwen3.5-27B": {
+    "file": "gguf/Huihui-Qwen3.5-27B-abliterated.Q4_K_M.gguf",
+    "mmproj": "gguf/Huihui-Qwen3.5-27B-abliterated.mmproj-Q8_0.gguf",
+    "ctx-size": 262144,
+    "gpu": 0,
+    "cache-type-k": "turbo4",
+    "cache-type-v": "turbo4"
+  },
+  "huihui-gemma-4-31B": {
+    "file": "gguf/huihui-gemma-4-31b-it-abliterated-v2-q4_k_m.gguf",
+    "mmproj": "gguf/mmproj-BF16.gguf",
+    "ctx-size": 131072,
+    "gpu": 1,
+    "cache-type-k": "turbo4",
+    "cache-type-v": "turbo4"
+  },
+  "super-gemma-4-31B": {
+    "file": "gguf/SuperGemma4-31b-abliterated.Q4_K_M.gguf",
+    "mmproj": "gguf/mmproj-BF16.gguf",
+    "ctx-size": 131072,
+    "gpu": 1,
+    "cache-type-k": "turbo4",
+    "cache-type-v": "turbo4"
+  },
+  "qwopus-3.6-27B": {
+    "file": "gguf/Qwopus3.6-27B-v1-preview-Q4_K_M.gguf",
+    "mmproj": "gguf/qwopus-mmproj.gguf",
+    "ctx-size": 262144,
+    "gpu": 0,
+    "cache-type-k": "turbo4",
+    "cache-type-v": "turbo4"
+  },
+  "qwen-3.6-27B-otq": {
+    "file": "gguf/Qwen3.6-27B-OTQ-DYN-Q4_K_M.gguf",
+    "mmproj": null,
+    "ctx-size": 262144,
+    "gpu": 0
+  },
+  "qwen-3.6-27B-std": {
+    "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
+    "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
+    "ctx-size": 262144,
+    "gpu": 0
+  }
+}

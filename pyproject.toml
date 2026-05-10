@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grimoire"
+version = "0.1.0"
+description = "Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "httpx>=0.20.0",
+]
+
+[project.scripts]
+grimoire = "grimoire.cli:main"
+grimoire-gateway = "grimoire.gateway:main"
+grimoire-launcher = "grimoire.launcher:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
