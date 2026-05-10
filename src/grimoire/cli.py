@@ -2,12 +2,11 @@
 """Grimoire CLI - model management commands."""
 
 import argparse
-import json
 import logging
 import os
 import sys
-import urllib.request
 
+from grimoire.ingest import download_model_file, model_filename_from_url
 from grimoire.registry import registry, MODELS_DIR
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,7 @@ def cmd_list(args):
         print("No models registered")
         return
 
-    fixed = registry._data.get("fixed", {})
+    fixed = registry.list_fixed()
     for name in models:
         cfg = registry.get(name)
         pinned = name in fixed
@@ -39,7 +38,12 @@ def cmd_ingest(args):
         print("Error: Missing --alias or --url", file=sys.stderr)
         sys.exit(1)
 
-    model_filename = model_url.split("/")[-1]
+    try:
+        model_filename = model_filename_from_url(model_url)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
     model_dir = os.path.join(MODELS_DIR, "gguf")
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, model_filename)
@@ -50,8 +54,11 @@ def cmd_ingest(args):
 
     try:
         print(f"Downloading model from {model_url} to {model_path}...")
-        urllib.request.urlretrieve(model_url, model_path)
+        download_model_file(model_url, model_path)
         print("Download complete")
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"Failed to download model: {e}", file=sys.stderr)
         sys.exit(1)
@@ -73,7 +80,7 @@ def cmd_remove(args):
     try:
         registry.remove(args.model)
         print(f"Removed model {args.model}")
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -106,7 +113,7 @@ def cmd_status(args):
     print(f"Models directory: {MODELS_DIR}")
     print()
 
-    fixed = registry._data.get("fixed", {})
+    fixed = registry.list_fixed()
     print("Pinned models:")
     if fixed:
         for name, gpu in fixed.items():

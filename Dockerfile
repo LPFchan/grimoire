@@ -76,7 +76,7 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DLLAMA_BUILD_TOOLS=ON \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_TOOLS_INSTALL=OFF \
+        -DLLAMA_TOOLS_INSTALL=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${GRIMOIRE_CMAKE_CUDA_ARCHITECTURES}" \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
@@ -98,16 +98,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     GRIMOIRE_MODELS_DIR=/models \
     GRIMOIRE_REGISTRY_PATH=/etc/grimoire/models.json \
-    LD_LIBRARY_PATH=/opt/model-a-llama-cpp/lib:/opt/model-a-llama-cpp/lib64
+    LD_LIBRARY_PATH=/opt/model-a-llama-cpp/lib:/opt/model-a-llama-cpp/lib64 \
+    PATH=/opt/grimoire-venv/bin:$PATH
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         git \
         python3.11 \
         python3.11-venv \
-        python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -115,13 +119,16 @@ WORKDIR /app
 # Copy compiled llama-server
 COPY --from=build /opt/model-a-llama-cpp /opt/model-a-llama-cpp
 
-# Create registry directory and default models.json
-RUN mkdir -p /etc/grimoire && echo '{}' > /etc/grimoire/models.json
+# Create registry directory and copy default models.json
+RUN mkdir -p /etc/grimoire
+COPY etc/models.json /etc/grimoire/models.json
 
 # Install Python dependencies
 COPY pyproject.toml README.md /app/
-RUN python3.11 -m pip install --upgrade pip \
-    && python3.11 -m pip install -e .
+COPY src/ /app/src/
+RUN python3.11 -m venv /opt/grimoire-venv \
+    && /opt/grimoire-venv/bin/pip install --upgrade pip \
+    && /opt/grimoire-venv/bin/pip install .
 
 # Expose gateway port
 EXPOSE 9001
@@ -131,5 +138,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:9001/health || exit 1
 
 # Default entrypoint
-ENTRYPOINT ["python3.11", "-m", "grimoire.entrypoint"]
-CMD ["--help"]
+ENTRYPOINT ["python", "-m", "grimoire.entrypoint"]

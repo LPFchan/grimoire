@@ -23,7 +23,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_cmd(cfg, port):
+def build_cmd(cfg, port, ctx_size_override=None):
     """Build llama-server command from model config."""
     model_path = os.path.join(MODELS_DIR, cfg["file"])
     if not os.path.exists(model_path):
@@ -31,8 +31,8 @@ def build_cmd(cfg, port):
         sys.exit(1)
 
     ctx_size = cfg.get("ctx-size", 131072)
-    if args.ctx_size:
-        ctx_size = args.ctx_size
+    if ctx_size_override:
+        ctx_size = ctx_size_override
 
     cmd = [
         LLAMA_SERVER_BIN,
@@ -54,14 +54,15 @@ def build_cmd(cfg, port):
 
     if cfg.get("mmproj"):
         mmproj_path = os.path.join(MODELS_DIR, cfg["mmproj"])
-        if os.path.exists(mmproj_path):
-            cmd.extend(["--mmproj", mmproj_path])
+        if not os.path.exists(mmproj_path):
+            logger.error(f"MMProj file not found: {mmproj_path}")
+            sys.exit(1)
+        cmd.extend(["--mmproj", mmproj_path])
 
     return cmd
 
 
 def main():
-    global args
     args = parse_args()
 
     cfg = registry.get(args.model)
@@ -69,14 +70,18 @@ def main():
         logger.error(f"Model '{args.model}' not found in registry")
         sys.exit(1)
 
-    gpu = cfg.get("gpu", 0)
+    pinned_gpu = registry.get_fixed_gpu(args.model)
+    gpu = pinned_gpu if pinned_gpu is not None else 0
     if args.gpu is not None:
+        if args.gpu < 0:
+            logger.error("GPU ID must be a non-negative integer")
+            sys.exit(1)
         gpu = args.gpu
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
 
-    cmd = build_cmd(cfg, args.port)
+    cmd = build_cmd(cfg, args.port, args.ctx_size)
 
     logger.info(f"Starting {args.model} on GPU {gpu}, port {args.port}")
     logger.info(f"Command: {' '.join(cmd)}")
