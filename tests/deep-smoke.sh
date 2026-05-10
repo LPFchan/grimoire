@@ -1,6 +1,6 @@
 #!/bin/bash
-# Grimoire deep smoke test — loads a model, chats with it, switches, unloads.
-# Requires a running grimoire instance. Will auto-load models via /switch.
+# Grimoire deep smoke test — GPU-aware model lifecycle test.
+# Loads models across all GPUs, tests LRU eviction, protects pinned models.
 # Usage: ./deep-smoke.sh [base_url] [api_key] [admin_key]
 set -euo pipefail
 
@@ -9,168 +9,204 @@ KEY="${2:-${GRIMOIRE_API_KEY:-}}"
 ADMIN="${3:-${KEY}}"
 
 failures=0
-active_model=""
+PASS=0
+REQUIRE_MODELS=1  # need gpu_count + this many extra models
 
 pass()  { echo "  PASS  $1"; }
 fail()  { echo "  FAIL  $1 — $2"; failures=$((failures + 1)); }
 abort() { echo "  ABORT $1 — $2"; failures=$((failures + 1)); echo; echo "Result: $failures failures"; exit 1; }
 header() { echo; echo "=== $1 ==="; }
-
-# ------------------------------------------------------------------
-die() { abort "$1" "$2"; }
-
-require() {
-    if [ -z "${!1:-}" ]; then die "missing $1" "set \$$1"; fi
-}
+die()   { abort "$1" "$2"; }
 
 # ------------------------------------------------------------------
 header "prerequisites"
-require KEY
-require ADMIN
-if ! curl -sf "${BASE}/health" > /dev/null; then
-    die "grimoire unreachable" "${BASE}/health failed"
-fi
+[ -n "$KEY" ]   || die "missing key" "set GRIMOIRE_API_KEY or pass as \$2"
+[ -n "$ADMIN" ] || die "missing admin" "set admin key or pass as \$3"
+curl -sf "${BASE}/health" > /dev/null || die "grimoire unreachable" "${BASE}/health failed"
 pass "grimoire reachable"
 
-# ------------------------------------------------------------------
 header "auth"
 code=$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/v1/models")
-[ "$code" = "401" ] && pass "unauthenticated rejected"    || fail "auth" "expected 401 got $code"
+[ "$code" = "401" ] && pass "unauthenticated rejected"          || fail "auth" "expected 401 got $code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models")
-[ "$code" = "200" ] && pass "authenticated accepted"       || fail "auth" "expected 200 got $code"
+[ "$code" = "200" ] && pass "authenticated accepted"             || die   "auth" "authenticated request failed"
 
 # ------------------------------------------------------------------
-header "registry"
-models_json=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models")
-count=$(echo "$models_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['data']))")
-[ "$count" -gt 0 ] && pass "$count models in registry" || die "registry" "empty"
+# Gather topology via a single Python helper script
+header "topology"
+TOPOLOGY=$(BASE="$BASE" KEY="$KEY" python3 <<'PYEOF'
+import json, os, urllib.request
 
-# pick two models from different families for switching test
-FIRST=$(echo "$models_json" | python3 -c "
-import sys,json
-data=json.load(sys.stdin)['data']
-qwen=[m['id'] for m in data if m.get('family')=='qwen']
-gemma=[m['id'] for m in data if m.get('family')=='gemma']
-print(qwen[0] if qwen else data[0]['id'])
-")
-SECOND=$(echo "$models_json" | python3 -c "
-import sys,json
-data=json.load(sys.stdin)['data']
-gemma=[m['id'] for m in data if m.get('family')=='gemma']
-qwen=[m['id'] for m in data if m.get('family')=='qwen']
-print(gemma[0] if gemma else data[-1]['id'])
-")
-pass "first=$FIRST second=$SECOND"
+BASE = os.environ["BASE"]
+KEY  = os.environ["KEY"]
+
+def api(path):
+    req = urllib.request.Request(f"{BASE}{path}", headers={"Authorization": f"Bearer {KEY}"})
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
+
+models = api("/v1/models")
+status = api("/models")
+gpu_count = status["gpu_count"]
+
+data = models["data"]
+pinned   = [m for m in data if m.get("pinned_gpu") is not None]
+nonpinned = [m for m in data if m.get("pinned_gpu") is None]
+
+queue = [m["id"] for m in pinned] + [m["id"] for m in nonpinned]
+
+print(json.dumps({"gpu_count": gpu_count, "queue": queue}))
+PYEOF
+)
+
+gpu_count=$(echo "$TOPOLOGY" | python3 -c "import sys,json; print(json.load(sys.stdin)['gpu_count'])")
+pass "$gpu_count GPU(s) detected"
+
+# Read queue as array
+queue_json=$(echo "$TOPOLOGY" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['queue']))")
+queue_len=$(echo "$queue_json" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+need=$((gpu_count + REQUIRE_MODELS))
+[ "$queue_len" -ge "$need" ] || die "models" "need $need models (got $queue_len)"
+
+# First gpu_count models fill GPUs, the rest are eviction triggers
+fill_models=$(echo "$queue_json" | python3 -c "import sys,json; a=json.load(sys.stdin); print(' '.join(a[:$gpu_count]))")
+eviction_model=$(echo "$queue_json" | python3 -c "import sys,json; a=json.load(sys.stdin); print(a[$gpu_count])")
+pass "fill: $fill_models"
+pass "eviction trigger: $eviction_model"
 
 # ------------------------------------------------------------------
+# helpers
+get_status() {
+    curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models" | \
+        python3 -c "import sys,json; [print(m.get('status',{}).get('value','')) for m in json.load(sys.stdin)['data'] if m['id']==sys.argv[1]]" "$1" 2>/dev/null || echo "unknown"
+}
+
+is_pinned() {
+    curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models" | \
+        python3 -c "import sys,json; [print('yes' if m.get('pinned_gpu') is not None else 'no') for m in json.load(sys.stdin)['data'] if m['id']==sys.argv[1]]" "$1" 2>/dev/null || echo "no"
+}
+
 load_model() {
     local model="$1"
     header "load $model"
-    local http=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer ${ADMIN}" \
-        -X POST "${BASE}/switch/${model}")
-    if [ "$http" = "200" ]; then
-        pass "switch accepted (200)"
-    else
-        die "switch" "got HTTP $http switching to $model"
-    fi
+    local http=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${ADMIN}" -X POST "${BASE}/switch/${model}")
+    [ "$http" = "200" ] || die "switch" "got HTTP $http switching to $model"
+    pass "switch accepted"
 
-    # poll until loaded
     local deadline=$(($(date +%s) + 180))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        local status=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models" | \
-            python3 -c "import sys,json; [print(m.get('status',{}).get('value','')) for m in json.load(sys.stdin)['data'] if m['id']=='$model']" 2>/dev/null || echo "")
-        if [ "$status" = "loaded" ]; then
-            pass "model loaded"
-            active_model="$model"
-            return 0
-        elif [ "$status" = "failed" ]; then
-            die "model $model" "status is 'failed'"
-        fi
+        local st=$(get_status "$model")
+        [ "$st" = "loaded" ]  && { pass "loaded (GPU settled)"; return 0; }
+        [ "$st" = "failed" ] && { die "$model" "status is 'failed'"; }
         sleep 2
     done
-    die "model $model" "timed out waiting for 'loaded' status"
+    die "$model" "timed out waiting for 'loaded'"
 }
 
-chat_once() {
-    local model="${1:-$active_model}"
+chat_verify() {
+    local model="$1"
     header "chat with $model"
     local resp=$(curl -sf -H "Authorization: Bearer ${KEY}" \
         -H "Content-Type: application/json" \
         -d "{\"model\":\"$model\",\"messages\":[{\"role\":\"user\",\"content\":\"say hi\"}],\"max_tokens\":256,\"stream\":false}" \
-        "${BASE}/v1/chat/completions" 2>&1)
-    local code=$?
-    if [ "$code" != "0" ]; then
-        fail "chat" "curl failed: $resp"
-        return
-    fi
-    local content=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+        "${BASE}/v1/chat/completions" 2>&1) || { fail "chat" "curl failed"; return; }
+    local content=$(echo "$resp" | python3 -c "
+import sys,json
+r=json.load(sys.stdin)
+c=r['choices'][0]['message'].get('content','')
+if not c: c=r['choices'][0]['message'].get('reasoning_content','')
+print(c)
+" 2>/dev/null)
     if [ -n "$content" ]; then
         pass "response: $(echo "$content" | head -c 80)"
     else
         fail "chat" "empty response"
     fi
-
-    # verify context_window in response
     local ctx=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('context_window',''))" 2>/dev/null || echo "")
-    if [ -n "$ctx" ]; then
-        pass "context_window=$ctx"
-    else
-        fail "context_window" "missing in non-streaming response"
-    fi
+    [ -n "$ctx" ] && pass "context_window=$ctx" || fail "context_window" "missing"
 }
 
-check_active_in_models() {
-    local model="$1"
+check_active() {
+    local model="$1" expected="$2"
     local active=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models" | \
-        python3 -c "import sys,json; [print(m['active']) for m in json.load(sys.stdin)['data'] if m['id']=='$model']" 2>/dev/null)
-    if [ "$active" = "True" ]; then
-        pass "$model marked active in /v1/models"
+        python3 -c "import sys,json; [print(m['active']) for m in json.load(sys.stdin)['data'] if m['id']==sys.argv[1]]" "$model" 2>/dev/null)
+    if [ "$active" = "$expected" ]; then
+        pass "$model active=$expected"
     else
-        fail "active flag" "$model not active in /v1/models"
+        fail "active flag" "$model got $active expected $expected"
     fi
 }
 
 stop_model() {
     local model="$1"
     header "stop $model"
-    local http=$(curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer ${ADMIN}" \
-        -X POST "${BASE}/stop/${model}")
+    local http=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${ADMIN}" -X POST "${BASE}/stop/${model}")
     [ "$http" = "200" ] && pass "stopped" || fail "stop" "got HTTP $http"
     sleep 2
-    local status=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models" | \
-        python3 -c "import sys,json; [print(m.get('status',{}).get('value','')) for m in json.load(sys.stdin)['data'] if m['id']=='$model']" 2>/dev/null || echo "")
-    [ "$status" = "unloaded" ] && pass "status is unloaded" || fail "status" "got '$status' expected 'unloaded'"
-    active_model=""
+    local st=$(get_status "$model")
+    [ "$st" = "unloaded" ] && pass "status is unloaded" || fail "status" "got '$st' expected 'unloaded'"
 }
 
 # ------------------------------------------------------------------
-# Verify none loaded initially
 header "pre-check"
-active=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/health" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['active_models']))")
-[ "$active" = "0" ] && pass "no models loaded" || pass "$active models already loaded (pre-existing)"
+active_now=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/health" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['active_models']))")
+[ "$active_now" = "0" ] && pass "no models pre-loaded" || pass "$active_now models already active"
 
 # ------------------------------------------------------------------
-load_model "$FIRST"
-check_active_in_models "$FIRST"
-chat_once "$FIRST"
+# PHASE 1: Fill all GPUs
+header "phase 1: fill all $gpu_count GPU(s)"
+loaded_list=""
+for model in $fill_models; do
+    load_model "$model"
+    loaded_list="$loaded_list $model"
+    check_active "$model" "True"
+    chat_verify "$model"
+done
+loaded_list=$(echo "$loaded_list" | xargs)
+pass "all GPUs filled: $loaded_list"
 
 # ------------------------------------------------------------------
-load_model "$SECOND"
-check_active_in_models "$SECOND"
-chat_once "$SECOND"
-# first should be evicted (only one GPU pinned model, second takes the other)
-old_status=$(curl -sf -H "Authorization: Bearer ${KEY}" "${BASE}/v1/models" | \
-    python3 -c "import sys,json; [print(m.get('status',{}).get('value','')) for m in json.load(sys.stdin)['data'] if m['id']=='$FIRST']" 2>/dev/null || echo "")
+# PHASE 2: Trigger LRU eviction
+header "phase 2: LRU eviction"
+
+# Find the oldest non-pinned model (first non-pinned in loaded_list)
+oldest=""
+for m in $loaded_list; do
+    if [ "$(is_pinned "$m")" = "no" ]; then
+        oldest="$m"
+        break
+    fi
+done
+[ -n "$oldest" ] || die "eviction" "no non-pinned model found to evict"
+pass "oldest non-pinned: $oldest"
+
+load_model "$eviction_model"
+check_active "$eviction_model" "True"
+chat_verify "$eviction_model"
+
+# Check oldest was evicted
+old_status=$(get_status "$oldest")
 if [ "$old_status" = "unloaded" ]; then
-    pass "$FIRST auto-evicted on switch"
+    pass "$oldest LRU-evicted"
 else
-    pass "$FIRST still $old_status (may be on other GPU)"
+    fail "eviction" "$oldest still $old_status (expected unloaded)"
 fi
 
+# Verify pinned models survived
+for m in $loaded_list; do
+    [ "$m" = "$oldest" ] && continue
+    st=$(get_status "$m")
+    [ "$st" = "loaded" ] && pass "$m survived" || fail "eviction" "$m was also evicted"
+done
+
 # ------------------------------------------------------------------
-stop_model "$SECOND"
+# PHASE 3: Cleanup all loaded models
+header "phase 3: cleanup"
+for m in $loaded_list $eviction_model; do
+    st=$(get_status "$m")
+    [ "$st" = "unloaded" ] && continue
+    stop_model "$m"
+done
 
 # ------------------------------------------------------------------
 echo

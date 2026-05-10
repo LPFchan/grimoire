@@ -115,7 +115,5 @@
       "cache-type-v": "turbo4"
     }
   },
-  "fixed": {
-    "qwen-3.6-27B": 0
-  }
+  "fixed": {}
 }
