@@ -74,16 +74,6 @@ API endpoints require `Authorization: Bearer ...` or `X-Grimoire-Token`; set `GR
 Unauthenticated local-only development requires the explicit opt-in `GRIMOIRE_ALLOW_ANONYMOUS=1`.
 Management endpoints use `GRIMOIRE_ADMIN_TOKEN` if set, otherwise the API key.
 
-## Drop-In Cutover On grimoire
-
-The legacy system exposes `localhost:9001` through Cloudflare Tunnel (`chat.lost.plus`) and uses the same OpenAI-compatible `/v1` path. To replace it without changing OpenCode or Cloudflare config:
-
-- Set `GATEWAY_API_KEY` or `GRIMOIRE_API_KEY` to the existing OpenCode key.
-- Stop the legacy `eastself-gateway.service` before starting this gateway, because both bind port `9001`.
-- Stop legacy per-model services before enabling dynamic Grimoire launches, because both systems compete for the same GPU and backend ports.
-- Keep `/home/yeowool/models`, `/home/yeowool/templates`, and `/home/yeowool/structured-cot/grammars` mounted as shown above.
-- Keep the Cloudflare tunnel target unchanged: `http://localhost:9001`.
-
 ## Model Registry
 
 The mutable registry is stored at `/var/lib/grimoire/models.json` by default so it is persisted by the state volume. The image ships a seed registry at `/etc/grimoire/models.json`; if the state registry does not exist yet, Grimoire reads the seed and writes future changes to `/var/lib/grimoire/models.json`.
