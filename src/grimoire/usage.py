@@ -127,6 +127,93 @@ class UsageStore:
             "models": {row["model"]: row_dict(row) for row in models},
         }
 
+    def binned_window(self, user_hash, ts_from, ts_to, bins):
+        """Return token/cost time series binned into `bins` buckets over [ts_from, ts_to).
+
+        ts_from and ts_to are Unix timestamps (seconds). Costs are summed per bin
+        in dollars; tokens are integer counts per bin. Empty bins are zero.
+        """
+        empty = {
+            "input_tokens_series": [0] * max(bins, 0),
+            "output_tokens_series": [0] * max(bins, 0),
+            "input_cost_series": [0.0] * max(bins, 0),
+            "output_cost_series": [0.0] * max(bins, 0),
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_input_cost": 0.0,
+            "total_output_cost": 0.0,
+        }
+        if ts_to <= ts_from or bins <= 0:
+            return empty
+        width = (ts_to - ts_from) / bins
+        where = (
+            "WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ? "
+            "AND CAST(strftime('%s', created_at) AS INTEGER) < ?"
+        )
+        params = [int(ts_from), int(ts_to)]
+        if user_hash is not None:
+            where += " AND user_hash = ?"
+            params.append(user_hash)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    CAST((CAST(strftime('%s', created_at) AS REAL) - ?) / ? AS INTEGER) AS bin,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(input_cost), 0) AS input_cost,
+                    COALESCE(SUM(output_cost), 0) AS output_cost
+                FROM usage_events
+                {where}
+                GROUP BY bin
+                """,
+                (float(ts_from), float(width), *params),
+            ).fetchall()
+        in_tok = [0] * bins
+        out_tok = [0] * bins
+        in_cost = [0.0] * bins
+        out_cost = [0.0] * bins
+        total_in_tok = 0
+        total_out_tok = 0
+        total_in_cost = 0.0
+        total_out_cost = 0.0
+        for r in rows:
+            try:
+                b = int(r["bin"])
+            except (TypeError, ValueError):
+                continue
+            if 0 <= b < bins:
+                in_tok[b] = int(r["input_tokens"] or 0)
+                out_tok[b] = int(r["output_tokens"] or 0)
+                in_cost[b] = float(r["input_cost"] or 0)
+                out_cost[b] = float(r["output_cost"] or 0)
+                total_in_tok += in_tok[b]
+                total_out_tok += out_tok[b]
+                total_in_cost += in_cost[b]
+                total_out_cost += out_cost[b]
+        return {
+            "input_tokens_series": in_tok,
+            "output_tokens_series": out_tok,
+            "input_cost_series": in_cost,
+            "output_cost_series": out_cost,
+            "total_input_tokens": total_in_tok,
+            "total_output_tokens": total_out_tok,
+            "total_input_cost": total_in_cost,
+            "total_output_cost": total_out_cost,
+        }
+
+    def earliest_event_ts(self, user_hash=None):
+        """Return the earliest event timestamp (Unix seconds) or None."""
+        where = "WHERE user_hash = ?" if user_hash else ""
+        params = (user_hash,) if user_hash else ()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                f"SELECT MIN(CAST(strftime('%s', created_at) AS INTEGER)) AS t "
+                f"FROM usage_events {where}",
+                params,
+            ).fetchone()
+        return int(row["t"]) if row and row["t"] is not None else None
+
     def import_legacy_token_stats(self, path, user_hash, cost_by_model=None):
         """Import legacy token-stats.json once, then continue appending new events."""
         if not path or not os.path.exists(path):

@@ -25,6 +25,7 @@ from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
 from grimoire.plugins import plugin_manager
 from grimoire.registry import MODELS_DIR, registry
+from grimoire.telemetry import telemetry_sampler, telemetry_store
 from grimoire.usage import usage_store
 
 logger = logging.getLogger(__name__)
@@ -525,9 +526,15 @@ async def lifespan(_app):
     initial_model = getattr(_app.state, "initial_model", None)
     if initial_model:
         await manager.start_model(initial_model)
+    sampler_task = asyncio.create_task(telemetry_sampler())
     try:
         yield
     finally:
+        sampler_task.cancel()
+        try:
+            await sampler_task
+        except (asyncio.CancelledError, Exception):
+            pass
         await manager.shutdown()
 
 
@@ -810,6 +817,95 @@ async def get_global_stats(request: Request):
     """Return global token and equivalent-cost usage totals."""
     require_admin(request)
     return usage_store.summary()
+
+
+DASHBOARD_WINDOWS_S = {
+    "5m": 5 * 60,
+    "15m": 15 * 60,
+    "1h": 60 * 60,
+    "6h": 6 * 60 * 60,
+    "24h": 24 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+    "30d": 30 * 24 * 60 * 60,
+}
+DASHBOARD_BINS = 60
+
+
+@app.get("/stats/dashboard")
+async def get_dashboard_stats(request: Request):
+    """Combined token/cost + system telemetry time series for the dashboard.
+
+    Query params:
+        window: one of "5m","15m","1h","6h","24h","7d","30d","all" (default "1h")
+    """
+    _, user_hash = require_api(request)
+    window = (request.query_params.get("window") or "1h").lower()
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if window in {"all", "lifetime"}:
+        earliest = usage_store.earliest_event_ts(user_hash=user_hash)
+        sample_earliest = telemetry_store.earliest_ts()
+        candidates = [t for t in (earliest, sample_earliest) if t]
+        ts_from = min(candidates) if candidates else now_ts - DASHBOARD_WINDOWS_S["1h"]
+        if ts_from >= now_ts:
+            ts_from = now_ts - DASHBOARD_WINDOWS_S["1h"]
+        window_label = "all"
+    else:
+        seconds = DASHBOARD_WINDOWS_S.get(window)
+        if seconds is None:
+            raise HTTPException(status_code=400, detail=f"Unknown window: {window}")
+        ts_from = now_ts - seconds
+        window_label = window
+
+    bins = DASHBOARD_BINS
+    usage = usage_store.binned_window(user_hash, ts_from, now_ts, bins)
+    summary = usage_store.summary(user_hash=user_hash)
+    lifetime = summary.get("total", {})
+
+    def _system(metric, gpu_index):
+        return {
+            "current": telemetry_store.latest(metric, gpu_index),
+            "series": telemetry_store.binned_avg(metric, gpu_index, ts_from, now_ts, bins),
+        }
+
+    gpu_indexes = sorted({0, 1, *range(manager.gpu_count)})
+    gpus = [
+        {
+            "index": idx,
+            "temp": _system("gpu_temp", idx),
+            "power": _system("gpu_power", idx),
+        }
+        for idx in gpu_indexes
+    ]
+
+    return {
+        "window": window_label,
+        "from": ts_from,
+        "to": now_ts,
+        "bins": bins,
+        "tokens": {
+            "input": {
+                "current": usage["total_input_tokens"],
+                "series": usage["input_tokens_series"],
+            },
+            "output": {
+                "current": usage["total_output_tokens"],
+                "series": usage["output_tokens_series"],
+            },
+        },
+        "cost": {
+            "total": usage["total_input_cost"] + usage["total_output_cost"],
+            "input": usage["total_input_cost"],
+            "output": usage["total_output_cost"],
+            "lifetime": float(lifetime.get("total_cost") or 0.0),
+            "series": [
+                a + b
+                for a, b in zip(usage["input_cost_series"], usage["output_cost_series"])
+            ],
+        },
+        "gpus": gpus,
+        "cpu": {"temp": _system("cpu_temp", -1)},
+    }
 
 
 @app.post("/switch/{model_name}")
