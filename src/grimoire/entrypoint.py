@@ -1160,10 +1160,6 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
             if len(captured) < MAX_HISTORY_CAPTURE_BYTES:
                 remaining = MAX_HISTORY_CAPTURE_BYTES - len(captured)
                 captured.extend(chunk[:remaining])
-            if gpu_index is not None:
-                tps = _extract_chunk_tokens_per_sec(chunk)
-                if tps is not None:
-                    telemetry_store.record(time.time(), [(gpu_index, "gpu_tokens_per_sec", tps)])
             yield chunk
     finally:
         raw = bytes(captured)
