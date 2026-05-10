@@ -721,7 +721,7 @@ async def delete_history(conversation_id: str, request: Request):
         history_store.delete_conversation_with_options(user_hash, conversation_id, delete_with_forks=with_forks)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return Response(status_code=204)
+    return {"deleted": conversation_id}
 
 
 @app.patch("/history/messages/{message_id}")
@@ -733,7 +733,7 @@ async def patch_history_message_by_id(message_id: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Message '{message_id}' not found")
     data = await request.json()
     history_store.update_message_tree(user_hash, conv_id, message_id, data)
-    return Response(status_code=204)
+    return {"updated": message_id}
 
 
 @app.delete("/history/messages/{message_id}")
@@ -768,7 +768,7 @@ async def patch_history_message(conversation_id: str, message_id: str, request: 
         history_store.update_message_tree(user_hash, conversation_id, message_id, data)
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return Response(status_code=204)
+    return {"updated": message_id}
 
 
 @app.delete("/history/{conversation_id}/messages/{message_id}")
