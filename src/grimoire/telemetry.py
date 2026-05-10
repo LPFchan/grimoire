@@ -135,7 +135,7 @@ def _read_gpu_samples():
         result = subprocess.run(
             [
                 "nvidia-smi",
-                "--query-gpu=index,temperature.gpu,power.draw",
+                "--query-gpu=index,temperature.gpu,power.draw,memory.used",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -164,6 +164,11 @@ def _read_gpu_samples():
             out.append((idx, "gpu_power", float(parts[2])))
         except ValueError:
             pass
+        if len(parts) >= 4:
+            try:
+                out.append((idx, "gpu_vram", float(parts[3])))
+            except ValueError:
+                pass
     return out
 
 

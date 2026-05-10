@@ -878,6 +878,8 @@ async def get_dashboard_stats(request: Request):
             "index": idx,
             "temp": _system("gpu_temp", idx),
             "power": _system("gpu_power", idx),
+            "vram": _system("gpu_vram", idx),
+            "tokens_per_sec": _system("gpu_tokens_per_sec", idx),
         }
         for idx in gpu_indexes
     ]
@@ -1103,7 +1105,30 @@ def _extract_usage(raw_bytes):
     return found
 
 
-async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, record_history=True):
+def _extract_tokens_per_sec(raw_bytes):
+    """Extract predicted_per_second from the last timing chunk in SSE data."""
+    text = raw_bytes.decode("utf-8", errors="ignore")
+    best = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        timings = parsed.get("timings") if isinstance(parsed, dict) else None
+        if isinstance(timings, dict):
+            tps = timings.get("predicted_per_second")
+            if isinstance(tps, (int, float)) and tps > 0:
+                best = float(tps)
+    return best
+
+
+async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, gpu_index=None, record_history=True):
     captured = bytearray()
     usage_tail = bytearray()
     try:
@@ -1144,6 +1169,13 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
                 usage["output_tokens"],
                 cost_rates=model_cfg.get("cost"),
             )
+
+        if gpu_index is not None:
+            tps = _extract_tokens_per_sec(raw)
+            if tps is None:
+                tps = _extract_tokens_per_sec(bytes(usage_tail))
+            if tps is not None and tps > 0:
+                telemetry_store.record(time.time(), [(gpu_index, "gpu_tokens_per_sec", tps)])
 
         assistant_text = _extract_assistant_text(raw)
         if record_history and assistant_text and conversation_id:
@@ -1195,6 +1227,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     active.name,
                     model_cfg,
                     payload,
+                    gpu_index=active.gpu,
                     record_history=upstream.status_code < 400,
                 )
             if non_streaming:

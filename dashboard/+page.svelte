@@ -19,7 +19,7 @@
 			lifetime: number;
 			series: Array<number>;
 		};
-		gpus: Array<{ index: number; temp: Series; power: Series }>;
+		gpus: Array<{ index: number; temp: Series; power: Series; vram: Series; tokens_per_sec: Series }>;
 		cpu: { temp: Series; power: Series };
 		fans: { fan1: Series; fan2: Series };
 	};
@@ -103,6 +103,17 @@
 		if (n == null) return '—';
 		if (n >= 1000) return `${(n / 1000).toFixed(1)}k RPM`;
 		return `${Math.round(n)} RPM`;
+	}
+
+	function fmtVram(mb: number | null | undefined): string {
+		if (mb == null) return '—';
+		if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+		return `${Math.round(mb)} MB`;
+	}
+
+	function fmtTps(n: number | null | undefined): string {
+		if (n == null) return '—';
+		return `${n.toFixed(1)} t/s`;
 	}
 
 	type Sparkline = { line: string; area: string; lo: number; hi: number };
@@ -334,6 +345,20 @@
 				gpu.power.series,
 				'oklch(0.78 0.16 80)',
 				fmtPower
+			)}
+			{@render statCard(
+				gpuLabel(gpu.index, 'VRAM'),
+				fmtVram(gpu.vram.current),
+				gpu.vram.series,
+				'oklch(0.65 0.18 270)',
+				fmtVram
+			)}
+			{@render statCard(
+				gpuLabel(gpu.index, 't/s'),
+				fmtTps(gpu.tokens_per_sec.current),
+				gpu.tokens_per_sec.series,
+				'oklch(0.70 0.16 60)',
+				fmtTps
 			)}
 		{/each}
 
