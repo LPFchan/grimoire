@@ -26,7 +26,7 @@ Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving.
 - **Multi-GPU** — Run multiple models simultaneously, one per GPU
 - **Dynamic GPU allocation** — Free GPU preferred, oldest non-pinned model evicted when all GPUs busy
 - **Canonical model switcher** — Built-in web UI and API for loading/switching models
-- **Server-side history** — Per-api-key conversation history stored in SQLite
+- **Server-side history** — Per-api-key conversation tree (branches, currNode pointer, fork chains) stored in SQLite, served to the bundled webui via the same `/history` API contract its DatabaseService used to hit IndexedDB
 - **Token/cost tally** — Per-api-key and global token/cost accounting with legacy import
 - **Pinned models** — Fix specific models to specific GPUs via `fixed` section
 - **Model registry** — JSON-based registry with per-model settings
@@ -154,10 +154,41 @@ contract the webui already speaks: `GET /props`, `GET /props?model=<id>`,
 
 On first load the webui prompts for the API key, which it sends as
 `Authorization: Bearer ...` on every authenticated request. The key is the
-same `GRIMOIRE_API_KEY` / legacy `GATEWAY_API_KEY` used by OpenCode.
+same `GRIMOIRE_API_KEY` / legacy `GATEWAY_API_KEY` used by OpenCode. After a
+successful POST to `/login`, grimoire writes the key into the webui's
+`LlamaCppWebui.config` localStorage entry so users only authenticate once.
 
 To override where the webui assets are served from (e.g. for development),
 set `GRIMOIRE_WEBUI_DIR` to a directory containing `index.html`.
+
+### Server-side conversation history
+
+The webui's upstream conversation store is Dexie/IndexedDB (browser-local).
+This repo ships `patches/grimoire-webui-history.patch`, applied during the
+webui build stage, that swaps the `DatabaseService` Dexie backend for HTTP
+calls to grimoire's tree-aware `/history` endpoints. The patch is scoped to
+one file (`tools/server/webui/src/lib/services/database.service.ts`) and
+preserves the existing static method signatures so chat/conversations stores
+keep working without changes.
+
+Endpoints the patched DatabaseService hits:
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/history` | List conversations (sidebar) |
+| POST | `/history` | Create or upsert conversation |
+| GET | `/history/{id}` | Read one conversation with its message tree |
+| PATCH | `/history/{id}` | Partial conversation update (`updateConversation`) |
+| DELETE | `/history/{id}?with_forks=true` | Delete conversation; optionally cascade through forks |
+| POST | `/history/{id}/messages` | Create a message branch under `parent_id` |
+| PATCH | `/history/messages/{id}` | Update a message (resolves convId server-side) |
+| DELETE | `/history/messages/{id}` | Delete a single message |
+| DELETE | `/history/{id}/messages/{id}?cascade=true` | Cascade delete a subtree |
+| POST | `/history/{id}/fork` | Fork conversation at a given message |
+| POST | `/history/import` | Bulk-import conversations in the webui's exported shape |
+
+Conversations and message trees are stored per `user_hash` (sha256 of the
+API key), so two users with different keys see disjoint history.
 
 ## Building
 

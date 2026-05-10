@@ -1,0 +1,610 @@
+diff --git a/tools/server/webui/src/lib/services/database.service.ts b/tools/server/webui/src/lib/services/database.service.ts
+index 8f7b81f..e8e90dd 100644
+--- a/tools/server/webui/src/lib/services/database.service.ts
++++ b/tools/server/webui/src/lib/services/database.service.ts
+@@ -1,23 +1,53 @@
+-import Dexie, { type EntityTable } from 'dexie';
+-import { findDescendantMessages, uuid, filterByLeafNodeId } from '$lib/utils';
+-import type { McpServerOverride } from '$lib/types/database';
++/**
++ * DatabaseService — grimoire-backed conversation store.
++ *
++ * Replaces the upstream Dexie/IndexedDB implementation with HTTP calls to
++ * grimoire's tree-aware /history endpoints. The static method signatures
++ * stay identical to the upstream interface so chat.svelte.ts,
++ * conversations.svelte.ts, ChatMessage.svelte, and legacy-migration.ts
++ * keep working without further changes.
++ *
++ * The grimoire server stores: parent_id, children_json, type, timestamp_ms,
++ * tool_calls, tool_call_id, reasoning_content, extra_json, timings_json,
++ * model, plus the conversation-level curr_node_id and forked_from_id.
++ *
++ * Authentication is handled by apiFetch/apiPost via the user's apiKey in
++ * settings → Authorization: Bearer <key>.
++ */
++
++import { apiFetch, apiPost, uuid } from '$lib/utils';
++import { MessageRole } from '$lib/enums';
+ 
+-class LlamacppDatabase extends Dexie {
+-	conversations!: EntityTable<DatabaseConversation, string>;
+-	messages!: EntityTable<DatabaseMessage, string>;
++interface ConversationListResponse {
++	conversations: DatabaseConversation[];
++}
+ 
+-	constructor() {
+-		super('LlamacppWebui');
++interface ConversationDetailResponse extends DatabaseConversation {
++	messages: DatabaseMessage[];
++}
+ 
+-		this.version(1).stores({
+-			conversations: 'id, lastModified, currNode, name',
+-			messages: 'id, convId, type, role, timestamp, parent, children'
+-		});
+-	}
++interface DeletedMessagesResponse {
++	deleted: string[];
+ }
+ 
+-const db = new LlamacppDatabase();
+-import { MessageRole } from '$lib/enums';
++interface ImportConversationsResponse {
++	imported: number;
++	skipped: number;
++}
++
++const HISTORY = '/history';
++
++function convPath(id: string): string {
++	return `${HISTORY}/${encodeURIComponent(id)}`;
++}
++
++function messagesPath(convId: string): string {
++	return `${convPath(convId)}/messages`;
++}
++
++function messageByIdPath(messageId: string): string {
++	return `${HISTORY}/messages/${encodeURIComponent(messageId)}`;
++}
+ 
+ export class DatabaseService {
+ 	/**
+@@ -28,22 +58,55 @@ export class DatabaseService {
+ 	 *
+ 	 */
+ 
+-	/**
+-	 * Creates a new conversation.
+-	 *
+-	 * @param name - Name of the conversation
+-	 * @returns The created conversation
+-	 */
+ 	static async createConversation(name: string): Promise<DatabaseConversation> {
+-		const conversation: DatabaseConversation = {
++		return await apiPost<DatabaseConversation>(HISTORY, {
+ 			id: uuid(),
+ 			name,
+ 			lastModified: Date.now(),
+-			currNode: ''
+-		};
++			currNode: null
++		});
++	}
+ 
+-		await db.conversations.add(conversation);
+-		return conversation;
++	static async getAllConversations(): Promise<DatabaseConversation[]> {
++		const result = await apiFetch<ConversationListResponse>(HISTORY);
++		return result.conversations || [];
++	}
++
++	static async getConversation(id: string): Promise<DatabaseConversation | undefined> {
++		try {
++			const detail = await apiFetch<ConversationDetailResponse>(convPath(id));
++			const { messages: _messages, ...conversation } = detail;
++			return conversation;
++		} catch {
++			return undefined;
++		}
++	}
++
++	static async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
++		try {
++			const detail = await apiFetch<ConversationDetailResponse>(convPath(convId));
++			return detail.messages || [];
++		} catch {
++			return [];
++		}
++	}
++
++	static async updateConversation(
++		id: string,
++		updates: Partial<Omit<DatabaseConversation, 'id'>>
++	): Promise<void> {
++		await apiFetch<ConversationDetailResponse>(convPath(id), {
++			method: 'PATCH',
++			body: JSON.stringify({ ...updates, lastModified: Date.now() })
++		});
++	}
++
++	static async deleteConversation(
++		id: string,
++		options?: { deleteWithForks?: boolean }
++	): Promise<void> {
++		const path = options?.deleteWithForks ? `${convPath(id)}?with_forks=true` : convPath(id);
++		await apiFetch<unknown>(path, { method: 'DELETE' });
+ 	}
+ 
+ 	/**
+@@ -54,88 +117,38 @@ export class DatabaseService {
+ 	 *
+ 	 */
+ 
+-	/**
+-	 * Creates a new message branch by adding a message and updating parent/child relationships.
+-	 * Also updates the conversation's currNode to point to the new message.
+-	 *
+-	 * @param message - Message to add (without id)
+-	 * @param parentId - Parent message ID to attach to
+-	 * @returns The created message
+-	 */
+ 	static async createMessageBranch(
+ 		message: Omit<DatabaseMessage, 'id'>,
+ 		parentId: string | null
+ 	): Promise<DatabaseMessage> {
+-		return await db.transaction('rw', [db.conversations, db.messages], async () => {
+-			// Handle null parent (root message case)
+-			if (parentId !== null) {
+-				const parentMessage = await db.messages.get(parentId);
+-				if (!parentMessage) {
+-					throw new Error(`Parent message ${parentId} not found`);
+-				}
+-			}
+-
+-			const newMessage: DatabaseMessage = {
+-				...message,
+-				id: uuid(),
+-				parent: parentId,
+-				toolCalls: message.toolCalls ?? '',
+-				children: []
+-			};
+-
+-			await db.messages.add(newMessage);
+-
+-			// Update parent's children array if parent exists
+-			if (parentId !== null) {
+-				const parentMessage = await db.messages.get(parentId);
+-				if (parentMessage) {
+-					await db.messages.update(parentId, {
+-						children: [...parentMessage.children, newMessage.id]
+-					});
+-				}
+-			}
+-
+-			await this.updateConversation(message.convId, {
+-				currNode: newMessage.id
+-			});
+-
+-			return newMessage;
++		return await apiPost<DatabaseMessage>(messagesPath(message.convId), {
++			id: uuid(),
++			role: message.role,
++			type: message.type ?? message.role,
++			content: message.content,
++			parent: parentId,
++			timestamp: message.timestamp ?? Date.now(),
++			toolCalls: message.toolCalls ?? '',
++			toolCallId: message.toolCallId,
++			reasoningContent: message.reasoningContent,
++			extra: message.extra,
++			timings: message.timings,
++			model: message.model
+ 		});
+ 	}
+ 
+-	/**
+-	 * Creates a root message for a new conversation.
+-	 * Root messages are not displayed but serve as the tree root for branching.
+-	 *
+-	 * @param convId - Conversation ID
+-	 * @returns The created root message
+-	 */
+ 	static async createRootMessage(convId: string): Promise<string> {
+-		const rootMessage: DatabaseMessage = {
++		const result = await apiPost<DatabaseMessage>(messagesPath(convId), {
+ 			id: uuid(),
+-			convId,
+-			type: 'root',
+-			timestamp: Date.now(),
+ 			role: MessageRole.SYSTEM,
++			type: 'root',
+ 			content: '',
+ 			parent: null,
+-			toolCalls: '',
+-			children: []
+-		};
+-
+-		await db.messages.add(rootMessage);
+-		return rootMessage.id;
++			timestamp: Date.now()
++		});
++		return result.id;
+ 	}
+ 
+-	/**
+-	 * Creates a system prompt message for a conversation.
+-	 *
+-	 * @param convId - Conversation ID
+-	 * @param systemPrompt - The system prompt content (must be non-empty)
+-	 * @param parentId - Parent message ID (typically the root message)
+-	 * @returns The created system message
+-	 * @throws Error if systemPrompt is empty
+-	 */
+ 	static async createSystemMessage(
+ 		convId: string,
+ 		systemPrompt: string,
+@@ -145,186 +158,39 @@ export class DatabaseService {
+ 		if (!trimmedPrompt) {
+ 			throw new Error('Cannot create system message with empty content');
+ 		}
+-
+-		const systemMessage: DatabaseMessage = {
++		return await apiPost<DatabaseMessage>(messagesPath(convId), {
+ 			id: uuid(),
+-			convId,
+-			type: MessageRole.SYSTEM,
+-			timestamp: Date.now(),
+ 			role: MessageRole.SYSTEM,
++			type: MessageRole.SYSTEM,
+ 			content: trimmedPrompt,
+ 			parent: parentId,
+-			children: []
+-		};
+-
+-		await db.messages.add(systemMessage);
+-
+-		const parentMessage = await db.messages.get(parentId);
+-		if (parentMessage) {
+-			await db.messages.update(parentId, {
+-				children: [...parentMessage.children, systemMessage.id]
+-			});
+-		}
+-
+-		return systemMessage;
++			timestamp: Date.now()
++		});
+ 	}
+ 
+-	/**
+-	 * Deletes a conversation and all its messages.
+-	 *
+-	 * @param id - Conversation ID
+-	 */
+-	static async deleteConversation(
++	static async updateMessage(
+ 		id: string,
+-		options?: { deleteWithForks?: boolean }
++		updates: Partial<Omit<DatabaseMessage, 'id'>>
+ 	): Promise<void> {
+-		await db.transaction('rw', [db.conversations, db.messages], async () => {
+-			if (options?.deleteWithForks) {
+-				// Recursively collect all descendant IDs
+-				const idsToDelete: string[] = [];
+-				const queue = [id];
+-
+-				while (queue.length > 0) {
+-					const parentId = queue.pop()!;
+-					const children = await db.conversations
+-						.filter((c) => c.forkedFromConversationId === parentId)
+-						.toArray();
+-
+-					for (const child of children) {
+-						idsToDelete.push(child.id);
+-						queue.push(child.id);
+-					}
+-				}
+-
+-				for (const forkId of idsToDelete) {
+-					await db.conversations.delete(forkId);
+-					await db.messages.where('convId').equals(forkId).delete();
+-				}
+-			} else {
+-				// Reparent direct children to deleted conv's parent
+-				const conv = await db.conversations.get(id);
+-				const newParent = conv?.forkedFromConversationId;
+-				const directChildren = await db.conversations
+-					.filter((c) => c.forkedFromConversationId === id)
+-					.toArray();
+-
+-				for (const child of directChildren) {
+-					await db.conversations.update(child.id, {
+-						forkedFromConversationId: newParent ?? undefined
+-					});
+-				}
+-			}
+-
+-			await db.conversations.delete(id);
+-			await db.messages.where('convId').equals(id).delete();
++		await apiFetch<unknown>(messageByIdPath(id), {
++			method: 'PATCH',
++			body: JSON.stringify(updates)
+ 		});
+ 	}
+ 
+-	/**
+-	 * Deletes a message and removes it from its parent's children array.
+-	 *
+-	 * @param messageId - ID of the message to delete
+-	 */
+ 	static async deleteMessage(messageId: string): Promise<void> {
+-		await db.transaction('rw', db.messages, async () => {
+-			const message = await db.messages.get(messageId);
+-			if (!message) return;
+-
+-			// Remove this message from its parent's children array
+-			if (message.parent) {
+-				const parent = await db.messages.get(message.parent);
+-				if (parent) {
+-					parent.children = parent.children.filter((childId: string) => childId !== messageId);
+-					await db.messages.put(parent);
+-				}
+-			}
+-
+-			// Delete the message
+-			await db.messages.delete(messageId);
+-		});
++		await apiFetch<unknown>(messageByIdPath(messageId), { method: 'DELETE' });
+ 	}
+ 
+-	/**
+-	 * Deletes a message and all its descendant messages (cascading deletion).
+-	 * This removes the entire branch starting from the specified message.
+-	 *
+-	 * @param conversationId - ID of the conversation containing the message
+-	 * @param messageId - ID of the root message to delete (along with all descendants)
+-	 * @returns Array of all deleted message IDs
+-	 */
+ 	static async deleteMessageCascading(
+ 		conversationId: string,
+ 		messageId: string
+ 	): Promise<string[]> {
+-		return await db.transaction('rw', db.messages, async () => {
+-			// Get all messages in the conversation to find descendants
+-			const allMessages = await db.messages.where('convId').equals(conversationId).toArray();
+-
+-			// Find all descendant messages
+-			const descendants = findDescendantMessages(allMessages, messageId);
+-			const allToDelete = [messageId, ...descendants];
+-
+-			// Get the message to delete for parent cleanup
+-			const message = await db.messages.get(messageId);
+-			if (message && message.parent) {
+-				const parent = await db.messages.get(message.parent);
+-				if (parent) {
+-					parent.children = parent.children.filter((childId: string) => childId !== messageId);
+-					await db.messages.put(parent);
+-				}
+-			}
+-
+-			// Delete all messages in the branch
+-			await db.messages.bulkDelete(allToDelete);
+-
+-			return allToDelete;
+-		});
+-	}
+-
+-	/**
+-	 * Gets all conversations, sorted by last modified time (newest first).
+-	 *
+-	 * @returns Array of conversations
+-	 */
+-	static async getAllConversations(): Promise<DatabaseConversation[]> {
+-		return await db.conversations.orderBy('lastModified').reverse().toArray();
+-	}
+-
+-	/**
+-	 * Gets a conversation by ID.
+-	 *
+-	 * @param id - Conversation ID
+-	 * @returns The conversation if found, otherwise undefined
+-	 */
+-	static async getConversation(id: string): Promise<DatabaseConversation | undefined> {
+-		return await db.conversations.get(id);
+-	}
+-
+-	/**
+-	 * Gets all messages in a conversation, sorted by timestamp (oldest first).
+-	 *
+-	 * @param convId - Conversation ID
+-	 * @returns Array of messages in the conversation
+-	 */
+-	static async getConversationMessages(convId: string): Promise<DatabaseMessage[]> {
+-		return await db.messages.where('convId').equals(convId).sortBy('timestamp');
+-	}
+-
+-	/**
+-	 * Updates a conversation.
+-	 *
+-	 * @param id - Conversation ID
+-	 * @param updates - Partial updates to apply
+-	 * @returns Promise that resolves when the conversation is updated
+-	 */
+-	static async updateConversation(
+-		id: string,
+-		updates: Partial<Omit<DatabaseConversation, 'id'>>
+-	): Promise<void> {
+-		await db.conversations.update(id, {
+-			...updates,
+-			lastModified: Date.now()
+-		});
++		const result = await apiFetch<DeletedMessagesResponse>(
++			`${messagesPath(conversationId)}/${encodeURIComponent(messageId)}?cascade=true`,
++			{ method: 'DELETE' }
++		);
++		return result.deleted || [];
+ 	}
+ 
+ 	/**
+@@ -335,31 +201,8 @@ export class DatabaseService {
+ 	 *
+ 	 */
+ 
+-	/**
+-	 * Updates the conversation's current node (active branch).
+-	 * This determines which conversation path is currently being viewed.
+-	 *
+-	 * @param convId - Conversation ID
+-	 * @param nodeId - Message ID to set as current node
+-	 */
+ 	static async updateCurrentNode(convId: string, nodeId: string): Promise<void> {
+-		await this.updateConversation(convId, {
+-			currNode: nodeId
+-		});
+-	}
+-
+-	/**
+-	 * Updates a message.
+-	 *
+-	 * @param id - Message ID
+-	 * @param updates - Partial updates to apply
+-	 * @returns Promise that resolves when the message is updated
+-	 */
+-	static async updateMessage(
+-		id: string,
+-		updates: Partial<Omit<DatabaseMessage, 'id'>>
+-	): Promise<void> {
+-		await db.messages.update(id, updates);
++		return DatabaseService.updateConversation(convId, { currNode: nodeId });
+ 	}
+ 
+ 	/**
+@@ -370,39 +213,11 @@ export class DatabaseService {
+ 	 *
+ 	 */
+ 
+-	/**
+-	 * Imports multiple conversations and their messages.
+-	 * Skips conversations that already exist.
+-	 *
+-	 * @param data - Array of { conv, messages } objects
+-	 */
+ 	static async importConversations(
+ 		data: { conv: DatabaseConversation; messages: DatabaseMessage[] }[]
+ 	): Promise<{ imported: number; skipped: number }> {
+-		let importedCount = 0;
+-		let skippedCount = 0;
+-
+-		return await db.transaction('rw', [db.conversations, db.messages], async () => {
+-			for (const item of data) {
+-				const { conv, messages } = item;
+-
+-				const existing = await db.conversations.get(conv.id);
+-				if (existing) {
+-					console.warn(`Conversation "${conv.name}" already exists, skipping...`);
+-					skippedCount++;
+-					continue;
+-				}
+-
+-				await db.conversations.add(conv);
+-				for (const msg of messages) {
+-					await db.messages.put(msg);
+-				}
+-
+-				importedCount++;
+-			}
+-
+-			return { imported: importedCount, skipped: skippedCount };
+-		});
++		const result = await apiPost<ImportConversationsResponse>(`${HISTORY}/import`, data);
++		return { imported: result.imported, skipped: result.skipped };
+ 	}
+ 
+ 	/**
+@@ -413,79 +228,17 @@ export class DatabaseService {
+ 	 *
+ 	 */
+ 
+-	/**
+-	 * Forks a conversation at a specific message, creating a new conversation
+-	 * containing all messages from the root up to (and including) the target message.
+-	 *
+-	 * @param sourceConvId - The source conversation ID
+-	 * @param atMessageId - The message ID to fork at (the new conversation ends here)
+-	 * @param options - Fork options (name and whether to include attachments)
+-	 * @returns The newly created conversation
+-	 */
+ 	static async forkConversation(
+ 		sourceConvId: string,
+ 		atMessageId: string,
+ 		options: { name: string; includeAttachments: boolean }
+ 	): Promise<DatabaseConversation> {
+-		return await db.transaction('rw', [db.conversations, db.messages], async () => {
+-			const sourceConv = await db.conversations.get(sourceConvId);
+-			if (!sourceConv) {
+-				throw new Error(`Source conversation ${sourceConvId} not found`);
+-			}
+-
+-			const allMessages = await db.messages.where('convId').equals(sourceConvId).toArray();
+-
+-			const pathMessages = filterByLeafNodeId(allMessages, atMessageId, true) as DatabaseMessage[];
+-			if (pathMessages.length === 0) {
+-				throw new Error(`Could not resolve message path to ${atMessageId}`);
+-			}
+-
+-			const idMap = new Map<string, string>();
+-
+-			for (const msg of pathMessages) {
+-				idMap.set(msg.id, uuid());
+-			}
+-
+-			const newConvId = uuid();
+-			const clonedMessages: DatabaseMessage[] = pathMessages.map((msg) => {
+-				const newId = idMap.get(msg.id)!;
+-				const newParent = msg.parent ? (idMap.get(msg.parent) ?? null) : null;
+-				const newChildren = msg.children
+-					.filter((childId: string) => idMap.has(childId))
+-					.map((childId: string) => idMap.get(childId)!);
+-
+-				return {
+-					...msg,
+-					id: newId,
+-					convId: newConvId,
+-					parent: newParent,
+-					children: newChildren,
+-					extra: options.includeAttachments ? msg.extra : undefined
+-				};
+-			});
+-
+-			const lastClonedMessage = clonedMessages[clonedMessages.length - 1];
+-			const newConv: DatabaseConversation = {
+-				id: newConvId,
+-				name: options.name,
+-				lastModified: Date.now(),
+-				currNode: lastClonedMessage.id,
+-				forkedFromConversationId: sourceConvId,
+-				mcpServerOverrides: sourceConv.mcpServerOverrides
+-					? sourceConv.mcpServerOverrides.map((o: McpServerOverride) => ({
+-							serverId: o.serverId,
+-							enabled: o.enabled
+-						}))
+-					: undefined
+-			};
+-
+-			await db.conversations.add(newConv);
+-
+-			for (const msg of clonedMessages) {
+-				await db.messages.add(msg);
+-			}
+-
+-			return newConv;
++		const detail = await apiPost<ConversationDetailResponse>(`${convPath(sourceConvId)}/fork`, {
++			at_message_id: atMessageId,
++			name: options.name,
++			include_attachments: options.includeAttachments
+ 		});
++		const { messages: _messages, ...conversation } = detail;
++		return conversation;
+ 	}
+ }

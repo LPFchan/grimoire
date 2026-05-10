@@ -222,6 +222,18 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("build/", dockerignore)
         self.assertIn("*.egg-info/", dockerignore)
 
+    def test_webui_history_patch_is_well_formed(self):
+        patch_path = ROOT / "patches" / "grimoire-webui-history.patch"
+        self.assertTrue(patch_path.exists(), "webui history patch file is missing")
+        content = patch_path.read_text()
+        self.assertIn("diff --git", content)
+        self.assertIn("tools/server/webui/src/lib/services/database.service.ts", content)
+        self.assertIn("apiFetch", content)
+        # The webui stage selectively applies grimoire-webui-* patches
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("/src/patches/grimoire-webui-*.patch", dockerfile)
+        self.assertIn("grimoire-webui-*", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()

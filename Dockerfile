@@ -59,8 +59,9 @@ RUN --mount=type=cache,target=/root/.ccache \
     git -C /app/.cache/llama-cpp-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
     git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
     git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
-    # Apply patches
+    # Apply non-webui patches (webui patches are applied in the webui stage)
     for patch in /app/patches/*.patch; do \
+        case "$(basename "$patch")" in grimoire-webui-*) continue ;; esac; \
         echo "Applying $patch"; \
         git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
     done; \
@@ -103,6 +104,10 @@ ARG GRIMOIRE_LLAMA_CPP_REF
 
 WORKDIR /src
 
+# Webui-only patches (e.g. grimoire-webui-history.patch which swaps the upstream
+# Dexie/IndexedDB DatabaseService for fetch calls to grimoire's /history endpoints).
+COPY patches/ /src/patches/
+
 RUN --mount=type=cache,target=/cache/webui-src \
     --mount=type=cache,target=/root/.npm \
     set -eux; \
@@ -114,6 +119,11 @@ RUN --mount=type=cache,target=/cache/webui-src \
     git -C /cache/webui-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
     git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
     git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
+    for patch in /src/patches/grimoire-webui-*.patch; do \
+        [ -f "$patch" ] || continue; \
+        echo "Applying webui patch: $patch"; \
+        git -C /cache/webui-src/repo apply "$patch"; \
+    done; \
     cp -r /cache/webui-src/repo/tools /src/tools; \
     cd /src/tools/server/webui; \
     npm ci; \
