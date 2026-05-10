@@ -28,7 +28,7 @@ ExecStart=/usr/bin/docker run --rm --name grimoire \
     -v /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro \
     -v /home/yeowool/token-stats.json:/var/lib/grimoire/token-stats.json:ro \
     -v grimoire-state:/var/lib/grimoire \
-    ghcr.io/lpfchan/grimoire:latest
+    grimoire:local
 
 ExecStop=/usr/bin/docker stop grimoire
 

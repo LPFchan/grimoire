@@ -45,7 +45,7 @@ docker run --name grimoire --gpus all -p 9001:9001 \
   -v /home/yeowool/templates:/templates:ro \
   -v /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro \
   -v grimoire-state:/var/lib/grimoire \
-  ghcr.io/lpfchan/grimoire:latest --model qwen-3.6-27B
+  grimoire:local --model qwen-3.6-27B
 
 # List registered models
 docker exec grimoire grimoire list
@@ -134,7 +134,7 @@ docker run --name grimoire --gpus all -p 9001:9001 \
   -v /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro \
   -v /home/yeowool/token-stats.json:/tmp/token-stats.json:ro \
   -v grimoire-state:/var/lib/grimoire \
-  ghcr.io/lpfchan/grimoire:latest
+  grimoire:local
 ```
 
 The import is idempotent per source path. New usage is appended to `/var/lib/grimoire/usage.sqlite3`.
