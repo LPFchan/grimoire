@@ -119,8 +119,8 @@ WORKDIR /app
 # Copy compiled llama-server
 COPY --from=build /opt/model-a-llama-cpp /opt/model-a-llama-cpp
 
-# Create registry directory and copy default models.json
-RUN mkdir -p /etc/grimoire
+# Create registry and state directories
+RUN mkdir -p /etc/grimoire /var/lib/grimoire
 COPY etc/models.json /etc/grimoire/models.json
 
 # Install Python dependencies

@@ -4,7 +4,9 @@ import copy
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import RLock
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,77 @@ class ModelRegistry:
         with self._lock:
             self._maybe_reload()
             return dict(self._data.get("fixed", {}))
+
+    @staticmethod
+    def normalize_model_id(model_id):
+        """Normalize gateway aliases, backend IDs, paths, and GGUF names for matching."""
+        if not model_id:
+            return ""
+        value = str(model_id).strip()
+        value = Path(value).name
+        value = re.sub(r"\.gguf$", "", value, flags=re.IGNORECASE)
+        return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+    def resolve(self, model_id):
+        """Resolve an external model ID to a registry alias using fuzzy core rules."""
+        if not model_id:
+            return None
+        with self._lock:
+            self._maybe_reload()
+            models = self._data.get("models", {})
+
+            if model_id in models:
+                return model_id
+
+            normalized = self.normalize_model_id(model_id)
+            if not normalized:
+                return None
+
+            for name, cfg in models.items():
+                candidates = [
+                    name,
+                    cfg.get("alias"),
+                    cfg.get("file"),
+                    Path(str(cfg.get("file", ""))).name,
+                ]
+                candidates.extend(cfg.get("aliases", []) or [])
+                for candidate in candidates:
+                    if candidate and self.normalize_model_id(candidate) == normalized:
+                        return name
+
+            matches = []
+            for name, cfg in models.items():
+                candidates = [name, cfg.get("file"), Path(str(cfg.get("file", ""))).name]
+                candidates.extend(cfg.get("aliases", []) or [])
+                candidate_norms = [self.normalize_model_id(c) for c in candidates if c]
+                if any(normalized in c or c in normalized for c in candidate_norms):
+                    matches.append(name)
+
+            if len(matches) == 1:
+                return matches[0]
+            return None
+
+    def model_metadata(self, model_name):
+        """Return public metadata for one registry model."""
+        cfg = self.get(model_name)
+        if not cfg:
+            return None
+        return {
+            "id": model_name,
+            "object": "model",
+            "created": 0,
+            "owned_by": "grimoire",
+            "context": cfg.get("ctx-size"),
+            "output": cfg.get("predict"),
+            "family": cfg.get("family"),
+            "capabilities": cfg.get("capabilities", ["completion"]),
+            "cost": cfg.get("cost", {"input": 0, "output": 0}),
+            "pinned_gpu": self.get_fixed_gpu(model_name),
+        }
+
+    def list_metadata(self):
+        """Return public metadata for all registry models."""
+        return [self.model_metadata(name) for name in self.list_all()]
 
     def is_fixed(self, model_name):
         """Check if a model is pinned to a GPU."""
