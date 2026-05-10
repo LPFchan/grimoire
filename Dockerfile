@@ -87,6 +87,42 @@ RUN --mount=type=cache,target=/root/.ccache \
 
 
 # =============================================================================
+# WebUI stage: Build the stock llama.cpp SvelteKit chat UI
+# =============================================================================
+
+FROM node:20-bookworm-slim AS webui
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG GRIMOIRE_LLAMA_CPP_REPO_URL
+ARG GRIMOIRE_LLAMA_CPP_REF
+
+WORKDIR /src
+
+RUN --mount=type=cache,target=/cache/webui-src \
+    --mount=type=cache,target=/root/.npm \
+    set -eux; \
+    if [ ! -d /cache/webui-src/repo/.git ]; then \
+        rm -rf /cache/webui-src/repo; \
+        git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /cache/webui-src/repo; \
+    fi; \
+    git -C /cache/webui-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
+    git -C /cache/webui-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
+    git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
+    git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
+    cp -r /cache/webui-src/repo/tools /src/tools; \
+    cd /src/tools/server/webui; \
+    npm ci; \
+    npm run build; \
+    mkdir -p /opt/grimoire-webui; \
+    cp -r /src/tools/server/public/. /opt/grimoire-webui/
+
+
+# =============================================================================
 # Runtime stage: Lean CUDA runtime + Python + gateway
 # =============================================================================
 
@@ -119,6 +155,9 @@ WORKDIR /app
 
 # Copy compiled llama-server
 COPY --from=build /opt/model-a-llama-cpp /opt/model-a-llama-cpp
+
+# Copy built llama.cpp webui
+COPY --from=webui /opt/grimoire-webui /opt/grimoire-webui
 
 # Create registry and state directories
 RUN mkdir -p /etc/grimoire /var/lib/grimoire

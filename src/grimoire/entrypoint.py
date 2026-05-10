@@ -19,6 +19,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
@@ -60,6 +61,7 @@ MAX_HISTORY_CAPTURE_BYTES = _env_int("GRIMOIRE_HISTORY_CAPTURE_BYTES", 2 * 1024 
 MAX_USAGE_CAPTURE_BYTES = _env_int("GRIMOIRE_USAGE_CAPTURE_BYTES", 1024 * 1024)
 LEGACY_STATS_PATH = os.environ.get("GRIMOIRE_LEGACY_STATS_PATH", "/var/lib/grimoire/token-stats.json")
 ALLOW_ANONYMOUS = _env_bool("GRIMOIRE_ALLOW_ANONYMOUS", False)
+WEBUI_DIR = os.environ.get("GRIMOIRE_WEBUI_DIR", "/opt/grimoire-webui")
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -242,6 +244,12 @@ def build_cmd(cfg, port):
     return cmd
 
 
+MODEL_STATUS_UNLOADED = "unloaded"
+MODEL_STATUS_LOADING = "loading"
+MODEL_STATUS_LOADED = "loaded"
+MODEL_STATUS_FAILED = "failed"
+
+
 class ActiveModel:
     """Manage a running llama-server process."""
 
@@ -253,6 +261,7 @@ class ActiveModel:
         self.process = None
         self.started = datetime.now(timezone.utc)
         self.backend_model_id = None
+        self.status = MODEL_STATUS_LOADING
 
     def start(self):
         """Start the llama-server process."""
@@ -425,6 +434,7 @@ class ModelManager:
 
             port = self._find_available_port(gpu)
             active = ActiveModel(model_name, cfg, port, gpu)
+            self.active[model_name] = active
             active.start()
             try:
                 startup_timeout = cfg.get("startup-timeout", DEFAULT_STARTUP_TIMEOUT)
@@ -434,12 +444,21 @@ class ModelManager:
                     startup_timeout = DEFAULT_STARTUP_TIMEOUT
                 await active.wait_ready(timeout=startup_timeout)
             except Exception:
+                active.status = MODEL_STATUS_FAILED
                 await asyncio.to_thread(active.stop)
+                self.active.pop(model_name, None)
                 raise
 
-            self.active[model_name] = active
+            active.status = MODEL_STATUS_LOADED
             logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
             return active
+
+    def get_status(self, model_name):
+        """Return router-mode status for a registry entry."""
+        active = self.active.get(model_name)
+        if not active:
+            return MODEL_STATUS_UNLOADED
+        return active.status
 
     async def stop_model(self, model_name):
         """Stop an active model."""
@@ -526,25 +545,6 @@ input,button{font:inherit;border-radius:10px;padding:11px 13px}input{border:1px 
 def _render_login_html(error=""):
     return LOGIN_HTML.replace("{error}", error)
 
-APP_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Grimoire</title><style>
-body{margin:0;background:#0f1117;color:#f4f4f5;font-family:Inter,ui-sans-serif,system-ui,sans-serif}.shell{display:grid;grid-template-columns:300px 1fr;min-height:100vh}.side{border-right:1px solid #272a36;background:#151823;padding:18px;display:flex;flex-direction:column;gap:14px}.main{padding:24px;display:grid;gap:16px;align-content:start}select,textarea,input,button{font:inherit;border-radius:10px;border:1px solid #333747;background:#10131c;color:#f4f4f5;padding:10px}button{cursor:pointer;background:#d99a45;color:#16120b;border:0;font-weight:700}.row{display:flex;gap:8px;align-items:center}.card{border:1px solid #2c3040;border-radius:14px;padding:14px;background:#171b27}.history{display:grid;gap:8px;overflow:auto}.hist{border:1px solid #2c3040;border-radius:10px;padding:10px;background:#10131c;cursor:pointer}.muted{color:#9ca3af;font-size:13px}textarea{min-height:160px;width:100%;box-sizing:border-box}@media(max-width:760px){.shell{grid-template-columns:1fr}.side{border-right:0;border-bottom:1px solid #272a36}}
-</style></head><body><div class="shell"><aside class="side"><h1>Grimoire</h1><select id="model"></select><button id="switch">Switch / Load</button><button id="new">New History</button><div class="muted" id="status"></div><div class="history" id="history"></div></aside><main class="main"><section class="card"><h2>Server-side History</h2><input id="title" placeholder="Conversation title"><textarea id="messages" placeholder='[{"role":"user","content":"Hello"}]'></textarea><div class="row"><button id="save">Save</button><button id="delete">Delete</button></div></section><section class="card"><h2>Active Models</h2><pre id="active"></pre></section></main></div><script>
-let currentId=null;const $=id=>document.getElementById(id);async function j(url,opt){let r=await fetch(url,opt);if(!r.ok)throw new Error(await r.text());return r.status===204?null:await r.json()}async function loadModels(){let d=await j('/models');let s=$('model');s.textContent='';(d.models||[]).forEach(m=>{let o=document.createElement('option');o.value=m;o.textContent=m+((d.active||[]).includes(m)?' *':'');s.appendChild(o)});$('active').textContent=JSON.stringify(d,null,2)}async function loadHistory(){let d=await j('/history');let h=$('history');h.textContent='';(d.conversations||[]).forEach(c=>{let el=document.createElement('div');el.className='hist';el.textContent=c.title+'\\n'+(c.model||'');el.onclick=async()=>{let x=await j('/history/'+c.id);currentId=x.id;$('title').value=x.title;$('messages').value=JSON.stringify(x.messages.map(m=>({role:m.role,content:m.content})),null,2)};h.appendChild(el)})}$('switch').onclick=async()=>{$('status').textContent='loading...';await j('/switch/'+encodeURIComponent($('model').value),{method:'POST'});$('status').textContent='loaded '+$('model').value;await loadModels()};$('new').onclick=async()=>{let c=await j('/history',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({title:'New chat',model:$('model').value,messages:[]})});currentId=c.id;$('title').value=c.title;$('messages').value='[]';await loadHistory()};$('save').onclick=async()=>{let body={title:$('title').value,model:$('model').value,messages:JSON.parse($('messages').value||'[]')};let url=currentId?'/history/'+currentId:'/history';let method=currentId?'PUT':'POST';let c=await j(url,{method,headers:{'content-type':'application/json'},body:JSON.stringify(body)});currentId=c.id;await loadHistory()};$('delete').onclick=async()=>{if(!currentId)return;await fetch('/history/'+currentId,{method:'DELETE'});currentId=null;$('title').value='';$('messages').value='[]';await loadHistory()};loadModels().catch(e=>$('status').textContent=e);loadHistory().catch(e=>$('status').textContent=e);
-</script></body></html>"""
-
-
-@app.get("/")
-async def root(request: Request):
-    """Canonical Grimoire model switcher and server-side history UI."""
-    if API_KEY and not _valid_cookie(request):
-        return RedirectResponse(url="/login", status_code=302)
-    if not API_KEY and not ALLOW_ANONYMOUS:
-        return RedirectResponse(url="/login", status_code=302)
-    return HTMLResponse(APP_HTML)
-
-
 @app.get("/login")
 async def login_page():
     if not API_KEY and not ALLOW_ANONYMOUS:
@@ -579,12 +579,16 @@ async def health():
 
 @app.get("/v1/models")
 async def get_v1_models(request: Request):
-    """Return all registry models in OpenAI-compatible format."""
+    """Return all registry models in OpenAI-compatible + llama.cpp router shape."""
     require_api(request)
     data = registry.list_metadata()
-    active = set(manager.list_active())
+    active_names = set(manager.list_active())
     for item in data:
-        item["active"] = item["id"] in active
+        name = item["id"]
+        item["active"] = name in active_names
+        item["status"] = {"value": manager.get_status(name)}
+        item["in_cache"] = True
+        item["path"] = (registry.get(name) or {}).get("file", "")
     return {"object": "list", "data": data}
 
 
@@ -704,6 +708,41 @@ async def stop_model_endpoint(model_name: str, request: Request):
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' is not active")
     await manager.stop_model(model_name)
     return {"status": "stopped", "model": model_name}
+
+
+def _model_payload_name(payload):
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("model")
+    return name if isinstance(name, str) and name else None
+
+
+@app.post("/models/load")
+async def models_load(request: Request):
+    """Router-mode alias of /switch/{name}, called by stock llama.cpp webui."""
+    require_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    name = _model_payload_name(payload)
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'model' in body")
+    return await switch_model(name, request)
+
+
+@app.post("/models/unload")
+async def models_unload(request: Request):
+    """Router-mode alias of /stop/{name}, called by stock llama.cpp webui."""
+    require_admin(request)
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    name = _model_payload_name(payload)
+    if not name:
+        raise HTTPException(status_code=400, detail="Missing 'model' in body")
+    return await stop_model_endpoint(name, request)
 
 
 def _history_conversation_id(request, payload):
@@ -1074,6 +1113,135 @@ async def ingest_model(request: Request):
         raise HTTPException(status_code=409, detail=str(e))
 
 
+DEFAULT_GENERATION_PARAMS = {
+    "n_predict": DEFAULT_PREDICT,
+    "seed": -1,
+    "temperature": 0.8,
+    "dynatemp_range": 0.0,
+    "dynatemp_exponent": 1.0,
+    "top_k": 40,
+    "top_p": 0.95,
+    "min_p": 0.05,
+    "top_n_sigma": -1.0,
+    "xtc_probability": 0.0,
+    "xtc_threshold": 0.1,
+    "typ_p": 1.0,
+    "repeat_last_n": 64,
+    "repeat_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "dry_multiplier": 0.0,
+    "dry_base": 1.75,
+    "dry_allowed_length": 2,
+    "dry_penalty_last_n": -1,
+    "dry_sequence_breakers": [],
+    "mirostat": 0,
+    "mirostat_tau": 5.0,
+    "mirostat_eta": 0.1,
+    "stop": [],
+    "max_tokens": DEFAULT_PREDICT,
+    "n_keep": 0,
+    "n_discard": 0,
+    "ignore_eos": False,
+    "stream": True,
+    "logit_bias": [],
+    "n_probs": 0,
+    "min_keep": 0,
+    "grammar": "",
+    "grammar_lazy": False,
+    "grammar_triggers": [],
+    "preserved_tokens": [],
+    "chat_format": "",
+    "reasoning_format": "auto",
+    "reasoning_in_content": False,
+    "generation_prompt": "",
+    "samplers": [],
+    "backend_sampling": False,
+    "speculative.n_max": 16,
+    "speculative.n_min": 0,
+    "speculative.p_min": 0.75,
+    "timings_per_token": False,
+    "post_sampling_probs": False,
+    "lora": [],
+}
+
+
+def _synthetic_props(model_name=None):
+    cfg = registry.get(model_name) if model_name else None
+    capabilities = (cfg or {}).get("capabilities", []) or []
+    has_vision = "multimodal" in capabilities or "vision" in capabilities
+    return {
+        "default_generation_settings": {
+            "id": 0,
+            "id_task": -1,
+            "n_ctx": (cfg or {}).get("ctx-size", DEFAULT_CTX_SIZE),
+            "speculative": False,
+            "is_processing": False,
+            "params": dict(DEFAULT_GENERATION_PARAMS),
+            "prompt": "",
+            "next_token": {
+                "has_next_token": False,
+                "has_new_line": False,
+                "n_remain": 0,
+                "n_decoded": 0,
+                "stopping_word": "",
+            },
+        },
+        "total_slots": (cfg or {}).get("parallel", 1),
+        "model_path": (cfg or {}).get("file", ""),
+        "role": "router",
+        "modalities": {"vision": bool(has_vision), "audio": False},
+        "chat_template": "",
+        "bos_token": "",
+        "eos_token": "",
+        "build_info": "grimoire",
+    }
+
+
+@app.get("/props")
+async def props(request: Request):
+    """Router-mode /props for the stock llama.cpp webui.
+
+    Without ?model=<id> returns server-wide router props.
+    With ?model=<id>&autoload=false returns synthetic per-model props from registry.
+    With ?model=<id> (autoload not false) starts the model and proxies its real /props.
+    """
+    require_api(request)
+    model_name = request.query_params.get("model")
+    autoload = request.query_params.get("autoload", "true").lower() not in {"false", "0", "no", "off"}
+
+    if not model_name:
+        return _synthetic_props()
+
+    resolved = registry.resolve(model_name)
+    if not resolved:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' not in registry")
+
+    if not autoload and not manager.get_active(resolved):
+        return _synthetic_props(resolved)
+
+    try:
+        active = await manager.start_model(resolved)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error(f"Failed to start {resolved} for /props: {e}")
+        raise HTTPException(status_code=502, detail="Model server unavailable")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"http://127.0.0.1:{active.port}/props")
+        if resp.status_code == 200:
+            data = resp.json()
+            data["role"] = "router"
+            return data
+    except Exception as e:
+        logger.info(f"Falling back to synthetic /props for {resolved}: {e}")
+    return _synthetic_props(resolved)
+
+
 @app.get("/status")
 async def status(request: Request):
     """Return system status."""
@@ -1096,6 +1264,22 @@ async def status(request: Request):
         "active": active_info,
         "gpu_count": manager.gpu_count
     }
+
+
+def _mount_webui():
+    """Mount the built llama.cpp webui as the root chat surface, if available."""
+    if not os.path.isdir(WEBUI_DIR):
+        logger.warning(
+            "GRIMOIRE_WEBUI_DIR=%s does not exist; chat UI will return 404. "
+            "Build the webui in your image or set GRIMOIRE_WEBUI_DIR to its build output.",
+            WEBUI_DIR,
+        )
+        return
+    app.mount("/", StaticFiles(directory=WEBUI_DIR, html=True), name="webui")
+    logger.info("Serving llama.cpp webui from %s", WEBUI_DIR)
+
+
+_mount_webui()
 
 
 def main():

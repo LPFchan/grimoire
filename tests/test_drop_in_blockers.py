@@ -85,22 +85,6 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("body{margin:0", html)
         self.assertNotIn("{error}", html)
 
-    def test_app_script_avoids_reserved_keyword_globals(self):
-        script = entrypoint.APP_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
-        self.assertNotIn("switch.onclick", script)
-        self.assertNotIn("new.onclick", script)
-        self.assertNotIn("delete.onclick", script)
-
-        if shutil.which("node"):
-            with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
-                f.write(script)
-                path = f.name
-            try:
-                result = subprocess.run(["node", "--check", path], capture_output=True, text=True, timeout=10)
-                self.assertEqual(result.returncode, 0, result.stderr)
-            finally:
-                os.unlink(path)
-
     def test_build_cmd_binds_backend_to_loopback(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file:
             cmd = entrypoint.build_cmd({"file": model_file.name}, port=8001)

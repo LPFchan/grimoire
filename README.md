@@ -33,6 +33,7 @@ Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving.
 - **Safe model ingestion** — Download and register HTTPS models via CLI or authenticated API
 - **Protected API** — `/v1/*`, history, stats, and management endpoints require API/admin auth
 - **OpenAI-compatible API** — Standard `/v1/chat/completions` with automatic routing
+- **Built-in chat UI** — Stock llama.cpp SvelteKit webui served at `/`, talking to grimoire as a router-mode backend (no DOM injection, no fork patches)
 
 ## Usage
 
@@ -142,6 +143,21 @@ Endpoints:
 
 - `GET /stats` — current API key totals
 - `GET /stats/global` — global totals, admin auth required
+
+## Chat UI
+
+The image bundles the stock llama.cpp SvelteKit webui (built from
+`tools/server/webui` in the same llama.cpp ref the runtime uses) and serves it
+at `https://chat.lost.plus/`. Grimoire implements the same router-mode API
+contract the webui already speaks: `GET /props`, `GET /props?model=<id>`,
+`GET /v1/models` (with `status.value`), `POST /models/load`, `POST /models/unload`.
+
+On first load the webui prompts for the API key, which it sends as
+`Authorization: Bearer ...` on every authenticated request. The key is the
+same `GRIMOIRE_API_KEY` / legacy `GATEWAY_API_KEY` used by OpenCode.
+
+To override where the webui assets are served from (e.g. for development),
+set `GRIMOIRE_WEBUI_DIR` to a directory containing `index.html`.
 
 ## Building
 
