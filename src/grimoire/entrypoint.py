@@ -196,7 +196,7 @@ def _cost_by_model():
     }
 
 
-def build_cmd(cfg, port):
+def build_cmd(cfg, port, alias=None):
     """Build llama-server command from model config."""
     model_path = _resolve_config_path(cfg["file"])
     if not os.path.exists(model_path):
@@ -215,6 +215,10 @@ def build_cmd(cfg, port):
         "--metrics",
         "--predict", str(cfg.get("predict", DEFAULT_PREDICT)),
     ]
+
+    effective_alias = alias or cfg.get("alias")
+    if effective_alias:
+        cmd.extend(["--alias", effective_alias])
 
     if cfg.get("cache-type-k"):
         cmd.extend(["--cache-type-k", cfg["cache-type-k"]])
@@ -266,7 +270,7 @@ class ActiveModel:
 
     def start(self):
         """Start the llama-server process."""
-        cmd = build_cmd(self.cfg, self.port)
+        cmd = build_cmd(self.cfg, self.port, alias=self.name)
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
 
@@ -878,6 +882,10 @@ async def get_dashboard_stats(request: Request):
         for idx in gpu_indexes
     ]
 
+    def _cumulative(series):
+        running = 0
+        return [running := running + v for v in series]
+
     return {
         "window": window_label,
         "from": ts_from,
@@ -886,11 +894,11 @@ async def get_dashboard_stats(request: Request):
         "tokens": {
             "input": {
                 "current": usage["total_input_tokens"],
-                "series": usage["input_tokens_series"],
+                "series": _cumulative(usage["input_tokens_series"]),
             },
             "output": {
                 "current": usage["total_output_tokens"],
-                "series": usage["output_tokens_series"],
+                "series": _cumulative(usage["output_tokens_series"]),
             },
         },
         "cost": {
@@ -898,10 +906,10 @@ async def get_dashboard_stats(request: Request):
             "input": usage["total_input_cost"],
             "output": usage["total_output_cost"],
             "lifetime": float(lifetime.get("total_cost") or 0.0),
-            "series": [
+            "series": _cumulative([
                 a + b
                 for a, b in zip(usage["input_cost_series"], usage["output_cost_series"])
-            ],
+            ]),
         },
         "gpus": gpus,
         "cpu": {"temp": _system("cpu_temp", -1)},
