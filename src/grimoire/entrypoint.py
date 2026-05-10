@@ -1128,6 +1128,11 @@ def _extract_tokens_per_sec(raw_bytes):
     return best
 
 
+def _extract_chunk_tokens_per_sec(chunk):
+    """Like _extract_tokens_per_sec but scans a single raw chunk for live updating."""
+    return _extract_tokens_per_sec(chunk)
+
+
 async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, gpu_index=None, record_history=True):
     captured = bytearray()
     usage_tail = bytearray()
@@ -1155,6 +1160,10 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
             if len(captured) < MAX_HISTORY_CAPTURE_BYTES:
                 remaining = MAX_HISTORY_CAPTURE_BYTES - len(captured)
                 captured.extend(chunk[:remaining])
+            if gpu_index is not None:
+                tps = _extract_chunk_tokens_per_sec(chunk)
+                if tps is not None:
+                    telemetry_store.record(time.time(), [(gpu_index, "gpu_tokens_per_sec", tps)])
             yield chunk
     finally:
         raw = bytes(captured)
