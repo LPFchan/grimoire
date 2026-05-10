@@ -65,16 +65,53 @@ jobs:
           ARCHES=$(awk -F= '/^ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=/{print $2}' Dockerfile | tr -d ';')
           echo "key=llama-${REF}-p${PATCH_HASH}-a${ARCHES}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      - name: Build and load locally for smoke check
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          tags: grimoire:smoke
           cache-from: |
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:${{ steps.cache_key.outputs.key }}
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:llama-buildkit
           cache-to: |
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:${{ steps.cache_key.outputs.key }},mode=max
             type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:llama-buildkit,mode=max
+
+      - name: Smoke check webui artifact
+        run: |
+          set -eux
+          docker run --rm --entrypoint sh grimoire:smoke -c '
+            test -s /opt/grimoire-webui/index.html
+            test -d /opt/grimoire-webui/_app
+            grep -q "<!doctype html>" /opt/grimoire-webui/index.html || grep -q "<!DOCTYPE html>" /opt/grimoire-webui/index.html
+          '
+
+      - name: Smoke check gateway boots and serves webui
+        run: |
+          set -eux
+          docker run -d --name grimoire-smoke -e GRIMOIRE_API_KEY=ci-smoke -p 19001:9001 grimoire:smoke
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:19001/health >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:19001/health
+          curl -sf -o /tmp/index.html http://127.0.0.1:19001/
+          grep -qi "doctype html" /tmp/index.html
+          # /v1/models without auth should fail closed
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:19001/v1/models)" = "401"
+          docker rm -f grimoire-smoke
+
+      - name: Push image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:${{ steps.cache_key.outputs.key }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE }}/cache:llama-buildkit

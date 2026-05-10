@@ -555,6 +555,30 @@ async def login_page():
     return HTMLResponse(_render_login_html(""))
 
 
+WEBUI_LOCALSTORAGE_CONFIG_KEY = "LlamaCppWebui.config"
+
+LOGIN_BRIDGE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Grimoire</title></head><body>
+<noscript>Logged in. <a href="/">Open chat</a>.</noscript>
+<script>
+try {{
+  var k = "{storage_key}";
+  var c = {{}};
+  try {{ c = JSON.parse(localStorage.getItem(k) || "{{}}") || {{}}; }} catch (e) {{ c = {{}}; }}
+  c.apiKey = {key_json};
+  localStorage.setItem(k, JSON.stringify(c));
+}} catch (e) {{}}
+location.replace("/");
+</script></body></html>"""
+
+
+def _render_login_bridge_html(key):
+    return LOGIN_BRIDGE_HTML.format(
+        storage_key=WEBUI_LOCALSTORAGE_CONFIG_KEY,
+        key_json=json.dumps(key),
+    )
+
+
 @app.post("/login")
 async def login_submit(request: Request):
     _require_login_enabled()
@@ -562,7 +586,7 @@ async def login_submit(request: Request):
     key = (form.get("key") or [""])[0]
     if API_KEY and not hmac.compare_digest(key, API_KEY):
         return HTMLResponse(_render_login_html('<p class="err">Invalid key</p>'), status_code=401)
-    response = RedirectResponse(url="/", status_code=302)
+    response = HTMLResponse(_render_login_bridge_html(key))
     response.set_cookie(COOKIE_NAME, key, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
     return response
 
