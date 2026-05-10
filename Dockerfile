@@ -108,6 +108,9 @@ WORKDIR /src
 # Dexie/IndexedDB DatabaseService for fetch calls to grimoire's /history endpoints).
 COPY patches/ /src/patches/
 
+# Dashboard page is owned as a standalone file, not a patch.
+COPY dashboard/ /src/dashboard/
+
 RUN --mount=type=cache,target=/cache/webui-src \
     --mount=type=cache,target=/root/.npm \
     set -eux; \
@@ -125,6 +128,8 @@ RUN --mount=type=cache,target=/cache/webui-src \
         git -C /cache/webui-src/repo apply "$patch"; \
     done; \
     cp -r /cache/webui-src/repo/tools /src/tools; \
+    mkdir -p /src/tools/server/webui/src/routes/dashboard; \
+    cp /src/dashboard/* /src/tools/server/webui/src/routes/dashboard/; \
     cd /src/tools/server/webui; \
     npm ci; \
     npm run build; \
