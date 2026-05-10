@@ -33,7 +33,7 @@ new file mode 100644
 index 0000000..edc22f2
 --- /dev/null
 +++ b/tools/server/webui/src/routes/dashboard/+page.svelte
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,372 @@
 +<script lang="ts">
 +	import { apiFetch } from '$lib/utils';
 +
