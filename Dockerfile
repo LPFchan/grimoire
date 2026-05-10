@@ -73,6 +73,8 @@ RUN --mount=type=cache,target=/root/.ccache \
                 git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
             done; \
             rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
+            rm -f /app/.cache/llama-cpp-build/CMakeCache.txt; \
+            rm -rf /app/.cache/llama-cpp-build/CMakeFiles 2>/dev/null || true; \
             touch /app/.cache/llama-cpp-build/.patched; \
         fi; \
     fi; \
