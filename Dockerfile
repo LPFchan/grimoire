@@ -68,11 +68,9 @@ RUN --mount=type=cache,target=/root/.ccache \
         git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
     done; \
     cmake -S /app/.cache/llama-cpp-src/repo -B /app/.cache/llama-cpp-build \
-        -DGGML_BACKEND_DL=ON \
         -DGGML_CUDA=ON \
         -DGGML_CUDA_FA=ON \
         -DGGML_NATIVE=OFF \
-        -DGGML_CPU_ALL_VARIANTS=OFF \
         -DGGML_BUILD_EXAMPLES=OFF \
         -DGGML_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_SERVER=ON \
@@ -81,12 +79,12 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_TOOLS_INSTALL=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${GRIMOIRE_CMAKE_CUDA_ARCHITECTURES}" \
+        -DCMAKE_INSTALL_PREFIX=/opt/model-a-llama-cpp \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
         -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build /app/.cache/llama-cpp-build --target llama-server --parallel $(nproc) --verbose \
-    && cmake --install /app/.cache/llama-cpp-build --prefix /opt/model-a-llama-cpp
+    && cmake --build /app/.cache/llama-cpp-build --target install --parallel $(nproc) --verbose
 
 
 # =============================================================================
