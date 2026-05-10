@@ -33,7 +33,7 @@ CPU_HWMON_NAMES = ("k10temp", "coretemp", "zenpower")
 CPU_HWMON_LABELS = ("Tctl", "Tdie", "Package id 0", "Tccd1")
 FAN_HWMON_NAMES = ("nct6798", "nct6775", "nct6779", "it87", "w83627ehf")
 
-_RAPL_ENERGY_PATH = "/sys/class/powercap/intel-rapl:0/energy_uj"
+_RAPL_ENERGY_PATH = "/host-powercap/intel-rapl/intel-rapl:0/energy_uj"
 _RAPL_STATE = {"last_ts": None, "last_energy_uj": None}
 
 
