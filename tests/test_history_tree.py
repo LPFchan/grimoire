@@ -94,7 +94,10 @@ class HistoryTreeContractTests(unittest.TestCase):
             json={"content": "edited", "toolCalls": "[]", "model": "qwen-3.6-27B"},
             headers=self.auth,
         )
-        self.assertEqual(response.status_code, 204)
+        # The endpoint switched from 204 to 200+JSON body (commit 7925382) to avoid
+        # client parse errors on empty responses.
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["updated"], "m-1")
         conv = self.client.get("/history/c1", headers=self.auth).json()
         msg = next(m for m in conv["messages"] if m["id"] == "m-1")
         self.assertEqual(msg["content"], "edited")
@@ -154,7 +157,9 @@ class HistoryTreeContractTests(unittest.TestCase):
         self.client.post("/history", json={"id": "child-c", "name": "Child", "forkedFromConversationId": "parent-c", "lastModified": 2}, headers=self.auth)
         self.client.post("/history", json={"id": "grand-c", "name": "Grand", "forkedFromConversationId": "child-c", "lastModified": 3}, headers=self.auth)
         response = self.client.delete("/history/parent-c?with_forks=true", headers=self.auth)
-        self.assertEqual(response.status_code, 204)
+        # The endpoint switched from 204 to 200+JSON body (commit 7925382).
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["deleted"], "parent-c")
         listing = self.client.get("/history", headers=self.auth).json()["conversations"]
         self.assertEqual(listing, [])
 
