@@ -410,7 +410,7 @@ class DflashHelperTests(unittest.TestCase):
         ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
         self.assertNotIn(-1, ids)
 
-    def test_prefix_boundaries_returns_system_prefix(self):
+    def test_prefix_boundaries_returns_one_per_message(self):
         msgs = [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "hi"},
@@ -418,16 +418,143 @@ class DflashHelperTests(unittest.TestCase):
         prompt_text = self.tok.apply_chat_template(msgs, add_generation_prompt=True)
         prompt_ids = self.tok.encode(prompt_text)
         boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        # The boundary must be a valid prefix length of prompt_ids.
-        self.assertEqual(len(boundaries), 1)
+        # One boundary per message; each must be a valid prefix length of prompt_ids.
+        self.assertEqual(len(boundaries), 2)
         sys_prefix = self.tok.encode(self.tok.apply_chat_template(msgs[:1]))
         self.assertEqual(boundaries[0], len(sys_prefix))
         self.assertEqual(prompt_ids[:boundaries[0]], sys_prefix)
+        full_no_gen = self.tok.encode(self.tok.apply_chat_template(msgs))
+        self.assertEqual(boundaries[1], len(full_no_gen))
+        self.assertEqual(prompt_ids[:boundaries[1]], full_no_gen)
 
-    def test_prefix_boundaries_empty_when_no_system(self):
+    def test_prefix_boundaries_user_only_returns_one_boundary(self):
         msgs = [{"role": "user", "content": "hi"}]
         prompt_ids = self.tok.encode(self.tok.apply_chat_template(msgs, add_generation_prompt=True))
-        self.assertEqual(entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids), [])
+        boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        # The user-content boundary is recorded; the generation-prompt suffix is not.
+        self.assertEqual(len(boundaries), 1)
+        user_prefix = self.tok.encode(self.tok.apply_chat_template(msgs))
+        self.assertEqual(boundaries[0], len(user_prefix))
+
+    def test_prefix_boundaries_walks_multi_turn_conversation(self):
+        msgs = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "first answer"},
+            {"role": "user", "content": "second question"},
+            {"role": "assistant", "content": "second answer"},
+            {"role": "user", "content": "third question"},
+        ]
+        prompt_ids = self.tok.encode(
+            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        )
+        boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        # One boundary per message — none collapse to the full prompt because the
+        # generation-prompt suffix lives only in prompt_ids.
+        self.assertEqual(len(boundaries), len(msgs))
+        # Boundaries are strictly ascending and each is a valid prefix.
+        self.assertEqual(boundaries, sorted(boundaries))
+        self.assertEqual(len(set(boundaries)), len(boundaries))
+        # Each boundary is a valid prefix length: prompt_ids[:n] equals the
+        # encoded prefix of messages[:i+1] for some i.
+        for i, n in enumerate(boundaries):
+            expected = self.tok.encode(self.tok.apply_chat_template(msgs[: i + 1]))
+            self.assertEqual(n, len(expected))
+            self.assertEqual(prompt_ids[:n], expected)
+        # Specifically, boundaries[-2] is the start of the final user message,
+        # which is what maybe_compress relies on for tail protection.
+        last_user_start = self.tok.encode(self.tok.apply_chat_template(msgs[:-1]))
+        self.assertEqual(boundaries[-2], len(last_user_start))
+
+
+class MaybeCompressHeadTailTests(unittest.TestCase):
+    """maybe_compress must protect head + tail and only compress the middle slice."""
+
+    def setUp(self):
+        from grimoire.dflash.prefill import PrefillConfig
+        self.PrefillConfig = PrefillConfig
+
+    def _run(self, prompt_ids, boundaries, keep_ratio=0.5, threshold=10):
+        """Drive maybe_compress synchronously with a stub daemon."""
+        import asyncio
+        from grimoire.dflash.prefill import maybe_compress
+
+        class StubDaemon:
+            def __init__(self, ratio):
+                self.ratio = ratio
+                self.compress_called_with = None
+
+            def compress(self, ids, drafter_path, keep_ratio):
+                self.compress_called_with = list(ids)
+                keep = max(1, int(len(ids) * self.ratio))
+                # Return a fixed sentinel so the test can detect the compressed slice.
+                return [-7] * keep
+
+        daemon = StubDaemon(keep_ratio)
+        cfg = self.PrefillConfig(
+            enabled=True, threshold=threshold, keep_ratio=keep_ratio, drafter_path="/dummy"
+        )
+        compressed, fired = asyncio.run(
+            maybe_compress(prompt_ids, daemon, cfg, boundaries=boundaries)
+        )
+        return compressed, fired, daemon
+
+    def test_head_and_tail_are_preserved_byte_identical(self):
+        # 4000-token prompt: head [0:500), middle [500:3500), tail [3500:4000).
+        prompt_ids = list(range(4000))
+        head_end, tail_start = 500, 3500
+        # boundaries semantic: per-message end positions; helper drops final == len.
+        # So we feed [head_end, ..., tail_start, somewhere_in_tail].
+        boundaries = [head_end, 1500, 2500, tail_start, 3900]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=1000
+        )
+        self.assertTrue(fired)
+        # Head untouched.
+        self.assertEqual(compressed[:head_end], prompt_ids[:head_end])
+        # Tail untouched (slice from end since compressed length differs).
+        tail_len = len(prompt_ids) - tail_start
+        self.assertEqual(compressed[-tail_len:], prompt_ids[tail_start:])
+        # Daemon saw only the middle slice.
+        self.assertEqual(daemon.compress_called_with, prompt_ids[head_end:tail_start])
+
+    def test_skip_when_middle_too_small(self):
+        # Middle < 1024 → no compression even if threshold is exceeded.
+        prompt_ids = list(range(2000))
+        boundaries = [100, 500, 800, 1500]  # middle = 800 - 100 = 700, < 1024
+        compressed, fired, _ = self._run(
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=500
+        )
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+
+    def test_single_boundary_protects_head_only(self):
+        prompt_ids = list(range(3000))
+        boundaries = [200]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=1000
+        )
+        self.assertTrue(fired)
+        self.assertEqual(compressed[:200], prompt_ids[:200])
+        # No tail protection: everything after head_end is compressed.
+        self.assertEqual(daemon.compress_called_with, prompt_ids[200:])
+
+    def test_no_boundaries_compresses_whole_prompt(self):
+        prompt_ids = list(range(3000))
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=None, keep_ratio=0.1, threshold=1000
+        )
+        self.assertTrue(fired)
+        self.assertEqual(daemon.compress_called_with, prompt_ids)
+
+    def test_below_threshold_short_circuits(self):
+        prompt_ids = list(range(100))
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=[10, 50, 80], keep_ratio=0.1, threshold=1000
+        )
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+        self.assertIsNone(daemon.compress_called_with)
 
 
 class DflashProxyIntegrationTests(unittest.TestCase):

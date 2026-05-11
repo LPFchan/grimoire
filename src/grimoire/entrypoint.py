@@ -1431,21 +1431,24 @@ def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
     chat template, to find the token offset of every message boundary. Only
     boundaries that actually match prompt_ids[:n] are kept.
 
-    Returns a list of (boundary_pos, role) tuples sorted ascending.
+    Load-bearing invariant: callers build prompt_ids with
+    add_generation_prompt=True, while this helper renders each prefix with
+    add_generation_prompt=False. That asymmetry is what makes the per-message
+    encoded lengths strictly less than len(prompt_ids) (the trailing generation
+    prompt lives only in prompt_ids), so boundaries[-1] lands on the end of the
+    final user-message content and boundaries[-2] on its start. maybe_compress
+    relies on this to pick the tail-protect slice.
+
+    Returns a list of int boundary positions, ascending.
     """
     boundaries = []
     if not messages:
         return boundaries
 
-    cumulative = 0
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
-        role = msg.get("role", "")
-        # Render all messages up to and including this one.
-        prefix_msgs = []
-        for j in range(i + 1):
-            prefix_msgs.append(messages[j])
+        prefix_msgs = messages[: i + 1]
         try:
             rendered = tokenizer.apply_chat_template(
                 prefix_msgs, tokenize=False, add_generation_prompt=False
