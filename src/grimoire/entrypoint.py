@@ -1622,7 +1622,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             # so the next turn only needs to prefill the new delta.
             if session_slot is not None and tokens_emitted:
                 try:
-                    daemon.snapshot_at(session_slot, len(effective_ids))
+                    daemon.snapshot(session_slot)
                     sk.update(conversation_id, session_slot, len(effective_ids), effective_ids)
                 except Exception as e:
                     logger.warning(f"session snapshot failed: {e}")
