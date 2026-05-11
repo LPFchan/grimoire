@@ -330,6 +330,7 @@ class ActiveModel:
             threshold=self.cfg.get("prefill-threshold", 32000),
             keep_ratio=self.cfg.get("prefill-keep-ratio", 0.05),
             drafter_path=drafter_path,
+            tail_budget=self.cfg.get("prefill-tail-budget", 16000),
         )
 
         self.dflash_daemon = DflashDaemon(

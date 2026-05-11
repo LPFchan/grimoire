@@ -7,9 +7,10 @@ This reduces prefill time by ~10x for 64K-128K prompts.
 The gateway detects long prompts, calls compress() to get the reduced token
 list, then feeds that to the daemon's generate() instead of the full prompt.
 
-Compression protects the system prompt (head) and the last user message (tail),
-compressing only the middle conversation history. Boundaries are passed from
-the caller as token positions that mark message boundaries.
+Compression protects the system prompt (head) and the last N turns that fit
+within tail_budget tokens (tail), compressing only the middle conversation
+history. Boundaries are passed from the caller as token positions that mark
+message boundaries.
 """
 
 import asyncio
@@ -30,12 +31,15 @@ class PrefillConfig:
         threshold: Token count above which compression triggers
         keep_ratio: Fraction of source tokens to keep (0.01-1.0)
         drafter_path: Path to the drafter GGUF model
+        tail_budget: Max tokens to protect at the tail (walks backwards from
+            the end, protecting whole turns until the budget is consumed).
     """
 
     enabled: bool = False
     threshold: int = 32000
     keep_ratio: float = 0.05
     drafter_path: Optional[str] = None
+    tail_budget: int = 16000
 
 
 async def maybe_compress(
@@ -46,8 +50,8 @@ async def maybe_compress(
 ) -> tuple:
     """Compress prompt if it exceeds the threshold.
 
-    Protects the system prompt (head) and the last user message (tail),
-    compressing only the middle conversation history.
+    Protects the system prompt (head) and the last turns that fit within
+    tail_budget (tail), compressing only the middle conversation history.
 
     Args:
         prompt_ids: Original prompt token IDs
@@ -67,20 +71,26 @@ async def maybe_compress(
     if len(prompt_ids) < config.threshold:
         return prompt_ids, False
 
-    # Identify head (system prompt) and tail (last user message) to protect.
-    # boundaries = sorted token offsets where each message ends.
-    #   head end = first boundary (end of system message)
-    #   tail start = second-to-last boundary (start of last message)
     compress_start = 0
     compress_end = len(prompt_ids)
 
     if boundaries and len(boundaries) >= 2:
         # Head: system prompt ends at first boundary.
         compress_start = boundaries[0]
-        # Tail: last message starts at the boundary before the last one.
-        # The last boundary is the end of the last message (full prompt).
-        # The second-to-last boundary is where the last message started.
-        compress_end = boundaries[-2]
+
+        # Tail: walk backwards from the end, protecting whole turns until
+        # tail_budget is consumed. Each turn = boundaries[i] - boundaries[i-1].
+        tail_so_far = 0
+        for i in range(len(boundaries) - 1, 0, -1):
+            turn_len = boundaries[i] - boundaries[i - 1]
+            if tail_so_far + turn_len > config.tail_budget:
+                compress_end = boundaries[i - 1]
+                break
+            tail_so_far += turn_len
+        else:
+            # All turns fit in tail_budget — nothing to compress in the middle.
+            compress_end = boundaries[0]
+
     elif boundaries and len(boundaries) == 1:
         # Only system message boundary — protect head, compress everything after.
         compress_start = boundaries[0]
