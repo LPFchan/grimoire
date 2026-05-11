@@ -332,16 +332,6 @@ class DflashDaemon:
             except OSError:
                 pass
 
-    def snapshot(self, slot: int) -> None:
-        """Take a KV cache snapshot at current position into slot.
-
-        Args:
-            slot: Daemon slot ID (0-7)
-        """
-        if slot < 0 or slot >= 8:
-            raise ValueError(f"Invalid prefix cache slot: {slot}")
-        self._send(f"SNAPSHOT {slot}\n")
-
     def restore(self, slot: int) -> bool:
         """Restore KV cache from a snapshot slot.
 
@@ -390,9 +380,10 @@ class DflashDaemon:
     def snapshot(self, slot: int) -> None:
         """Take a KV cache snapshot at current position.
 
-        Sends a SNAPSHOT command. The daemon captures at cache.cur_pos,
-        which should equal len(effective_ids) after generation completes.
-        Callers must ensure no pending token reads before calling this.
+        Sends a SNAPSHOT command. The daemon captures at cache.cur_pos.
+        For prompt-boundary snapshots, prefer the inline `snap=pos:slot`
+        suffix on send_generate_cmd so decode cannot advance cache.cur_pos
+        before the snapshot is taken.
 
         Args:
             slot: Daemon slot ID (0-7)

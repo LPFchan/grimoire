@@ -34,6 +34,14 @@ def _prefix_hash(prompt_ids: list) -> bytes:
     return h.digest()[:12]
 
 
+def _session_key(conversation_id: str) -> bytes:
+    """Compute a stable 16B key for swap bookkeeping."""
+    h = hashlib.sha1()
+    h.update(b"session-kv\x00")
+    h.update(str(conversation_id).encode("utf-8", errors="surrogatepass"))
+    return h.digest()[:16]
+
+
 class SessionKV:
     """Manages per-conversation KV snapshot slots.
 
@@ -53,12 +61,21 @@ class SessionKV:
     def __init__(self, cap: int = DEFAULT_SESSION_CAP, prefix_cap: int = SESSION_SLOT_OFFSET):
         self.cap = cap
         self.slot_offset = prefix_cap
+        self.physical_cap = max(0, min(8 - prefix_cap, cap))
         # LRU: conversation_id -> (slot, prefix_len, prefix_hash)
         self.sessions: OrderedDict[str, tuple] = OrderedDict()
 
     def _slot_for_index(self, index: int) -> int:
         """Return daemon slot ID for session index 0..cap-1."""
-        return (self.slot_offset + index) % 8
+        return self.slot_offset + index
+
+    def swap_key(self, conversation_id: str) -> bytes:
+        """Return the stable swap key for a conversation."""
+        return _session_key(conversation_id)
+
+    def has_session(self, conversation_id: str) -> bool:
+        """Return True if a conversation currently has session metadata."""
+        return conversation_id in self.sessions
 
     def get_session(self, conversation_id: str, prompt_ids: list) -> Optional[tuple]:
         """Get cached slot for a conversation if the prompt prefix matches.
@@ -92,10 +109,10 @@ class SessionKV:
 
         Returns the slot ID, or None if cap is 0.
         """
-        if self.cap <= 0:
+        if self.physical_cap <= 0:
             return None
 
-        if len(self.sessions) >= self.cap:
+        if len(self.sessions) >= self.physical_cap:
             old_id, _ = next(iter(self.sessions.items()))
             self.sessions.pop(old_id)
 
@@ -105,11 +122,21 @@ class SessionKV:
         # len(sessions) is unsafe: after eviction it can collide with the
         # MRU survivor's slot.
         used = {entry[0] for entry in self.sessions.values()}
-        for idx in range(self.cap):
+        for idx in range(self.physical_cap):
             slot = self._slot_for_index(idx)
             if slot not in used:
                 return slot
         return None
+
+    def evict_lru_if_full(self, conversation_id: str) -> Optional[str]:
+        """Evict the LRU session if adding conversation_id would exceed cap."""
+        if self.cap <= 0 or conversation_id in self.sessions:
+            return None
+        if len(self.sessions) < self.cap:
+            return None
+        old_id, _ = next(iter(self.sessions.items()))
+        self.sessions.pop(old_id)
+        return old_id
 
     def update(self, conversation_id: str, slot: int, prefix_len: int, prompt_ids: list) -> None:
         """Record or update the snapshot position and content hash.

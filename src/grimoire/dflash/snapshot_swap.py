@@ -41,8 +41,22 @@ class SnapshotSwap:
             the LRU snapshot is saved to SSD and freed from VRAM.
     """
 
-    def __init__(self, swap_dir: str, max_vram_slots: int = 4):
+    def __init__(
+        self,
+        swap_dir: str,
+        max_vram_slots: int = 4,
+        slot_offset: int = 0,
+        slot_count: int = 8,
+    ):
         self.swap_dir = Path(swap_dir)
+        slot_count = max(0, min(8 - slot_offset, slot_count))
+        self.allowed_slots = list(range(slot_offset, slot_offset + slot_count))
+        if max_vram_slots > len(self.allowed_slots):
+            logger.warning(
+                f"snapshot swap max_vram_slots={max_vram_slots} exceeds "
+                f"allowed slots ({len(self.allowed_slots)}); clamping"
+            )
+            max_vram_slots = len(self.allowed_slots)
         self.max_vram_slots = max_vram_slots
         # VRAM slots: hash_key -> slot_id (in-use, in VRAM)
         self.vram: OrderedDict[bytes, int] = OrderedDict()
@@ -53,7 +67,7 @@ class SnapshotSwap:
         self.swap_dir.mkdir(parents=True, exist_ok=True)
         logger.info(
             f"snapshot swap enabled: dir={self.swap_dir} "
-            f"max_vram={max_vram_slots}"
+            f"max_vram={self.max_vram_slots} slots={self.allowed_slots}"
         )
 
     def _manifest_path(self) -> Path:
@@ -128,6 +142,10 @@ class SnapshotSwap:
         if self.max_vram_slots <= 0:
             return None
 
+        if key in self.vram:
+            self.vram.move_to_end(key)
+            return self.vram[key]
+
         # Make room if VRAM is full — applies whether the key is on disk
         # (and we're about to load it back) or new.
         if len(self.vram) >= self.max_vram_slots:
@@ -137,11 +155,11 @@ class SnapshotSwap:
             self.disk[lru_key] = disk_path
             self._save_manifest()
 
-        # Find a free daemon slot.
+        # Find a free daemon slot inside the reserved slot range.
         used = set(self.vram.values())
-        free_slot = next((s for s in range(8) if s not in used), None)
+        free_slot = next((s for s in self.allowed_slots if s not in used), None)
         if free_slot is None:
-            raise RuntimeError("All 8 daemon slots in use")
+            raise RuntimeError("All allowed daemon snapshot slots are in use")
 
         # If the key is on disk, restore its contents into the slot.
         if key in self.disk:
@@ -180,6 +198,24 @@ class SnapshotSwap:
             # Save to disk instead of freeing, so it can be restored later.
             path = self._evict_to_disk(daemon, key, slot)
             self.disk[key] = path
+            self._save_manifest()
+        elif key in self.disk:
+            path = self.disk.pop(key)
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._save_manifest()
+
+    def discard(self, daemon, key: bytes) -> None:
+        """Drop a snapshot from VRAM/disk without saving it first."""
+        if key in self.vram:
+            slot = self.vram.pop(key)
+            if daemon is not None:
+                try:
+                    daemon.free_snapshot(slot)
+                except Exception:
+                    pass
             self._save_manifest()
         elif key in self.disk:
             path = self.disk.pop(key)

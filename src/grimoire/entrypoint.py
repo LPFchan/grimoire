@@ -318,7 +318,7 @@ class ActiveModel:
         draft_path = resolve_path(self.cfg, "draft")
         drafter_path = resolve_path(self.cfg, "drafter")
 
-        pc_cap = self.cfg.get("prefix-cache-slots", 4)
+        pc_cap = max(0, min(int(self.cfg.get("prefix-cache-slots", 4)), 8))
         self.prefix_cache = PrefixCache(
             cap=pc_cap,
             cache_dir=f"/var/lib/grimoire/prefix_cache/{self.name}",
@@ -335,16 +335,19 @@ class ActiveModel:
             tail_budget=self.cfg.get("prefill-tail-budget", 12288),
         )
 
-        session_cap = self.cfg.get("session-kv-slots", 2)
+        session_cap = max(0, int(self.cfg.get("session-kv-slots", 2)))
         self.session_kv = SessionKV(
             cap=session_cap,
             prefix_cap=pc_cap,
         )
 
-        swap_cap = self.cfg.get("swap-max-vram", 4)
+        max_session_vram = max(0, 8 - pc_cap)
+        swap_cap = min(self.cfg.get("swap-max-vram", session_cap), session_cap, max_session_vram)
         self.snapshot_swap = SnapshotSwap(
             swap_dir=f"/var/lib/grimoire/snapshot_swap/{self.name}",
             max_vram_slots=swap_cap,
+            slot_offset=pc_cap,
+            slot_count=max_session_vram,
         )
 
         self.dflash_daemon = DflashDaemon(
@@ -1556,25 +1559,62 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             snap_pos = None
             session_slot = None
             sk = active.session_kv
+            swap = getattr(active, "snapshot_swap", None)
+            session_key = sk.swap_key(conversation_id) if conversation_id and sk else None
+            had_session = False
             # Session KV: check if this conversation has a cached snapshot.
             # If hit, RESTORE from that slot — only prefill the new delta.
             if conversation_id and sk:
                 sess = sk.get_session(conversation_id, effective_ids)
                 if sess is not None:
-                    prefix_hit = (sess[0], sess[1])
-                    session_slot = sess[0]
+                    had_session = True
+                    session_slot, session_prefix_len = sess
+                    if swap and session_key is not None:
+                        swap_hit = swap.get(session_key)
+                        if swap_hit is None:
+                            logger.warning("session snapshot missing from swap index; evicting session")
+                            sk.evict(conversation_id)
+                            session_slot = None
+                            had_session = False
+                        elif swap_hit[1]:
+                            session_slot = swap_hit[0]
+                            prefix_hit = (session_slot, session_prefix_len)
+                        else:
+                            session_slot = await asyncio.to_thread(
+                                swap.reserve_slot, daemon, session_key
+                            )
+                            prefix_hit = (session_slot, session_prefix_len)
+                    else:
+                        prefix_hit = (session_slot, session_prefix_len)
+                elif swap and session_key is not None and not sk.has_session(conversation_id):
+                    await asyncio.to_thread(swap.discard, daemon, session_key)
             # Prefix cache: fallback for new conversations or cache-miss sessions.
             if prefix_hit is None:
                 pc = active.prefix_cache
                 if pc and not pc.disabled:
                     prefix_hit = pc.lookup(effective_ids, boundaries=boundaries)
-                    if boundaries:
-                        prep = pc.prepare_inline_snap(effective_ids, boundaries[0])
-                        if prep:
-                            snap_slot, snap_pos = prep
-            # New conversation: reserve a session slot for post-gen snapshot.
+            # New conversation: reserve a session slot for an inline prompt snapshot.
             if conversation_id and sk and session_slot is None:
-                session_slot = sk.reserve_slot()
+                if swap and session_key is not None:
+                    evicted_id = sk.evict_lru_if_full(conversation_id)
+                    if evicted_id is not None:
+                        await asyncio.to_thread(
+                            swap.discard, daemon, sk.swap_key(evicted_id)
+                        )
+                    session_slot = await asyncio.to_thread(
+                        swap.reserve_slot, daemon, session_key
+                    )
+                else:
+                    session_slot = sk.reserve_slot()
+
+            if session_slot is not None:
+                snap_slot, snap_pos = session_slot, len(effective_ids)
+            else:
+                pc = active.prefix_cache
+                if pc and not pc.disabled and boundaries:
+                    prep = pc.prepare_inline_snap(effective_ids, boundaries[0])
+                    if prep:
+                        snap_slot, snap_pos = prep
 
             cmd_path = await asyncio.to_thread(
                 daemon.send_generate_cmd,
@@ -1625,17 +1665,21 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             elapsed = max(time.monotonic() - t0, 1e-6)
             tps = len(tokens_emitted) / elapsed
 
-            # Post-generation snapshot: capture KV at end of effective_ids
-            # so the next turn only needs to prefill the new delta.
+            # Session snapshots are captured inline at len(effective_ids)
+            # during prefill, before decode advances cache.cur_pos.
             if session_slot is not None and tokens_emitted:
                 try:
-                    daemon.snapshot(session_slot)
                     sk.update(conversation_id, session_slot, len(effective_ids), effective_ids)
                 except Exception as e:
                     logger.warning(f"session snapshot failed: {e}")
                     sk.evict(conversation_id)
+                    if swap and session_key is not None:
+                        await asyncio.to_thread(swap.discard, daemon, session_key)
+            elif session_slot is not None and not tokens_emitted and not had_session:
+                if swap and session_key is not None:
+                    await asyncio.to_thread(swap.discard, daemon, session_key)
 
-            if snap_slot is not None and snap_pos is not None:
+            if snap_slot is not None and snap_pos is not None and snap_slot != session_slot:
                 if tokens_emitted:
                     pc.confirm_inline_snap(snap_slot, snap_pos, effective_ids)
                 else:
