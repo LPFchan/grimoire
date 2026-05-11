@@ -1586,7 +1586,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             prefix_hit = (session_slot, session_prefix_len)
                     else:
                         prefix_hit = (session_slot, session_prefix_len)
-                elif swap and session_key is not None and not sk.has_session(conversation_id):
+                elif swap and session_key is not None:
                     await asyncio.to_thread(swap.discard, daemon, session_key)
             # Prefix cache: fallback for new conversations or cache-miss sessions.
             if prefix_hit is None:
@@ -1667,16 +1667,16 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
             # Session snapshots are captured inline at len(effective_ids)
             # during prefill, before decode advances cache.cur_pos.
-            if session_slot is not None and tokens_emitted:
-                try:
-                    sk.update(conversation_id, session_slot, len(effective_ids), effective_ids)
-                except Exception as e:
-                    logger.warning(f"session snapshot failed: {e}")
-                    sk.evict(conversation_id)
-                    if swap and session_key is not None:
-                        await asyncio.to_thread(swap.discard, daemon, session_key)
-            elif session_slot is not None and not tokens_emitted and not had_session:
-                if swap and session_key is not None:
+            if session_slot is not None:
+                if tokens_emitted or had_session:
+                    try:
+                        sk.update(conversation_id, session_slot, len(effective_ids), effective_ids)
+                    except Exception as e:
+                        logger.warning(f"session snapshot failed: {e}")
+                        sk.evict(conversation_id)
+                        if swap and session_key is not None:
+                            await asyncio.to_thread(swap.discard, daemon, session_key)
+                elif swap and session_key is not None:
                     await asyncio.to_thread(swap.discard, daemon, session_key)
 
             if snap_slot is not None and snap_pos is not None and snap_slot != session_slot:

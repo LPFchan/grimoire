@@ -143,7 +143,9 @@ class SessionKV:
 
         Args:
             conversation_id: The conversation identifier.
-            slot: Daemon slot ID that holds the snapshot.
+            slot: Daemon slot ID assigned to this session's snapshot.
+                With SSD swap enabled, multiple sessions may route to the same
+                physical slot value at different times.
             prefix_len: Number of tokens captured in the snapshot.
             prompt_ids: Full prompt token IDs (used to compute content hash).
         """
