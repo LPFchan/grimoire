@@ -425,9 +425,10 @@ class DflashHelperTests(unittest.TestCase):
         ]
         prompt_text = self.tok.apply_chat_template(msgs, add_generation_prompt=True)
         prompt_ids = self.tok.encode(prompt_text)
-        boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
         # One boundary per message; each must be a valid prefix length of prompt_ids.
         self.assertEqual(len(boundaries), 2)
+        self.assertEqual(len(protected), 0)
         sys_prefix = self.tok.encode(self.tok.apply_chat_template(msgs[:1]))
         self.assertEqual(boundaries[0], len(sys_prefix))
         self.assertEqual(prompt_ids[:boundaries[0]], sys_prefix)
@@ -438,9 +439,10 @@ class DflashHelperTests(unittest.TestCase):
     def test_prefix_boundaries_user_only_returns_one_boundary(self):
         msgs = [{"role": "user", "content": "hi"}]
         prompt_ids = self.tok.encode(self.tok.apply_chat_template(msgs, add_generation_prompt=True))
-        boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
         # The user-content boundary is recorded; the generation-prompt suffix is not.
         self.assertEqual(len(boundaries), 1)
+        self.assertEqual(len(protected), 0)
         user_prefix = self.tok.encode(self.tok.apply_chat_template(msgs))
         self.assertEqual(boundaries[0], len(user_prefix))
 
@@ -456,10 +458,11 @@ class DflashHelperTests(unittest.TestCase):
         prompt_ids = self.tok.encode(
             self.tok.apply_chat_template(msgs, add_generation_prompt=True)
         )
-        boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
         # One boundary per message — none collapse to the full prompt because the
         # generation-prompt suffix lives only in prompt_ids.
         self.assertEqual(len(boundaries), len(msgs))
+        self.assertEqual(len(protected), 0)
         # Boundaries are strictly ascending and each is a valid prefix.
         self.assertEqual(boundaries, sorted(boundaries))
         self.assertEqual(len(set(boundaries)), len(boundaries))
@@ -473,6 +476,80 @@ class DflashHelperTests(unittest.TestCase):
         # which is what maybe_compress relies on for tail protection.
         last_user_start = self.tok.encode(self.tok.apply_chat_template(msgs[:-1]))
         self.assertEqual(boundaries[-2], len(last_user_start))
+
+    def test_prefix_boundaries_returns_protected_ranges_for_obsidian_read_note(self):
+        msgs = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "read this note"},
+            {"role": "assistant", "content": "I'll use the obsidian_read-note tool"},
+            {
+                "role": "tool",
+                "tool": {"name": "obsidian_read-note"},
+                "content": "this is the note content that should be protected",
+            },
+            {"role": "assistant", "content": "Here's what the note says..."},
+            {"role": "user", "content": "thanks"},
+        ]
+        prompt_ids = self.tok.encode(
+            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        )
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        self.assertEqual(len(boundaries), len(msgs))
+        # The obsidian_read-note tool output (index 3) should be in protected ranges.
+        self.assertEqual(len(protected), 1)
+        note_start, note_end = protected[0]
+        # The protected range should cover the tool message boundary span.
+        tool_start = boundaries[2]  # end of assistant message before tool
+        tool_end = boundaries[3]  # end of tool message
+        self.assertEqual(note_start, tool_start)
+        self.assertEqual(note_end, tool_end)
+
+    def test_prefix_boundaries_protects_multiple_obsidian_read_note_messages(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "read notes"},
+            {
+                "role": "tool",
+                "tool": {"name": "obsidian_read-note"},
+                "content": "note A content here",
+            },
+            {"role": "assistant", "content": "reading next..."},
+            {
+                "role": "tool",
+                "tool": {"name": "obsidian_read-note"},
+                "content": "note B content here",
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+        prompt_ids = self.tok.encode(
+            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        )
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        self.assertEqual(len(boundaries), len(msgs))
+        # Two tool messages should produce two protected ranges.
+        self.assertEqual(len(protected), 2)
+        for ps, pe in protected:
+            self.assertLess(ps, pe)
+        self.assertLess(protected[0][1], protected[1][0])
+
+    def test_prefix_boundaries_ignores_non_obsidian_tools(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do something"},
+            {
+                "role": "tool",
+                "tool": {"name": "bash"},
+                "content": "ls -la",
+            },
+            {"role": "assistant", "content": "ok"},
+        ]
+        prompt_ids = self.tok.encode(
+            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        )
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        self.assertEqual(len(boundaries), len(msgs))
+        # bash tool should not produce protected ranges.
+        self.assertEqual(len(protected), 0)
 
 
 class MaybeCompressHeadTailTests(unittest.TestCase):
@@ -507,7 +584,7 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
             tail_budget=tail_budget,
         )
         compressed, fired = asyncio.run(
-            maybe_compress(prompt_ids, daemon, cfg, boundaries=boundaries)
+            maybe_compress(prompt_ids, daemon, cfg, boundaries=boundaries, protected_ranges=None)
         )
         return compressed, fired, daemon
 
@@ -627,6 +704,142 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         self.assertFalse(fired)
         self.assertEqual(compressed, prompt_ids)
         self.assertIsNone(daemon.compress_called_with)
+
+
+class MaybeCompressProtectedRangesTests(unittest.TestCase):
+    """maybe_compress must respect protected_ranges and only compress gaps between them."""
+
+    def setUp(self):
+        from grimoire.dflash.prefill import PrefillConfig
+        self.PrefillConfig = PrefillConfig
+
+    def _run(self, prompt_ids, boundaries, protected_ranges, keep_ratio=0.5, threshold=10, tail_budget=600):
+        import asyncio
+        from grimoire.dflash.prefill import maybe_compress
+
+        class StubDaemon:
+            def __init__(self, ratio):
+                self.ratio = ratio
+                self.compress_calls = []
+
+            def compress(self, ids, drafter_path, keep_ratio):
+                self.compress_calls.append(list(ids))
+                keep = max(1, int(len(ids) * self.ratio))
+                return [-7] * keep
+
+        daemon = StubDaemon(keep_ratio)
+        cfg = self.PrefillConfig(
+            enabled=True,
+            threshold=threshold,
+            keep_ratio=keep_ratio,
+            drafter_path="/dummy",
+            tail_budget=tail_budget,
+        )
+        compressed, fired = asyncio.run(
+            maybe_compress(
+                prompt_ids, daemon, cfg, boundaries=boundaries,
+                protected_ranges=protected_ranges if protected_ranges else None
+            )
+        )
+        return compressed, fired, daemon
+
+    def test_protected_range_in_middle_is_preserved(self):
+        # Prompt: 5000 tokens
+        # Boundaries: [50, 200, 2500, 3000, 3500, 4500, 4800]
+        # tail_budget=300: i=6 turn=300 fits, i=5 turn=1000 → 1300>300 break
+        # → tail_start=boundaries[4]=3500
+        # Protected: [(2500, 3000)] — obsidian_read-note in middle
+        # Merged: [[0,200], [2500,3000], [3500,5000]]
+        # Gaps: [200:2500]=2300, [3000:3500]=500 → total=2800 >= 1024
+        # Compressed len: 5000 - 2800*0.9 = 2480 → threshold=2481
+        prompt_ids = list(range(5000))
+        boundaries = [50, 200, 2500, 3000, 3500, 4500, 4800]
+        protected_ranges = [(2500, 3000)]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+            keep_ratio=0.1, threshold=2481, tail_budget=300
+        )
+        self.assertTrue(fired)
+        self.assertEqual(compressed[:200], prompt_ids[:200])
+        tail_len = 5000 - 3500
+        self.assertEqual(compressed[-tail_len:], prompt_ids[3500:])
+        gap1_compressed_len = 230  # 2300 * 0.1
+        protected_offset = 200 + gap1_compressed_len
+        self.assertEqual(
+            compressed[protected_offset:protected_offset + 500],
+            prompt_ids[2500:3000],
+            "protected range must be byte-identical in compressed output",
+        )
+        self.assertEqual(len(daemon.compress_calls), 2)
+        self.assertEqual(daemon.compress_calls[0], prompt_ids[200:2500])
+        self.assertEqual(daemon.compress_calls[1], prompt_ids[3000:3500])
+
+    def test_protected_range_overlaps_head_is_merged(self):
+        # Prompt: 5000 tokens, same boundaries
+        # tail_budget=300: → tail_start=3500
+        # Protected: [(100, 1500)] — overlaps head [0:200] → merge to [0,1500]
+        # Merged: [[0,1500], [3500,5000]]
+        # Gap: [1500:3500]=2000 >= 1024
+        # Compressed len: 5000 - 2000*0.9 = 3200 → threshold=3201
+        prompt_ids = list(range(5000))
+        boundaries = [50, 200, 2500, 3000, 3500, 4500, 4800]
+        protected_ranges = [(100, 1500)]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+            keep_ratio=0.1, threshold=3201, tail_budget=300
+        )
+        self.assertTrue(fired)
+        self.assertEqual(compressed[:1500], prompt_ids[:1500])
+        tail_len = 5000 - 3500
+        self.assertEqual(compressed[-tail_len:], prompt_ids[3500:])
+        self.assertEqual(len(daemon.compress_calls), 1)
+        self.assertEqual(daemon.compress_calls[0], prompt_ids[1500:3500])
+
+    def test_protected_range_overlaps_tail_is_merged(self):
+        # Prompt: 5000 tokens, same boundaries
+        # tail_budget=300: → tail_start=3500
+        # Protected: [(3000, 4000)] — overlaps tail [3500:5000] → merge to [3000,5000]
+        # Merged: [[0,200], [3000,5000]]
+        # Gap: [200:3000]=2800 >= 1024
+        # Compressed len: 5000 - 2800*0.9 = 2480 → threshold=2481
+        prompt_ids = list(range(5000))
+        boundaries = [50, 200, 2500, 3000, 3500, 4500, 4800]
+        protected_ranges = [(3000, 4000)]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+            keep_ratio=0.1, threshold=2481, tail_budget=300
+        )
+        self.assertTrue(fired)
+        self.assertEqual(compressed[:200], prompt_ids[:200])
+        self.assertEqual(compressed[-2000:], prompt_ids[3000:])
+        self.assertEqual(len(daemon.compress_calls), 1)
+        self.assertEqual(daemon.compress_calls[0], prompt_ids[200:3000])
+
+    def test_protected_range_consumes_all_compressible_skips(self):
+        prompt_ids = list(range(2000))
+        boundaries = [50, 200, 1800]
+        # Protected range covers the entire middle. No compressible gap remains.
+        protected_ranges = [(200, 1800)]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+            keep_ratio=0.1, threshold=500, tail_budget=200
+        )
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+        self.assertEqual(daemon.compress_calls, [])
+
+    def test_small_gap_below_min_is_skipped(self):
+        prompt_ids = list(range(2000))
+        boundaries = [50, 200, 1800]
+        # Protected range leaves a 128-token gap below the 256-token minimum.
+        protected_ranges = [(200, 1872)]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+            keep_ratio=0.1, threshold=500, tail_budget=200
+        )
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+        self.assertEqual(daemon.compress_calls, [])
 
 
 class SessionKVTests(unittest.TestCase):

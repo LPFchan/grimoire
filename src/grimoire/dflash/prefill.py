@@ -47,11 +47,14 @@ async def maybe_compress(
     daemon,
     config: PrefillConfig,
     boundaries: Optional[list] = None,
+    protected_ranges: Optional[list] = None,
 ) -> tuple:
     """Compress prompt if it exceeds the threshold.
 
     Protects the system prompt (head) and the last turns that fit within
     tail_budget (tail), compressing only the middle conversation history.
+    Additional protected_ranges (e.g., obsidian_read-note tool outputs) are
+    also exempted from compression.
 
     Args:
         prompt_ids: Original prompt token IDs
@@ -60,6 +63,8 @@ async def maybe_compress(
         boundaries: List of token positions marking message boundaries,
             derived from _dflash_prefix_boundaries(). Each element is an int
             (token offset) where a message ends.
+        protected_ranges: List of (start, end) tuples marking token ranges
+            that must not be compressed (e.g., tool outputs).
 
     Returns:
         (compressed_ids, compression_fired) tuple. If compression didn't
@@ -71,67 +76,119 @@ async def maybe_compress(
     if len(prompt_ids) < config.threshold:
         return prompt_ids, False
 
-    compress_start = 0
-    compress_end = len(prompt_ids)
+    n = len(prompt_ids)
+    # Build list of protected intervals: [start, end) — never compressed.
+    # Start with head = [0, n) meaning "protect everything" as a default.
+    head_end = n
 
     if boundaries and len(boundaries) >= 2:
         # Head: system prompt + first user message (opencode compaction summary).
-        # Protecting the first user message preserves the compaction context
-        # and the original user prompt when no compaction is active.
-        compress_start = boundaries[1]
+        head_end = boundaries[1]
 
         # Tail: walk backwards from the end, protecting whole turns until
         # tail_budget is consumed. Each turn = boundaries[i] - boundaries[i-1].
+        # If a turn exceeds the budget, it's still protected (overshoot).
         tail_so_far = 0
+        tail_start = n
         for i in range(len(boundaries) - 1, 1, -1):
             turn_len = boundaries[i] - boundaries[i - 1]
             if tail_so_far + turn_len > config.tail_budget:
-                compress_end = boundaries[i - 1]
+                tail_start = boundaries[i - 1]
                 break
             tail_so_far += turn_len
+            tail_start = boundaries[i - 1]
         else:
             # All turns fit in tail_budget — nothing to compress in the middle.
-            compress_end = boundaries[1]
+            tail_start = boundaries[1]
+
+        # Prevent head + tail from merging (which would leave nothing to compress).
+        if tail_start <= head_end:
+            tail_start = head_end
+
+        protected: list[list[int]] = [[0, head_end], [tail_start, n]]
 
     elif boundaries and len(boundaries) >= 1:
         # Only system boundary (or system + 1 msg) — protect head.
-        compress_start = boundaries[0]
+        head_end = boundaries[0]
+        protected = [[0, head_end]]
 
-    # If the middle portion is too small to benefit from compression, skip.
-    middle_len = compress_end - compress_start
-    if middle_len < 1024:
+    else:
+        # No boundaries — protect nothing (entire prompt is compressible).
+        protected = []
+
+    # Merge additional protected ranges (e.g., obsidian_read-note outputs).
+    if protected_ranges:
+        for ps, pe in protected_ranges:
+            if 0 <= ps < pe <= n:
+                protected.append([ps, pe])
+
+    # Sort by start, then merge overlapping intervals.
+    if protected:
+        protected.sort()
+        merged = [protected[0][:]]
+        for s, e in protected[1:]:
+            if s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+    else:
+        merged = []
+
+    # Find compressible gaps between protected intervals (and edges of prompt).
+    gaps = []
+    prev_end = 0
+    for s, e in merged:
+        if s - prev_end >= 256:
+            gaps.append((prev_end, s))
+        prev_end = max(prev_end, e)
+    # Gap after last protected interval to end of prompt.
+    if n - prev_end >= 256:
+        gaps.append((prev_end, n))
+
+    total_compressible = sum(e - s for s, e in gaps)
+    if total_compressible < 1024:
         return prompt_ids, False
 
-    head_len = compress_start
-    tail_len = len(prompt_ids) - compress_end
-
+    head_tail_len = n - total_compressible
     logger.info(
-        f"pflash compressing {middle_len} middle tokens "
-        f"(head={head_len} tail={tail_len} keep={config.keep_ratio})"
+        f"pflash compressing {total_compressible} middle tokens "
+        f"(head+tail={head_tail_len} keep={config.keep_ratio})"
     )
 
     t0 = time.monotonic()
-
-    # Compress only the middle portion.
-    middle = prompt_ids[compress_start:compress_end]
     loop = asyncio.get_event_loop()
-    compressed_middle = await loop.run_in_executor(
-        None,
-        lambda: daemon.compress(
-            middle,
-            drafter_path=config.drafter_path,
-            keep_ratio=config.keep_ratio,
-        ),
-    )
 
-    # Reattach protected head and tail.
-    compressed = prompt_ids[:compress_start] + compressed_middle + prompt_ids[compress_end:]
+    # Compress each gap independently and rebuild the prompt.
+    compressed = []
+    for i, (gstart, gend) in enumerate(gaps):
+        # Append the protected segment before this gap.
+        if i == 0:
+            compressed.extend(prompt_ids[:gstart])
+        else:
+            compressed.extend(prompt_ids[gaps[i - 1][1]:gstart])
+
+        gap = prompt_ids[gstart:gend]
+        compressed_gap = await loop.run_in_executor(
+            None,
+            lambda g=gap: daemon.compress(
+                g,
+                drafter_path=config.drafter_path,
+                keep_ratio=config.keep_ratio,
+            ),
+        )
+        compressed.extend(compressed_gap)
+
+    # Append the final protected tail segment.
+    if gaps:
+        compressed.extend(prompt_ids[gaps[-1][1]:])
+    else:
+        compressed = prompt_ids[:]
 
     elapsed = time.monotonic() - t0
     logger.info(
-        f"pflash middle {middle_len} -> {len(compressed_middle)} tokens "
-        f"({middle_len / max(len(compressed_middle), 1):.1f}x, "
-        f"total {len(prompt_ids)} -> {len(compressed)}) in {elapsed:.1f}s"
+        f"pflash middle {total_compressible} -> {len(compressed) - head_tail_len} tokens "
+        f"({total_compressible / max(len(compressed) - head_tail_len, 1):.1f}x, "
+        f"total {n} -> {len(compressed)}) in {elapsed:.1f}s"
     )
 
     return compressed, True

@@ -1457,11 +1457,13 @@ def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
     final user-message content and boundaries[-2] on its start. maybe_compress
     relies on this to pick the tail-protect slice.
 
-    Returns a list of int boundary positions, ascending.
+    Returns (boundaries, protected_ranges) where boundaries is a list of int
+    boundary positions (ascending), and protected_ranges is a list of
+    (start, end) tuples marking token ranges that must not be compressed.
     """
     boundaries = []
     if not messages:
-        return boundaries
+        return [], []
 
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
@@ -1479,7 +1481,40 @@ def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
             continue
         if prompt_ids[:n] == encoded:
             boundaries.append(n)
-    return boundaries
+
+    # Detect obsidian_read-note tool output messages and mark their token
+    # ranges as protected (exempt from PFlash compression).
+    protected_ranges = []
+    _protected_tools = {"obsidian_read-note"}
+    prev_boundary = 0
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        tool_name = None
+        if msg.get("role") == "tool" and isinstance(msg.get("tool"), dict):
+            tool_name = msg["tool"].get("name")
+        if msg.get("type") == "tool" and isinstance(msg.get("tool"), str):
+            tool_name = msg["tool"]
+        if tool_name not in _protected_tools:
+            continue
+        try:
+            prefix_msgs = messages[:i]
+            rendered_before = tokenizer.apply_chat_template(
+                prefix_msgs, tokenize=False, add_generation_prompt=False
+            )
+            start = len(tokenizer.encode(rendered_before, add_special_tokens=False))
+            prefix_msgs_after = messages[: i + 1]
+            rendered_after = tokenizer.apply_chat_template(
+                prefix_msgs_after, tokenize=False, add_generation_prompt=False
+            )
+            end = len(tokenizer.encode(rendered_after, add_special_tokens=False))
+        except Exception:
+            continue
+        if 0 <= start < end <= len(prompt_ids):
+            protected_ranges.append((start, end))
+        prev_boundary = end
+
+    return boundaries, protected_ranges
 
 
 async def _proxy_dflash(requested_model, payload, active, user_hash, conversation_id):
@@ -1531,7 +1566,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         )
 
     stop_ids = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
-    boundaries = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
+    boundaries, protected_ranges = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -1548,7 +1583,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             if active.prefill_config and active.prefill_config.enabled:
                 try:
                     effective_ids, _ = await maybe_compress(
-                        prompt_ids, daemon, active.prefill_config, boundaries=boundaries
+                        prompt_ids, daemon, active.prefill_config, boundaries=boundaries,
+                        protected_ranges=protected_ranges if protected_ranges else None
                     )
                 except Exception as e:
                     logger.error(f"pflash compression failed: {e}")
