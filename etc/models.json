@@ -128,12 +128,12 @@
       "ctx-size": 262144,
       "predict": 16384,
       "budget": 22,
-      "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0",
+      "cache-type-k": "tq3_0",
+      "cache-type-v": "tq3_0",
       "fa-window": 2048,
-      "prefix-cache-slots": 4,
-      "prefill-threshold": 32000,
-      "prefill-keep-ratio": 0.05,
+      "prefix-cache-slots": 2,
+      "prefill-threshold": 16384,
+      "prefill-keep-ratio": 0.10,
       "prefill-compression": "auto"
     }
   },

@@ -1425,26 +1425,39 @@ def _dflash_collect_stop_ids(tokenizer, payload_stop, cfg):
 
 
 def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
-    """Compute candidate cache boundaries that are valid prefixes of prompt_ids.
+    """Compute message boundaries as valid prefix positions in prompt_ids.
 
-    Currently emits the system-message boundary. If the encoded system prefix
-    doesn't actually match prompt_ids[:n] (chat-template overhead is template-
-    specific), the boundary is dropped.
+    Walks the message list, rendering progressively longer prefixes through the
+    chat template, to find the token offset of every message boundary. Only
+    boundaries that actually match prompt_ids[:n] are kept.
+
+    Returns a list of (boundary_pos, role) tuples sorted ascending.
     """
     boundaries = []
-    system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
-    if not system_msgs:
+    if not messages:
         return boundaries
-    try:
-        sys_text = tokenizer.apply_chat_template(
-            system_msgs, tokenize=False, add_generation_prompt=False
-        )
-        sys_ids = tokenizer.encode(sys_text, add_special_tokens=False)
-    except Exception:
-        return boundaries
-    n = len(sys_ids)
-    if 0 < n < len(prompt_ids) and prompt_ids[:n] == sys_ids:
-        boundaries.append(n)
+
+    cumulative = 0
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role", "")
+        # Render all messages up to and including this one.
+        prefix_msgs = []
+        for j in range(i + 1):
+            prefix_msgs.append(messages[j])
+        try:
+            rendered = tokenizer.apply_chat_template(
+                prefix_msgs, tokenize=False, add_generation_prompt=False
+            )
+            encoded = tokenizer.encode(rendered, add_special_tokens=False)
+            n = len(encoded)
+        except Exception:
+            continue
+        if n <= 0 or n >= len(prompt_ids):
+            continue
+        if prompt_ids[:n] == encoded:
+            boundaries.append(n)
     return boundaries
 
 
@@ -1514,7 +1527,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             if active.prefill_config and active.prefill_config.enabled:
                 try:
                     effective_ids, _ = await maybe_compress(
-                        prompt_ids, daemon, active.prefill_config
+                        prompt_ids, daemon, active.prefill_config, boundaries=boundaries
                     )
                 except Exception as e:
                     logger.error(f"pflash compression failed: {e}")
