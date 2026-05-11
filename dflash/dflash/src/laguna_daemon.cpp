@@ -465,6 +465,19 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
             std::string in_path;
             int n_gen = 0;
             iss >> slot >> in_path >> n_gen;
+            int inline_snap_pos  = -1;
+            int inline_snap_slot = -1;
+            {
+                size_t p = line.find(" snap=");
+                if (p != std::string::npos) {
+                    int L = -1, S = -1;
+                    if (std::sscanf(line.c_str() + p + 6, "%d:%d", &L, &S) == 2 &&
+                        L > 0 && S >= 0 && S < kMaxSlots) {
+                        inline_snap_pos  = L;
+                        inline_snap_slot = S;
+                    }
+                }
+            }
             if (slot < 0 || slot >= kMaxSlots || in_path.empty() || n_gen <= 0) {
                 std::fprintf(stderr, "[snap] RESTORE bad args: %s\n", line.c_str());
                 std::printf("err bad_args\n"); std::fflush(stdout);
@@ -525,6 +538,16 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
             if (!ok) {
                 std::printf("err prefill\n"); std::fflush(stdout);
                 stream_emit(-1); continue;
+            }
+            if (inline_snap_slot >= 0 && inline_snap_pos > 0 &&
+                inline_snap_pos <= (int)prompt_full.size()) {
+                if (ensure_slot(inline_snap_slot) &&
+                    laguna_snapshot_save(cache, snapshots[inline_snap_slot])) {
+                    snapshots[inline_snap_slot].cur_pos = inline_snap_pos;
+                    std::printf("[snap] inline slot=%d cur_pos=%d\n",
+                                 inline_snap_slot, inline_snap_pos);
+                    std::fflush(stdout);
+                }
             }
             std::vector<int32_t> history(prompt_full);
             auto argmax = [](const std::vector<float> & ll) {
