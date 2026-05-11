@@ -27,6 +27,9 @@ Self-hosted AI inference infrastructure for multi-GPU llama.cpp + DFlash serving
 - **Multi-GPU** — Run multiple models simultaneously, one per GPU
 - **Dual backends** — llama.cpp (HTTP) + DFlash (stdin/stdout) managed by the same gateway
 - **DFlash speculative decoding** — DDTree + PFlash for ~3.4x faster decode on RTX 3090
+- **PFlash compression** — Boundary-aware prefill compression with protected head/tail and 10% middle compression via small drafter model
+- **Session KV with content-hash validation** — Per-session KV snapshots validated on restore to prevent stale cache corruption
+- **SSD snapshot swap** — LRU VRAM↔SSD rotation for snapshot slots with `.dfsn` binary format and manifest persistence
 - **Prefix cache** — LRU KV snapshot cache with disk persistence for repeated prompts
 - **Dynamic GPU allocation** — Free GPU preferred, oldest non-pinned model evicted when all GPUs busy
 - **Canonical model switcher** — Built-in web UI and API for loading/switching models
@@ -88,9 +91,7 @@ The mutable registry is stored at `/var/lib/grimoire/models.json` by default so 
 {
   "models": {
     "qwen-3.6-27B": {
-      "backend": "llama",
-      "file": "gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf",
-      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
+      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "ctx-size": 262144,
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
@@ -100,14 +101,20 @@ The mutable registry is stored at `/var/lib/grimoire/models.json` by default so 
       "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
       "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
+      "tokenizer": "tokenizers/qwen3.6-27B",
       "ctx-size": 262144,
       "budget": 22,
-      "prefix-cache-slots": 4
+      "cache-type-k": "tq3_0",
+      "cache-type-v": "tq3_0",
+      "prefix-cache-slots": 2,
+      "session-kv-slots": 2,
+      "prefill-threshold": 95000,
+      "prefill-keep-ratio": 0.10,
+      "prefill-tail-budget": 76500,
+      "prefill-compression": "auto"
     }
   },
-  "fixed": {
-    "gemma-4-31B": 1
-  }
+  "fixed": {}
 }
 ```
 
@@ -115,6 +122,87 @@ The mutable registry is stored at `/var/lib/grimoire/models.json` by default so 
 - `fixed` — model alias → GPU ID (pinned, never evicted)
 - Models not in `fixed` use dynamic LRU allocation
 - **Backends**: `backend: "llama"` (default, HTTP) or `backend: "dflash"` (stdin/stdout protocol)
+
+### DFlash Model Settings
+
+| Key | Description |
+| --- | --- |
+| `target` | Main model GGUF file path |
+| `draft` | DFlash speculative draft model (safetensors) |
+| `drafter` | Small scoring model for compression (GGUF) |
+| `tokenizer` | Local tokenizer directory path |
+| `budget` | DDTree page pool budget (22 pages = 262K ctx) |
+| `prefix-cache-slots` | Number of VRAM slots for prefix cache snapshots |
+| `session-kv-slots` | Number of VRAM slots for per-session KV snapshots |
+| `prefill-threshold` | Token count above which PFlash compression fires |
+| `prefill-keep-ratio` | Fraction of middle tokens kept after compression (0.10 = 10%) |
+| `prefill-tail-budget` | Max tokens protected at conversation tail |
+| `prefill-compression` | Compression mode: `"auto"` or `"never"` |
+
+## DFlash Speculative Decoding
+
+DFlash provides speculative decoding via DDTree + PFlash for ~3.4x faster decode on RTX 3090.
+
+### Weight Architecture
+
+Three models are involved, each with distinct VRAM lifecycle:
+
+| Model | Size | Role | VRAM Policy |
+| --- | --- | --- | --- |
+| Target (Qwen3.6-27B Q4_K_M) | 16.0 GB | Primary generation | **Always resident** — never parked |
+| Draft (DFlash bf16) | 3.5 GB | Speculative token proposal | Parked during prefill/decode, loaded only during verify steps |
+| Drafter (Qwen3-0.6B bf16) | 1.2 GB | Compression scoring | Parked during normal operation, loaded only during PFlash compression |
+
+### VRAM Budgeting (RTX 3090, 24 GB)
+
+```
+Base weights (target):           16.0 GB
+Active KV cache (tq3_0, 25KB/token): variable
+Session KV snapshots (×2 slots):  variable (mirrors active)
+Prefix cache snapshot:            375 MB (fixed, 15K head tokens)
+────────────────────────────────────────
+Budget for everything else:        8.0 GB
+```
+
+**Total VRAM formula**:
+```
+vram = 16.0 + effective_tokens × 25000 × 3 / 1e9 + 0.375
+```
+
+The "×3": 1× active KV + 2× session snapshots. Hard limit: 23.5 GB (500 MB safety margin).
+
+### PFlash Compression
+
+When `len(prompt_ids) >= prefill_threshold`, the full prompt splits into three regions:
+
+```
+[HEAD: 15,000 tokens fixed]
+[ MIDDLE: compressed at 10% keep ratio]
+[  TAIL: protected, uncompressed within tail_budget]
+```
+
+- **Head**: system prompt + first user message (compaction summary). Always uncompressed.
+- **Tail**: walks backwards from end, protecting whole turns until `tail_budget` consumed.
+- **Middle**: scored by drafter model, compressed at 10% keep ratio.
+
+Compression runs with target resident. The drafter loads temporarily (~1.2 GB VRAM), scores the middle tokens, then parks.
+
+**Tuned parameters** (per Opus 4.7 / GPT-5.5 analysis):
+- `prefill_threshold`: 95,000 tokens (maximum safe for 24 GB VRAM with headroom)
+- `prefill_tail_budget`: 76,500 tokens (Opus: max mathematical 76,666; GPT-5.5: 61,428 for 200K+ stress safety)
+- Current deployment uses Opus values (76,500), leaving a 10K-token gap after compression for ~100+ turns of growth.
+
+### Session KV with Content-Hash Validation
+
+Session KV snapshots are validated on restore using a SHA-1 prefix hash. If the current prompt prefix does not match the stored hash (e.g. after in-place message edit), the snapshot is evicted and recomputed from scratch. This prevents stale KV corruption on conversation edits.
+
+### SSD Snapshot Swap (`SnapshotSwap`)
+
+When VRAM snapshot slots are exhausted, LRU snapshots are persisted to NVMe SSD in `.dfsn` binary format with manifest persistence. On demand, SSD-resident snapshots are loaded back into VRAM slots.
+
+- **SSD speed**: 1.9 GB/s sequential read
+- **Key-derived filenames**: Avoids slot aliasing collisions on eviction
+- **Hit/miss distinction**: Disk hits return `(slot, False)` to distinguish from true misses (`None`)
 
 ## Ingest Safety
 
