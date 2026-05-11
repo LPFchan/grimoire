@@ -2769,94 +2769,101 @@ int main(int argc, char ** argv) {
             // Output: stream of int32 compressed token IDs, terminated by -1.
             // Drafter coexists with target+draft via libllama in the same
             // ggml allocator — no park/unpark needed for compression itself.
-            if (starts_with(line, "compress ")) {
-                char ppath[1024];
-                int  keep_x1000 = 0;
-                char drafter_path[1024];
-                int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
-                                    ppath, &keep_x1000, drafter_path);
-                if (n != 3) {
-                    std::fprintf(stderr,
-                                 "[compress] bad args, need: <bin> <keep_x1000> <drafter_gguf>\n");
-                    stream_emit(-1); continue;
-                }
-                auto src_ids = read_int32_file(ppath);
-                if (src_ids.empty()) {
-                    std::fprintf(stderr, "[compress] empty input\n");
-                    stream_emit(-1); continue;
-                }
-
-                // Park target + draft before allocating drafter context so
-                // the drafter's KV (~1.3 GB Q4_0) + scratch (~600 MB) have
-                // headroom on a 24 GB card. Restore after scoring.
-                // On >=32 GB GPUs, DFLASH_COMPRESS_NO_PARK=1 skips parking
-                // so the scorer stays co-resident with target+draft.
-                const bool no_park = (std::getenv("DFLASH_COMPRESS_NO_PARK") &&
-                                      std::atoi(std::getenv("DFLASH_COMPRESS_NO_PARK")) != 0);
-                bool restore_target = !target_parked && !no_park;
-                bool restore_draft  = !draft_parked && !no_park;
-                if (restore_target) {
-                    step_graph_destroy(proj_sg);
-                    free_target_weights(w);
-                    target_parked = true;
-                    std::printf("[compress] target parked\n"); std::fflush(stdout);
-                }
-                if (restore_draft) {
-                    free_draft_weights(dw);
-                    draft_parked = true;
-                    std::printf("[compress] draft parked\n"); std::fflush(stdout);
-                }
-
-                if (!drafter_loaded) {
-                    if (!dflash27b::load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
-                        std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
-                                     dflash27b_last_error());
-                        stream_emit(-1); continue;
-                    }
-                    drafter_loaded = true;
-                    std::printf("[drafter] loaded %s (n_layer=%d n_head=%d n_head_kv=%d)\n",
-                                drafter_path, drafter_ctx.weights.n_layer,
-                                drafter_ctx.weights.n_head, drafter_ctx.weights.n_head_kv);
-                    std::fflush(stdout);
-                }
-
-                float keep = (float)keep_x1000 / 1000.0f;
-                auto compressed = dflash27b::drafter_score_and_compress(
-                    drafter_ctx, src_ids, keep);
-                std::printf("[compress] %zu -> %zu tokens (keep_ratio=%.3f)\n",
-                            src_ids.size(), compressed.size(), keep);
-                std::fflush(stdout);
-
-                // Restore daemon state for the (almost certainly) following
-                // generate command.
-                if (restore_target) {
-                    if (!load_target_gguf(target_path, target_backend, w)) {
-                        std::fprintf(stderr, "[compress] target restore: %s\n",
-                                     dflash27b_last_error());
-                        stream_emit(-1); continue;
-                    }
-                    target_parked = false;
-                    std::printf("[compress] target restored\n"); std::fflush(stdout);
-                }
-                if (restore_draft) {
-                    if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
-                        std::fprintf(stderr, "[compress] draft restore: %s\n",
-                                     dflash27b_last_error());
-                        stream_emit(-1); continue;
-                    }
-                    if (g_draft_swa_window > 0) {
-                        dw.swa_window = g_draft_swa_window;
-                        for (int il = 0; il < dw.n_layer - 1; il++)
-                            dw.layers[il].is_swa = true;
-                    }
-                    draft_parked = false;
-                    std::printf("[compress] draft restored\n"); std::fflush(stdout);
-                }
-
-                for (int32_t t : compressed) stream_emit(t);
-                stream_emit(-1);
-                continue;
+if (starts_with(line, "compress ")) {
+            // Format mirrors qwen35'́s daemon so server.py'́s _prefill_hook
+            // is byte-identical for both arches:
+            //   compress <ids.bin> <keep_x1000> <drafter.gguf>
+            //
+            // Compression VRAM dance (target-stays-resident mode):
+            //   1. Park draft (~3.5 GB freed) — target stays resident
+            //   2. Load drafter (~1.2 GB) — net VRAM delta: -2.3 GB
+            //   3. Score + compress
+            //   4. Park drafter (free 1.2 GB)
+            //   5. Unpark draft (restore 3.5 GB for spec decode)
+            // This avoids the 9-second SSD unpark of the target model,
+            // replacing it with ~2 seconds of draft park/unpark.
+            char ppath[1024];
+            int  keep_x1000 = 0;
+            char drafter_path[1024];
+            const int n = std::sscanf(line.c_str() + 9, "%1023s %d %1023s",
+                                        ppath, &keep_x1000, drafter_path);
+            if (n != 3) {
+                std::fprintf(stderr,
+                              "[compress] bad args, need: <bin> <keep_x1000> <drafter.gguf>\n");
+                stream_emit(-1); continue;
             }
+            auto src_ids = read_uncounted_i32(ppath);
+            if (src_ids.empty()) {
+                std::fprintf(stderr, "[compress] empty input\n");
+                stream_emit(-1); continue;
+            }
+
+            // Park draft to make room for drafter (target stays resident).
+            const bool restore_draft = !draft_parked;
+            if (restore_draft) {
+                free_draft_weights(dw);
+                draft_parked = true;
+                std::printf("[compress] draft parked\n"); std::fflush(stdout);
+            }
+
+            if (!drafter_loaded) {
+                if (!load_drafter(drafter_path, /*gpu_layers=*/999, drafter_ctx)) {
+                    std::fprintf(stderr, "[compress] load_drafter failed: %s\n",
+                                  dflash27b_last_error());
+                    if (restore_draft) {
+                        if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
+                            std::fprintf(stderr, "[compress] draft restore after drafter fail: %s\n",
+                                         dflash27b_last_error());
+                        } else {
+                            if (g_draft_swa_window > 0) {
+                                dw.swa_window = g_draft_swa_window;
+                                for (int il = 0; il < dw.n_layer - 1; il++)
+                                    dw.layers[il].is_swa = true;
+                            }
+                            draft_parked = false;
+                        }
+                    }
+                    stream_emit(-1); continue;
+                }
+                drafter_loaded = true;
+                std::printf("[drafter] loaded %s vocab=%d\n",
+                             drafter_path, drafter_ctx.weights.n_vocab);
+                std::fflush(stdout);
+            }
+
+            const float keep = (float)keep_x1000 / 1000.0f;
+            auto compressed = drafter_score_and_compress(drafter_ctx, src_ids, keep);
+            std::printf("[compress] %zu -> %zu tokens (keep_ratio=%.3f)\n",
+                         src_ids.size(), compressed.size(), keep);
+            std::fflush(stdout);
+
+            // Park drafter to make room for draft (spec decode needs draft).
+            if (drafter_loaded) {
+                free_drafter(drafter_ctx);
+                drafter_loaded = false;
+                std::printf("[compress] drafter parked\n"); std::fflush(stdout);
+            }
+
+            // Restore draft for the upcoming spec decode.
+            if (restore_draft) {
+                if (!load_draft_safetensors(draft_path, draft_backend, dw)) {
+                    std::fprintf(stderr, "[compress] draft restore: %s\n",
+                                  dflash27b_last_error());
+                    stream_emit(-1); continue;
+                }
+                if (g_draft_swa_window > 0) {
+                    dw.swa_window = g_draft_swa_window;
+                    for (int il = 0; il < dw.n_layer - 1; il++)
+                        dw.layers[il].is_swa = true;
+                }
+                draft_parked = false;
+                std::printf("[compress] draft restored\n"); std::fflush(stdout);
+            }
+
+            for (int32_t t : compressed) stream_emit(t);
+            stream_emit(-1);
+            continue;
+        }
 
             // ── Prefix-cache snapshot commands (#59) ──────────────────────
             // Check longer prefixes before shorter ones to avoid mis-dispatch
