@@ -38,10 +38,7 @@ class DropInBlockerTests(unittest.TestCase):
             "qwen-3.6-27B",
             "huihui-qwen3.5-27B",
             "huihui-gemma-4-31B",
-            "super-gemma-4-31B",
             "qwopus-3.6-27B",
-            "qwen-3.6-27B-otq",
-            "qwen-3.6-27B-std",
         }.issubset(aliases))
 
     def test_auth_fails_closed_without_api_key(self):

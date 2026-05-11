@@ -111,20 +111,20 @@ class SnapshotSwap:
 
     def _load_to_vram(self, daemon, slot: int, key: bytes) -> None:
         """Load a snapshot from SSD into a VRAM slot."""
-        if slot not in self.disk:
-            raise KeyError(f"Slot {slot} not in disk cache")
+        if key not in self.disk:
+            raise KeyError(f"Key not in disk cache: {key.hex()}")
 
-        path = self.disk[slot]
+        path = self.disk[key]
         if not Path(path).exists():
-            logger.warning(f"swap: disk file missing for slot={slot}, evicting")
-            del self.disk[slot]
+            logger.warning(f"swap: disk file missing for key={key.hex()}, evicting")
+            del self.disk[key]
             self._save_manifest()
             raise KeyError(f"Disk file missing: {path}")
 
         try:
             daemon.load_snapshot(slot, path)
             self.vram[key] = slot
-            del self.disk[slot]
+            del self.disk[key]
             self._save_manifest()
             logger.info(f"swap: loaded slot={slot} from {path}")
         except Exception as e:
@@ -150,12 +150,14 @@ class SnapshotSwap:
                 self.vram[key] = slot
                 return slot
 
-        # All 8 slots in use — evict one more.
-        self._evict_one(daemon)
-        freed_slot = list(self.vram.keys())[-1]  # LRU was just evicted
-        slot = self.vram.pop(freed_slot)
-        self.vram[key] = slot
-        return slot
+        # All 8 daemon slots are taken (only reachable when max_vram_slots > 8,
+        # since otherwise the loop above would have found a free ID). Evict
+        # again and reuse the slot _evict_one returns directly — looking it up
+        # from self.vram after eviction picks up the MRU survivor instead of
+        # the freed slot.
+        freed_slot = self._evict_one(daemon)
+        self.vram[key] = freed_slot
+        return freed_slot
 
     def get(self, key: bytes) -> Optional[tuple]:
         """Look up a slot by hash key.

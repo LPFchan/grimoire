@@ -227,7 +227,7 @@ COPY --from=dflash-build /opt/dflash /opt/dflash
 # Copy built llama.cpp webui
 COPY --from=webui /opt/grimoire-webui /opt/grimoire-webui
 
- # Copy jinja chat templates (for huihui/super gemma variants)
+# Copy jinja chat templates (for huihui-gemma variant)
 COPY templates/ /templates/
 
 # Create registry and state directories

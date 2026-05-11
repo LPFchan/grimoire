@@ -24,6 +24,7 @@ import grimoire.entrypoint as entrypoint
 from grimoire import registry as registry_mod
 from grimoire.dflash.daemon import DflashDaemon
 from grimoire.dflash.prefix_cache import PrefixCache
+from grimoire.dflash.session_kv import SessionKV
 
 
 class DflashRegistryValidationTests(unittest.TestCase):
@@ -272,6 +273,7 @@ class FakeActive:
         self.dflash_daemon = daemon
         self.prefix_cache = None
         self.prefill_config = None
+        self.session_kv = None
         self._tokenizer = tokenizer
         self._lock = None
 
@@ -504,18 +506,21 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         return compressed, fired, daemon
 
     def test_head_and_tail_are_preserved_byte_identical(self):
-        # 3000-token prompt, 5 boundaries:
-        #   msg 0 ends at 200   (system / head)
-        #   msg 1 ends at 1500  (1300-tok turn — the middle to compress)
-        #   msg 2 ends at 2000  (500-tok turn)
-        #   msg 3 ends at 2500  (500-tok turn)
-        #   msg 4 ends at 2800  (300-tok turn — last user content)
-        # tail_budget=700: walking backwards, msg 4 (300) fits (tail=300), but
-        # adding msg 3 (500) → 800 > 700, so break at i=3 with compress_end =
-        # boundaries[2] = 2000. Protected tail spans msgs 3 and 4 (overshooting
-        # budget by msg 3's 500 tokens — intentional whole-turn protection).
+        # 3000-token prompt, 6 boundaries:
+        #   msg 0 ends at 50    (system)
+        #   msg 1 ends at 200   (first user — together with msg 0 forms the head)
+        #   msg 2 ends at 1500  (1300-tok turn — the middle to compress)
+        #   msg 3 ends at 2000  (500-tok turn)
+        #   msg 4 ends at 2500  (500-tok turn)
+        #   msg 5 ends at 2800  (300-tok turn — last user content)
+        # Head (compress_start) = boundaries[1] = 200, which protects sys + the
+        # first user message (opencode compaction summary).
+        # tail_budget=700: walking backwards, msg 5 (300) fits (tail=300), but
+        # adding msg 4 (500) → 800 > 700, so break at i=4 with compress_end =
+        # boundaries[3] = 2000. Protected tail spans msgs 4 and 5 (overshooting
+        # budget by msg 4's 500 tokens — intentional whole-turn protection).
         prompt_ids = list(range(3000))
-        boundaries = [200, 1500, 2000, 2500, 2800]
+        boundaries = [50, 200, 1500, 2000, 2500, 2800]
         expected_tail_start = 2000
         compressed, fired, daemon = self._run(
             prompt_ids, boundaries, keep_ratio=0.1, threshold=1000, tail_budget=700
@@ -546,8 +551,10 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         # of the backwards walk sees turn_len > budget and breaks immediately,
         # setting compress_end = boundaries[-2]. The huge turn is still protected
         # (intentional overshoot — never truncate mid-turn).
+        # boundaries[0]=50 is sys, boundaries[1]=100 ends the first user message
+        # and forms compress_start (head protection).
         prompt_ids = list(range(4500))
-        boundaries = [100, 600, 1100, 1400, 4400]  # last turn = 4400-1400 = 3000
+        boundaries = [50, 100, 600, 1100, 1400, 4400]  # last turn = 4400-1400 = 3000
         compressed, fired, daemon = self._run(
             prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=500
         )
@@ -555,24 +562,26 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         # Tail begins at boundaries[-2]=1400; everything from there onwards intact.
         tail_len = len(prompt_ids) - 1400
         self.assertEqual(compressed[-tail_len:], prompt_ids[1400:])
-        # Middle is [100:1400] (msgs 1..3).
+        # Middle is [100:1400] (msgs 2..4 — msg 1 is part of the protected head).
         self.assertEqual(daemon.compress_called_with, prompt_ids[100:1400])
 
     def test_tail_walk_accumulates_until_break(self):
-        # 6 boundaries; tail_budget=900 accommodates msg5 (200) + msg4 (300) +
-        # msg3 (200) = 700, but msg2 (500) would push to 1200 > 900 → break at
-        # i=2, compress_end = boundaries[1] = 1300. (Middle = [100:1300] = 1200
-        # tokens, large enough to clear the 1024-min-middle short-circuit.)
+        # 7 boundaries; sys (boundaries[0]) + first_user (boundaries[1]) form
+        # the protected head. tail_budget=900 accommodates the last three
+        # post-head turns (200 + 300 + 200 = 700), but the fourth (500) would
+        # push to 1200 > 900 → break at i=3, compress_end = boundaries[2] = 1300.
+        # Middle = [100:1300] = 1200 tokens, large enough to clear the
+        # 1024-min-middle short-circuit.
         prompt_ids = list(range(3000))
-        boundaries = [100, 1300, 1800, 2000, 2300, 2500]
+        boundaries = [50, 100, 1300, 1800, 2000, 2300, 2500]
         compressed, fired, daemon = self._run(
             prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=900
         )
         self.assertTrue(fired)
-        # Tail starts at boundaries[1] = 1300 (msgs 2..5 + generation suffix).
+        # Tail starts at boundaries[2] = 1300 (last 4 post-head turns).
         tail_len = len(prompt_ids) - 1300
         self.assertEqual(compressed[-tail_len:], prompt_ids[1300:])
-        # Middle is [100:1300] (msg 1 only).
+        # Middle is [100:1300] (the post-head middle turn only).
         self.assertEqual(daemon.compress_called_with, prompt_ids[100:1300])
 
     def test_skip_when_middle_too_small(self):
@@ -612,6 +621,75 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         self.assertFalse(fired)
         self.assertEqual(compressed, prompt_ids)
         self.assertIsNone(daemon.compress_called_with)
+
+
+class SessionKVTests(unittest.TestCase):
+    """SessionKV maps conversation_id -> (slot, prefix_len) for cross-turn KV reuse."""
+
+    def test_get_session_returns_none_for_unknown_conv(self):
+        sk = SessionKV(cap=2, prefix_cap=2)
+        self.assertIsNone(sk.get_session("nope"))
+
+    def test_reserve_slot_uses_offset_for_cold_cache(self):
+        sk = SessionKV(cap=2, prefix_cap=2)
+        # First reservation hands out the offset slot (= prefix_cap).
+        self.assertEqual(sk.reserve_slot(), 2)
+
+    def test_reserve_then_update_keeps_consecutive_slots_distinct(self):
+        sk = SessionKV(cap=2, prefix_cap=2)
+        slot_a = sk.reserve_slot()
+        sk.update("a", slot_a, prefix_len=100)
+        slot_b = sk.reserve_slot()
+        sk.update("b", slot_b, prefix_len=200)
+        self.assertNotEqual(slot_a, slot_b)
+        self.assertEqual({slot_a, slot_b}, {2, 3})
+
+    def test_reserve_after_eviction_avoids_mru_collision(self):
+        # Regression: reserve_slot used to compute idx=len(sessions) after
+        # popping the LRU, which gave the SAME slot as the surviving MRU
+        # session. Two conversations ended up mapped to one daemon slot and
+        # the survivor's snapshot was clobbered on the next snapshot_at.
+        sk = SessionKV(cap=2, prefix_cap=2)
+        slot_a = sk.reserve_slot()
+        sk.update("a", slot_a, prefix_len=100)
+        slot_b = sk.reserve_slot()
+        sk.update("b", slot_b, prefix_len=200)
+        # 'a' is LRU; reserving for 'c' must evict 'a' and reuse its slot.
+        slot_c = sk.reserve_slot()
+        self.assertEqual(slot_c, slot_a, "evicted slot should be reused")
+        self.assertNotEqual(slot_c, slot_b, "must not collide with the MRU survivor")
+
+    def test_get_session_promotes_lru(self):
+        sk = SessionKV(cap=2, prefix_cap=2)
+        sk.update("a", 2, 10)
+        sk.update("b", 3, 20)
+        # Touching 'a' promotes it; 'b' is now LRU and gets evicted on next reserve.
+        sk.get_session("a")
+        slot_c = sk.reserve_slot()
+        sk.update("c", slot_c, 30)
+        self.assertIsNone(sk.get_session("b"))
+        self.assertIsNotNone(sk.get_session("a"))
+
+    def test_evict_is_idempotent(self):
+        sk = SessionKV(cap=2, prefix_cap=2)
+        sk.update("a", 2, 10)
+        sk.evict("a")
+        sk.evict("a")  # Must not raise.
+        self.assertIsNone(sk.get_session("a"))
+
+    def test_clear_drops_all_state(self):
+        sk = SessionKV(cap=2, prefix_cap=2)
+        sk.update("a", 2, 10)
+        sk.update("b", 3, 20)
+        sk.clear()
+        self.assertIsNone(sk.get_session("a"))
+        self.assertIsNone(sk.get_session("b"))
+        # After clear, reservations restart from offset.
+        self.assertEqual(sk.reserve_slot(), 2)
+
+    def test_cap_zero_disables_reservation(self):
+        sk = SessionKV(cap=0, prefix_cap=2)
+        self.assertIsNone(sk.reserve_slot())
 
 
 class DflashProxyIntegrationTests(unittest.TestCase):

@@ -66,9 +66,17 @@ class SessionKV:
             old_id, _ = next(iter(self.sessions.items()))
             self.sessions.pop(old_id)
 
-        idx = len(self.sessions)
-        slot = self._slot_for_index(idx)
-        return slot
+        # Pick the first slot in [offset, offset+cap) that isn't held by a
+        # surviving session. After an LRU eviction this returns the evicted
+        # slot; on a cold cache it returns the offset slot. Falling back to
+        # len(sessions) is unsafe: after eviction it can collide with the
+        # MRU survivor's slot.
+        used = {entry[0] for entry in self.sessions.values()}
+        for idx in range(self.cap):
+            slot = self._slot_for_index(idx)
+            if slot not in used:
+                return slot
+        return None
 
     def update(self, conversation_id: str, slot: int, prefix_len: int) -> None:
         """Record or update the snapshot position for a conversation."""
