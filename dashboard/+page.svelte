@@ -250,7 +250,7 @@
 	{/if}
 
 	<section
-		class="mb-8 flex flex-col items-center rounded-2xl border bg-muted/20 px-8 py-12 text-center"
+		class="mb-8 flex flex-col items-center px-8 py-12 text-center"
 	>
 		<div class="text-xs font-medium uppercase tracking-widest text-muted-foreground">
 			Lifetime cost
