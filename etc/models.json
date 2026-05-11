@@ -91,9 +91,9 @@
       "fa-window": 2048,
       "prefix-cache-slots": 2,
       "session-kv-slots": 2,
-      "prefill-threshold": 32768,
-      "prefill-keep-ratio": 0.10,
-      "prefill-tail-budget": 12288,
+      "prefill-threshold": 48000,
+      "prefill-keep-ratio": 0.05,
+      "prefill-tail-budget": 16000,
       "prefill-compression": "auto"
     }
   },
