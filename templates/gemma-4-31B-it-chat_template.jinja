@@ -1,9 +1,9 @@
-{%- macro format_parameters(properties, required) -%}
+{%- macro format_parameters(properties, required, filter_keys=false) -%}
     {%- set standard_keys = ['description', 'type', 'properties', 'required', 'nullable'] -%}
     {%- set ns = namespace(found_first=false) -%}
     {%- for key, value in properties | dictsort -%}
         {%- set add_comma = false -%}
-        {%- if key not in standard_keys -%}
+        {%- if not filter_keys or key not in standard_keys -%}
             {%- if ns.found_first %},{% endif -%}
             {%- set ns.found_first = true -%}
             {{ key }}:{
@@ -65,7 +65,7 @@
                 {%- elif value is mapping -%}
                     {%- if add_comma %},{%- else -%} {%- set add_comma = true -%} {% endif -%}
                     properties:{
-                    {{- format_parameters(value, value['required'] | default([])) -}}
+                    {{- format_parameters(value, value['required'] | default([]), filter_keys=true) -}}
                     }
                 {%- endif -%}
                 {%- if value['required'] -%}
