@@ -1,0 +1,548 @@
+"""Tests for the dflash backend (registry, prefix cache, helpers, daemon, proxy)."""
+
+import io
+import json
+import os
+import struct
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+os.environ.setdefault("GRIMOIRE_HISTORY_PATH", str(Path(tempfile.gettempdir()) / "grimoire-dflash-history.sqlite3"))
+os.environ.setdefault("GRIMOIRE_USAGE_PATH", str(Path(tempfile.gettempdir()) / "grimoire-dflash-usage.sqlite3"))
+os.environ.setdefault("GRIMOIRE_REGISTRY_SEED_PATH", str(ROOT / "etc" / "models.json"))
+os.environ.setdefault("GRIMOIRE_REGISTRY_PATH", str(Path(tempfile.gettempdir()) / "grimoire-dflash-registry.json"))
+
+from fastapi.testclient import TestClient
+
+import grimoire.entrypoint as entrypoint
+from grimoire import registry as registry_mod
+from grimoire.dflash.daemon import DflashDaemon
+from grimoire.dflash.prefix_cache import PrefixCache
+
+
+class DflashRegistryValidationTests(unittest.TestCase):
+    """Validation guardrails for the dflash backend entries in models.json."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.models_dir = Path(self.tmp.name)
+        self._orig_models_dir = registry_mod.MODELS_DIR
+        registry_mod.MODELS_DIR = str(self.models_dir)
+
+        # Real files on disk for the happy path; tests can remove or shadow as needed.
+        (self.models_dir / "target.gguf").write_bytes(b"x")
+        (self.models_dir / "draft.safetensors").write_bytes(b"x")
+        (self.models_dir / "drafter.gguf").write_bytes(b"x")
+
+        self.registry_path = self.models_dir / "registry.json"
+        self.reg = registry_mod.ModelRegistry(path=str(self.registry_path), seed_path=None)
+
+    def tearDown(self):
+        registry_mod.MODELS_DIR = self._orig_models_dir
+
+    def _add(self, name, **overrides):
+        cfg = {
+            "backend": "dflash",
+            "target": "target.gguf",
+            "draft": "draft.safetensors",
+            "drafter": "drafter.gguf",
+            "tokenizer": "Qwen/Qwen3.6-27B",
+            "ctx-size": 1024,
+        }
+        cfg.update(overrides)
+        self.reg.add(name, cfg)
+
+    def test_valid_dflash_entry_passes(self):
+        self._add("ok")
+        valid, reason = self.reg.validate("ok")
+        self.assertTrue(valid, reason)
+
+    def test_missing_target_fails(self):
+        os.unlink(self.models_dir / "target.gguf")
+        self._add("notarget")
+        valid, reason = self.reg.validate("notarget")
+        self.assertFalse(valid)
+        self.assertIn("Target model not found", reason)
+
+    def test_missing_draft_fails(self):
+        os.unlink(self.models_dir / "draft.safetensors")
+        self._add("nodraft")
+        valid, reason = self.reg.validate("nodraft")
+        self.assertFalse(valid)
+        self.assertIn("Draft model not found", reason)
+
+    def test_missing_drafter_optional_unless_set(self):
+        os.unlink(self.models_dir / "drafter.gguf")
+        # Without a drafter field, validation should still pass.
+        self._add("no_drafter_field")
+        self.reg.update("no_drafter_field", {"drafter": None})
+        valid, reason = self.reg.validate("no_drafter_field")
+        self.assertTrue(valid, reason)
+
+    def test_missing_tokenizer_fails_loudly(self):
+        self._add("no_tok")
+        self.reg.update("no_tok", {"tokenizer": None})
+        valid, reason = self.reg.validate("no_tok")
+        self.assertFalse(valid)
+        self.assertIn("tokenizer", reason.lower())
+
+    def test_unknown_backend_fails(self):
+        self.reg.add("weird", {"backend": "tflite", "file": "x.tflite"})
+        valid, reason = self.reg.validate("weird")
+        self.assertFalse(valid)
+        self.assertIn("Unknown backend", reason)
+
+
+class PrefixCacheBoundaryTests(unittest.TestCase):
+    """The lookup() probe must check supplied boundaries, not just the full prompt."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = PrefixCache(cap=4, cache_dir=self.tmp.name)
+
+    def _commit(self, prompt, boundary):
+        prep = self.cache.prepare_inline_snap(prompt, boundary)
+        self.assertIsNotNone(prep)
+        slot, pos = prep
+        self.cache.confirm_inline_snap(slot, pos, prompt)
+        return slot
+
+    def test_full_prompt_hit(self):
+        prompt = list(range(20))
+        self._commit(prompt, len(prompt))
+        hit = self.cache.lookup(prompt)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[1], len(prompt))
+
+    def test_partial_boundary_hit(self):
+        prompt = list(range(30))
+        sys_boundary = 10
+        # Cache only the system prefix.
+        self._commit(prompt[:sys_boundary], sys_boundary)
+        # A new conversation that *starts* with the same system prefix.
+        new_prompt = prompt[:sys_boundary] + list(range(100, 110))
+        hit = self.cache.lookup(new_prompt, boundaries=[sys_boundary])
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[1], sys_boundary)
+
+    def test_lookup_picks_deepest_boundary(self):
+        prompt = list(range(40))
+        self._commit(prompt[:10], 10)
+        self._commit(prompt[:25], 25)
+        hit = self.cache.lookup(prompt, boundaries=[10, 25])
+        self.assertEqual(hit[1], 25)
+
+    def test_abort_does_not_register_entry(self):
+        prompt = list(range(20))
+        prep = self.cache.prepare_inline_snap(prompt, 20)
+        self.assertIsNotNone(prep)
+        slot, _ = prep
+        self.cache.abort_inline_snap(slot)
+        self.assertIsNone(self.cache.lookup(prompt))
+
+    def test_disabled_cache_is_inert(self):
+        cache = PrefixCache(cap=0, cache_dir=self.tmp.name)
+        self.assertIsNone(cache.lookup([1, 2, 3]))
+        self.assertIsNone(cache.prepare_inline_snap([1, 2, 3], 2))
+
+    def test_invalid_boundary_is_skipped(self):
+        prompt = list(range(10))
+        self.assertIsNone(self.cache.prepare_inline_snap(prompt, 0))
+        self.assertIsNone(self.cache.prepare_inline_snap(prompt, 11))
+
+
+class LooksLikeLocalPathTests(unittest.TestCase):
+    """`_looks_like_local_path` must distinguish HF repo ids from filesystem paths."""
+
+    def _check(self, spec, expected):
+        self.assertEqual(registry_mod._looks_like_local_path(spec), expected, spec)
+
+    def test_absolute_path(self):
+        self._check("/models/qwen", True)
+
+    def test_explicit_relative_path(self):
+        self._check("./models/qwen", True)
+        self._check("../tokenizers/qwen", True)
+
+    def test_nested_relative_path(self):
+        self._check("models/qwen/tokenizer", True)
+
+    def test_hf_repo_id(self):
+        self._check("Qwen/Qwen3.6-27B", False)
+        self._check("google/gemma-4-31b-it", False)
+
+    def test_bare_name(self):
+        self._check("gpt2", False)
+
+    def test_empty_or_invalid(self):
+        self._check("", False)
+        self._check(None, False)
+
+
+class FakeTokenizer:
+    """Char-by-token tokenizer that satisfies the slice of the HF API _proxy_dflash uses.
+
+    Each token id is the unicode codepoint of one character, so encode/decode
+    round-trip cleanly and incremental decode produces clean per-char deltas.
+    """
+
+    eos_token_id = 0
+    unk_token_id = 999
+
+    _SPECIAL = {"<|im_end|>": 1}
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        parts = []
+        for m in messages:
+            parts.append(f"[{m.get('role')}]{m.get('content', '')}[/{m.get('role')}]")
+        text = "".join(parts)
+        if add_generation_prompt:
+            text += "[assistant]"
+        return text
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False):
+        skipped = {self.eos_token_id, self._SPECIAL["<|im_end|>"]} if skip_special_tokens else set()
+        return "".join(chr(t) for t in tokens if t not in skipped)
+
+    def convert_tokens_to_ids(self, token):
+        return self._SPECIAL.get(token, -1)
+
+
+class FakeDflashDaemon:
+    """Stand-in for the dflash daemon binary.
+
+    Yields a pre-baked list of tokens. send_generate_cmd creates a real temp
+    file so the production code's `os.unlink` cleanup works without patching.
+    """
+
+    def __init__(self, tokens):
+        self._tokens = list(tokens)
+        self.last_cmd_args = None
+        self._running = True
+
+    def is_running(self):
+        return self._running
+
+    def send_generate_cmd(
+        self, prompt_ids, n_gen,
+        prefix_cache_slot=None, snap_slot=None, snap_pos=None,
+        temperature=0.8, top_p=0.9, top_k=40, seed=None,
+    ):
+        self.last_cmd_args = {
+            "prompt_ids": list(prompt_ids),
+            "n_gen": n_gen,
+            "prefix_cache_slot": prefix_cache_slot,
+            "snap_slot": snap_slot,
+            "snap_pos": snap_pos,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "seed": seed,
+        }
+        fd, path = tempfile.mkstemp(suffix=".bin")
+        os.close(fd)
+        return path
+
+    def read_next_token(self):
+        if not self._tokens:
+            return None
+        return self._tokens.pop(0)
+
+
+class FakeActive:
+    """Lightweight ActiveModel substitute for the dflash proxy path."""
+
+    def __init__(self, name, cfg, daemon, tokenizer):
+        self.name = name
+        self.cfg = cfg
+        self.gpu = 0
+        self.port = None
+        self.backend_type = entrypoint.BACKEND_DFLASH
+        self.dflash_daemon = daemon
+        self.prefix_cache = None
+        self.prefill_config = None
+        self._tokenizer = tokenizer
+        self._lock = None
+
+    def get_tokenizer(self):
+        return self._tokenizer
+
+    def dflash_lock(self):
+        import asyncio
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def is_running(self):
+        return self.dflash_daemon.is_running()
+
+
+def _parse_sse(body_text):
+    """Parse SSE event stream into a list of parsed JSON frames + raw terminators."""
+    frames = []
+    for chunk in body_text.split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk or not chunk.startswith("data:"):
+            continue
+        data = chunk[len("data:"):].strip()
+        if data == "[DONE]":
+            frames.append("[DONE]")
+        else:
+            try:
+                frames.append(json.loads(data))
+            except json.JSONDecodeError:
+                frames.append(data)
+    return frames
+
+
+class DflashDaemonProtocolTests(unittest.TestCase):
+    """Exercise send_generate_cmd / read_next_token without launching the binary."""
+
+    def setUp(self):
+        self.daemon = DflashDaemon(target_path="t", draft_path="d")
+        # Fake proc with a captured stdin and a benign poll().
+        self.captured = io.BytesIO()
+        proc = type("Proc", (), {})()
+        proc.stdin = self.captured
+        proc.poll = lambda: None
+        self.daemon.proc = proc
+        # Read end of pipe for the streamed tokens.
+        self.r_fd, self.w_fd = os.pipe()
+        self.daemon.r_pipe = self.r_fd
+
+    def tearDown(self):
+        for fd in (self.r_fd, self.w_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def test_send_generate_cmd_writes_command_and_prompt_bin(self):
+        path = self.daemon.send_generate_cmd(
+            [10, 20, 30], 16,
+            temperature=0.7, top_p=0.95, top_k=50, seed=42,
+        )
+        try:
+            sent = self.captured.getvalue().decode()
+            self.assertTrue(sent.startswith(path + " 16"), sent)
+            self.assertIn("temp=0.7000", sent)
+            self.assertIn("top_p=0.9500", sent)
+            self.assertIn("top_k=50", sent)
+            self.assertIn("seed=42", sent)
+            self.assertTrue(sent.endswith("\n"))
+            with open(path, "rb") as f:
+                prompt_bytes = f.read()
+            self.assertEqual(prompt_bytes, struct.pack("<iii", 10, 20, 30))
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_send_generate_cmd_includes_restore_and_snap(self):
+        path = self.daemon.send_generate_cmd(
+            [1, 2], 8, prefix_cache_slot=3, snap_slot=5, snap_pos=2,
+        )
+        try:
+            sent = self.captured.getvalue().decode()
+            self.assertIn(f"RESTORE 3 {path} 8", sent)
+            self.assertIn("snap=2:5", sent)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_read_next_token_parses_int32_stream(self):
+        os.write(self.w_fd, struct.pack("<i", 42))
+        os.write(self.w_fd, struct.pack("<i", 99))
+        self.assertEqual(self.daemon.read_next_token(), 42)
+        self.assertEqual(self.daemon.read_next_token(), 99)
+
+    def test_read_next_token_returns_none_on_sentinel(self):
+        os.write(self.w_fd, struct.pack("<i", -1))
+        self.assertIsNone(self.daemon.read_next_token())
+
+    def test_read_next_token_returns_none_on_closed_pipe(self):
+        os.close(self.w_fd)
+        self.w_fd = -1  # already closed; suppress tearDown re-close
+        self.assertIsNone(self.daemon.read_next_token())
+
+
+class DflashHelperTests(unittest.TestCase):
+    """Pure-logic helpers used by _proxy_dflash."""
+
+    def setUp(self):
+        self.tok = FakeTokenizer()
+
+    def test_collect_stop_ids_includes_eos_and_chat_end(self):
+        ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
+        self.assertIn(self.tok.eos_token_id, ids)
+        self.assertIn(self.tok._SPECIAL["<|im_end|>"], ids)
+
+    def test_collect_stop_ids_includes_request_stop_string(self):
+        ids = entrypoint._dflash_collect_stop_ids(self.tok, "STOP", {})
+        for c in "STOP":
+            self.assertIn(ord(c), ids)
+
+    def test_collect_stop_ids_includes_request_stop_list(self):
+        ids = entrypoint._dflash_collect_stop_ids(self.tok, ["A", "B"], {})
+        self.assertIn(ord("A"), ids)
+        self.assertIn(ord("B"), ids)
+
+    def test_collect_stop_ids_includes_cfg_stop_strings(self):
+        ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {"stop-strings": ["Z"]})
+        self.assertIn(ord("Z"), ids)
+
+    def test_collect_stop_ids_skips_unknown_specials(self):
+        # convert_tokens_to_ids returns -1 for unknown specials; those must NOT enter the set.
+        ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
+        self.assertNotIn(-1, ids)
+
+    def test_prefix_boundaries_returns_system_prefix(self):
+        msgs = [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "hi"},
+        ]
+        prompt_text = self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        prompt_ids = self.tok.encode(prompt_text)
+        boundaries = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        # The boundary must be a valid prefix length of prompt_ids.
+        self.assertEqual(len(boundaries), 1)
+        sys_prefix = self.tok.encode(self.tok.apply_chat_template(msgs[:1]))
+        self.assertEqual(boundaries[0], len(sys_prefix))
+        self.assertEqual(prompt_ids[:boundaries[0]], sys_prefix)
+
+    def test_prefix_boundaries_empty_when_no_system(self):
+        msgs = [{"role": "user", "content": "hi"}]
+        prompt_ids = self.tok.encode(self.tok.apply_chat_template(msgs, add_generation_prompt=True))
+        self.assertEqual(entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids), [])
+
+
+class DflashProxyIntegrationTests(unittest.TestCase):
+    """End-to-end /v1/chat/completions through _proxy_dflash with a fake daemon."""
+
+    def setUp(self):
+        self._old_api = entrypoint.API_KEY
+        self._old_admin = entrypoint.ADMIN_TOKEN
+        entrypoint.API_KEY = "test-key"
+        entrypoint.ADMIN_TOKEN = "test-key"
+        entrypoint.manager.active.clear()
+        self.client = TestClient(entrypoint.app)
+        self.auth = {"Authorization": "Bearer test-key"}
+
+    def tearDown(self):
+        entrypoint.API_KEY = self._old_api
+        entrypoint.ADMIN_TOKEN = self._old_admin
+        entrypoint.manager.active.clear()
+
+    def _install_fake_active(self, tokens, cfg_overrides=None):
+        cfg = {"backend": "dflash", "ctx-size": 1024, "predict": 64}
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        daemon = FakeDflashDaemon(tokens)
+        active = FakeActive("dflash-test", cfg, daemon, FakeTokenizer())
+
+        async def fake_start_model(model_name):
+            return active
+
+        # registry.resolve has to recognise the alias; add it to the live registry.
+        if "dflash-test" not in entrypoint.registry.list_all():
+            entrypoint.registry.add("dflash-test", cfg)
+        self.addCleanup(self._remove_alias, "dflash-test")
+        self._patch_start = patch.object(entrypoint.manager, "start_model", fake_start_model)
+        self._patch_start.start()
+        self.addCleanup(self._patch_start.stop)
+        return active, daemon
+
+    def _remove_alias(self, name):
+        try:
+            entrypoint.registry.remove(name)
+        except KeyError:
+            pass
+
+    def test_streaming_emits_per_token_deltas_in_order(self):
+        # Emit "hi!" then EOS — EOS lands in stop_ids and must not appear as a delta.
+        active, _ = self._install_fake_active([ord("h"), ord("i"), ord("!"), 0])
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "dflash-test", "messages": [{"role": "user", "content": "ping"}], "stream": True},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        frames = _parse_sse(response.text)
+        deltas = [f["choices"][0]["delta"].get("content", "")
+                  for f in frames
+                  if isinstance(f, dict) and "choices" in f and f["choices"][0].get("delta", {}).get("content")]
+        self.assertEqual(deltas, ["h", "i", "!"], frames)
+        self.assertEqual(frames[-1], "[DONE]")
+        # Final usage frame carries token counts + timings.
+        final = next(f for f in reversed(frames)
+                     if isinstance(f, dict) and f.get("usage"))
+        self.assertEqual(final["usage"]["completion_tokens"], 3)
+        self.assertIn("timings", final)
+        self.assertGreater(final["timings"]["predicted_per_second"], 0)
+
+    def test_context_overflow_returns_400_before_daemon_call(self):
+        active, daemon = self._install_fake_active([], cfg_overrides={"ctx-size": 4, "predict": 64})
+        long_text = "x" * 100
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "dflash-test", "messages": [{"role": "user", "content": long_text}], "stream": True},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("exceeds context size", response.json()["detail"])
+        # Daemon must not have been touched.
+        self.assertIsNone(daemon.last_cmd_args)
+
+    def test_error_path_yields_done_terminator(self):
+        active, daemon = self._install_fake_active([])
+        daemon._running = False  # Force the "daemon not running" branch.
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "dflash-test", "messages": [{"role": "user", "content": "x"}], "stream": True},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("[DONE]", response.text)
+        frames = _parse_sse(response.text)
+        err_frame = next(f for f in frames if isinstance(f, dict) and f.get("error"))
+        self.assertIn("not running", err_frame["error"]["message"])
+
+    def test_non_streaming_returns_json_with_full_text(self):
+        self._install_fake_active([ord("o"), ord("k"), 0])
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "dflash-test", "messages": [{"role": "user", "content": "ping"}], "stream": False},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["choices"][0]["message"]["content"], "ok")
+        self.assertEqual(body["usage"]["completion_tokens"], 2)
+
+    def test_proxy_v1_short_circuits_dflash_to_501(self):
+        self._install_fake_active([])
+        response = self.client.post(
+            "/v1/completions",
+            json={"model": "dflash-test", "prompt": "x"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 501)
+        self.assertIn("not supported on dflash", response.json()["detail"])
+
+
+if __name__ == "__main__":
+    unittest.main()

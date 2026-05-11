@@ -27,14 +27,33 @@ def _get_backend(cfg: dict) -> str:
     return cfg.get("backend", BACKEND_LLAMA)
 
 
-def _resolve_path(cfg: dict, key: str) -> Optional[str]:
-    """Resolve a model config path (file, draft, drafter, mmproj)."""
+def resolve_path(cfg: dict, key: str) -> Optional[str]:
+    """Resolve a model config path (file, draft, drafter, mmproj, tokenizer).
+
+    Absolute paths are returned as-is; relative paths are anchored at MODELS_DIR.
+    """
     path = cfg.get(key)
     if not path:
         return None
     if os.path.isabs(path):
         return path
     return os.path.join(MODELS_DIR, path)
+
+
+def _looks_like_local_path(spec: str) -> bool:
+    """True if `spec` should be treated as a filesystem path rather than an HF id.
+
+    Hugging Face repo ids look like `org/repo` (single `/`, no leading dot, not
+    absolute). Anything that's absolute, starts with `./` or `../`, or has more
+    than one path separator is treated as a local path.
+    """
+    if not isinstance(spec, str) or not spec:
+        return False
+    if os.path.isabs(spec):
+        return True
+    if spec.startswith("./") or spec.startswith("../"):
+        return True
+    return spec.count(os.sep) >= 2
 
 
 class ModelRegistry:
@@ -279,15 +298,25 @@ class ModelRegistry:
             if not os.path.exists(model_path):
                 return False, f"Model file not found at {model_path}"
         elif backend == BACKEND_DFLASH:
-            target = _resolve_path(cfg, "target")
+            target = resolve_path(cfg, "target")
             if not target or not os.path.exists(target):
                 return False, f"Target model not found at {target}"
-            draft = _resolve_path(cfg, "draft")
+            draft = resolve_path(cfg, "draft")
             if not draft or not os.path.exists(draft):
                 return False, f"Draft model not found at {draft}"
-            drafter = _resolve_path(cfg, "drafter")
+            drafter = resolve_path(cfg, "drafter")
             if drafter and not os.path.exists(drafter):
                 return False, f"Drafter model not found at {drafter}"
+            tokenizer = cfg.get("tokenizer")
+            if not tokenizer:
+                return False, (
+                    "Missing 'tokenizer' field: dflash backends need an explicit "
+                    "tokenizer (HF repo id or local path); runtime download is not safe"
+                )
+            if _looks_like_local_path(tokenizer):
+                tok_path = resolve_path(cfg, "tokenizer")
+                if tok_path and not os.path.exists(tok_path):
+                    return False, f"Tokenizer path not found at {tok_path}"
         else:
             return False, f"Unknown backend '{backend}'"
 

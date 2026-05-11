@@ -83,24 +83,35 @@ class PrefixCache:
         h.update(struct.pack("<I", self.fa_window or 0))
         return h.digest()[:16]
 
-    def lookup(self, prompt_ids: list) -> Optional[tuple]:
-        """Find the longest cached prefix in prompt_ids.
+    def lookup(self, prompt_ids: list, boundaries: Optional[list] = None) -> Optional[tuple]:
+        """Find the longest cached prefix of prompt_ids at a known boundary.
 
-        Checks the system-prompt boundary and all turn boundaries.
-        Returns (slot_id, prefix_len) for the deepest match, or None.
+        Args:
+            prompt_ids: full prompt token sequence
+            boundaries: candidate token positions to probe (e.g., end of system
+                message, end of each conversation turn). Each must be an integer
+                in (0, len(prompt_ids)]. If None, only the full prompt is probed.
 
-        For simplicity, we check the full prompt hash. The inline snapshot
-        mechanism handles sub-prefix caching during prefill.
+        Returns:
+            (slot_id, prefix_len) for the deepest cached match, or None.
         """
         if self.disabled:
             return None
 
-        key = self.hash_prefix(prompt_ids)
-        if key in self.entries:
-            slot = self.entries[key]
-            self.entries.move_to_end(key)
-            logger.debug(f"prefix cache hit slot={slot} len={len(prompt_ids)}")
-            return (slot, len(prompt_ids))
+        candidates = list(boundaries) if boundaries else []
+        candidates.append(len(prompt_ids))
+        # Probe deepest first so we win on the longest cached prefix.
+        seen = set()
+        for boundary in sorted({b for b in candidates if 0 < b <= len(prompt_ids)}, reverse=True):
+            if boundary in seen:
+                continue
+            seen.add(boundary)
+            key = self.hash_prefix(prompt_ids[:boundary])
+            if key in self.entries:
+                slot = self.entries[key]
+                self.entries.move_to_end(key)
+                logger.debug(f"prefix cache hit slot={slot} len={boundary}")
+                return (slot, boundary)
         return None
 
     def prepare_inline_snap(
@@ -109,13 +120,16 @@ class PrefixCache:
         """Prepare an inline snapshot at the given boundary position.
 
         Picks a slot and defers eviction until confirm. Returns
-        (slot_id, boundary) or None if already cached.
+        (slot_id, boundary) or None if the boundary is unusable or already cached.
 
         Args:
             prompt_ids: Full prompt token IDs
-            boundary: Token position to snapshot at (e.g., end of system prompt)
+            boundary: Token position to snapshot at (e.g., end of system prompt).
+                Must be > 0 and <= len(prompt_ids); otherwise no snapshot is taken.
         """
         if self.disabled:
+            return None
+        if boundary <= 0 or boundary > len(prompt_ids):
             return None
 
         prefix = prompt_ids[:boundary]

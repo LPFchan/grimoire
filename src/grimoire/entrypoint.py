@@ -24,10 +24,18 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 
 from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig
+from grimoire.dflash.prefill import maybe_compress
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
 from grimoire.plugins import plugin_manager
-from grimoire.registry import MODELS_DIR, registry, BACKEND_LLAMA, BACKEND_DFLASH
+from grimoire.registry import (
+    MODELS_DIR,
+    registry,
+    resolve_path,
+    _looks_like_local_path,
+    BACKEND_LLAMA,
+    BACKEND_DFLASH,
+)
 from grimoire.telemetry import telemetry_sampler, telemetry_store
 from grimoire.usage import usage_store
 
@@ -278,6 +286,10 @@ class ActiveModel:
         self.prefix_cache: Optional[PrefixCache] = None
         self.prefill_config: Optional[PrefillConfig] = None
         self._tokenizer = None
+        # Serializes generate() calls against the single daemon stdin/stdout
+        # pair. Created lazily so the unit-test path that constructs an
+        # ActiveModel outside an event loop doesn't crash.
+        self._dflash_lock: Optional[asyncio.Lock] = None
 
     def start(self):
         """Start the backend process."""
@@ -300,13 +312,10 @@ class ActiveModel:
 
     def _start_dflash(self):
         """Start the dflash daemon process."""
-        from grimoire.registry import _resolve_path
+        target_path = resolve_path(self.cfg, "target")
+        draft_path = resolve_path(self.cfg, "draft")
+        drafter_path = resolve_path(self.cfg, "drafter")
 
-        target_path = _resolve_path(self.cfg, "target")
-        draft_path = _resolve_path(self.cfg, "draft")
-        drafter_path = _resolve_path(self.cfg, "drafter")
-
-        # Prefix cache
         pc_cap = self.cfg.get("prefix-cache-slots", 4)
         self.prefix_cache = PrefixCache(
             cap=pc_cap,
@@ -316,7 +325,6 @@ class ActiveModel:
         )
         self.prefix_cache.load()
 
-        # PFlash config
         self.prefill_config = PrefillConfig(
             enabled=self.cfg.get("prefill-compression", "auto") != "off",
             threshold=self.cfg.get("prefill-threshold", 32000),
@@ -330,7 +338,6 @@ class ActiveModel:
             max_ctx=self.cfg.get("ctx-size", 16384),
             budget=self.cfg.get("budget", 22),
             gpu_id=self.gpu,
-            drafter_path=drafter_path,
             prefill_threshold=self.prefill_config.threshold,
             prefill_keep_ratio=self.prefill_config.keep_ratio,
             kv_k_type=self.cfg.get("cache-type-k", "q8_0"),
@@ -338,6 +345,12 @@ class ActiveModel:
         )
         self.dflash_daemon.spawn(timeout=self.cfg.get("startup-timeout", DEFAULT_STARTUP_TIMEOUT))
         self.process = self.dflash_daemon.proc
+
+    def dflash_lock(self) -> asyncio.Lock:
+        """Return the per-model lock that serializes daemon I/O."""
+        if self._dflash_lock is None:
+            self._dflash_lock = asyncio.Lock()
+        return self._dflash_lock
 
     async def wait_ready(self, timeout=DEFAULT_STARTUP_TIMEOUT):
         """Wait until the backend is ready."""
@@ -435,89 +448,26 @@ class ActiveModel:
             return self.dflash_daemon.is_running()
         return self.process is not None and self.process.poll() is None
 
-    def generate(
-        self,
-        prompt_ids: list,
-        n_gen: int,
-        stop_ids: set = None,
-        temperature: float = 0.8,
-        top_p: float = 0.9,
-        top_k: int = 40,
-        seed: int = None,
-    ) -> list:
-        """Generate tokens via the dflash daemon.
+    def get_tokenizer(self):
+        """Get or load the tokenizer for this model.
 
-        Handles prefix cache lookup, inline snapshot preparation,
-        and PFlash compression.
+        Reads `tokenizer` from the model config. Values containing a path
+        separator (or starting with `.`) are treated as local paths under
+        MODELS_DIR; everything else is loaded as a Hugging Face repo id.
+        Raises RuntimeError if no tokenizer is configured or loading fails.
         """
-        if self.backend_type != BACKEND_DFLASH or not self.dflash_daemon:
-            raise RuntimeError(f"{self.name} is not a dflash backend")
-
-        daemon = self.dflash_daemon
-
-        # PFlash compression for long prompts
-        from grimoire.dflash.prefill import maybe_compress
-        import asyncio
-
-        loop = asyncio.get_event_loop()
-        effective_ids = asyncio.run(
-            maybe_compress(prompt_ids, daemon, self.prefill_config)
-        )[0] if self.prefill_config else prompt_ids
-
-        # Prefix cache lookup
-        prefix_hit = None
-        if self.prefix_cache and not self.prefix_cache.disabled:
-            prefix_hit = self.prefix_cache.lookup(effective_ids)
-
-        # Prepare inline snapshot
-        snap_slot = None
-        snap_pos = None
-        if self.prefix_cache and not self.prefix_cache.disabled:
-            prep = self.prefix_cache.prepare_inline_snap(effective_ids, len(effective_ids))
-            if prep:
-                snap_slot, snap_pos = prep
-
-        # Generate
-        tokens = daemon.generate(
-            prompt_ids=effective_ids,
-            n_gen=n_gen,
-            stop_ids=stop_ids,
-            prefix_cache_slot=prefix_hit[0] if prefix_hit else None,
-            prefix_cache_prefix_len=prefix_hit[1] if prefix_hit else None,
-            snap_slot=snap_slot,
-            snap_pos=snap_pos,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
-        )
-
-        # Confirm or abort snapshot
-        if snap_slot is not None:
-            if len(tokens) > 0:
-                self.prefix_cache.confirm_inline_snap(snap_slot, snap_pos, effective_ids)
-            else:
-                self.prefix_cache.abort_inline_snap(snap_slot)
-
-        return tokens
-
-    def _get_tokenizer(self):
-        """Get or load the tokenizer for this model."""
-        if self._tokenizer:
+        if self._tokenizer is not None:
             return self._tokenizer
-        try:
-            from transformers import AutoTokenizer
-            family = self.cfg.get("family", "qwen")
-            if family == "qwen":
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    "Qwen/Qwen3.6-27B", trust_remote_code=True
-                )
-            elif family == "gemma":
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    "google/gemma-4-31b-it"
-                )
-        except Exception as e:
-            logger.error(f"Failed to load tokenizer: {e}")
+        spec = self.cfg.get("tokenizer")
+        if not spec:
+            raise RuntimeError(
+                f"Model '{self.name}' has no 'tokenizer' configured; "
+                "dflash models require an explicit tokenizer (HF repo id or local path)"
+            )
+        from transformers import AutoTokenizer
+        source = resolve_path(self.cfg, "tokenizer") if _looks_like_local_path(spec) else spec
+        trust_remote = bool(self.cfg.get("tokenizer-trust-remote-code", False))
+        self._tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=trust_remote)
         return self._tokenizer
 
 
@@ -796,7 +746,8 @@ async def get_v1_models(request: Request):
         item["active"] = name in active_names
         item["status"] = {"value": manager.get_status(name)}
         item["in_cache"] = True
-        item["path"] = cfg.get("file", "")
+        # llama backends carry `file`; dflash carries `target`.
+        item["path"] = cfg.get("file") or cfg.get("target") or ""
         item["context_window"] = cfg.get("ctx-size", DEFAULT_CTX_SIZE)
     return {"object": "list", "data": data}
 
@@ -1438,99 +1389,275 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=resp_headers)
 
 
-async def _proxy_dflash(requested_model, payload, active, user_hash, conversation_id):
-    """Handle chat completions for dflash backend.
+DFLASH_SUPPORTED_SAMPLING = {"temperature", "top_p", "top_k", "seed"}
+DFLASH_IGNORED_SAMPLING = {
+    "min_p", "repetition_penalty", "frequency_penalty",
+    "presence_penalty", "logit_bias", "typical_p", "tfs_z", "mirostat",
+}
 
-    Tokenizes the prompt, runs dflash generation via the daemon,
-    then formats the response as OpenAI-compatible SSE or JSON.
+
+def _dflash_collect_stop_ids(tokenizer, payload_stop, cfg):
+    """Build the daemon's stop-id set from EOS, chat-template ends, and user stop."""
+    stop_ids = set()
+    if tokenizer.eos_token_id is not None:
+        stop_ids.add(tokenizer.eos_token_id)
+
+    # Common chat-template assistant terminators across model families.
+    for candidate in ("<|im_end|>", "<end_of_turn>", "<|eot_id|>", "<|end_of_text|>"):
+        try:
+            tok_id = tokenizer.convert_tokens_to_ids(candidate)
+        except Exception:
+            tok_id = None
+        if isinstance(tok_id, int) and tok_id >= 0 and tok_id != tokenizer.unk_token_id:
+            stop_ids.add(tok_id)
+
+    # Operator-supplied stop strings on the model config.
+    for s in cfg.get("stop-strings", []) or []:
+        stop_ids.update(tokenizer.encode(s, add_special_tokens=False))
+
+    # Request-level stop strings.
+    raw_stops = [payload_stop] if isinstance(payload_stop, str) else (payload_stop or [])
+    for s in raw_stops:
+        if isinstance(s, str) and s:
+            stop_ids.update(tokenizer.encode(s, add_special_tokens=False))
+
+    return stop_ids
+
+
+def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
+    """Compute candidate cache boundaries that are valid prefixes of prompt_ids.
+
+    Currently emits the system-message boundary. If the encoded system prefix
+    doesn't actually match prompt_ids[:n] (chat-template overhead is template-
+    specific), the boundary is dropped.
+    """
+    boundaries = []
+    system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+    if not system_msgs:
+        return boundaries
+    try:
+        sys_text = tokenizer.apply_chat_template(
+            system_msgs, tokenize=False, add_generation_prompt=False
+        )
+        sys_ids = tokenizer.encode(sys_text, add_special_tokens=False)
+    except Exception:
+        return boundaries
+    n = len(sys_ids)
+    if 0 < n < len(prompt_ids) and prompt_ids[:n] == sys_ids:
+        boundaries.append(n)
+    return boundaries
+
+
+async def _proxy_dflash(requested_model, payload, active, user_hash, conversation_id):
+    """Handle chat completions for the dflash backend.
+
+    Streams via the daemon's stdin/stdout protocol while reusing the same
+    history/telemetry/plugin pipeline as the llama path so dashboards work.
     """
     model_cfg = active.cfg
     payload = copy.deepcopy(payload)
     payload = plugin_manager.before_request(payload, active.name, model_cfg)
 
     messages = payload.get("messages", [])
-    stream = payload.get("stream", True)
-    max_tokens = payload.get("max_tokens", model_cfg.get("predict", DEFAULT_PREDICT))
+    want_stream = payload.get("stream", True)
+    max_tokens = int(payload.get("max_tokens", model_cfg.get("predict", DEFAULT_PREDICT)) or DEFAULT_PREDICT)
     temperature = payload.get("temperature", 0.8)
     top_p = payload.get("top_p", 0.9)
     top_k = payload.get("top_k", 40)
     seed = payload.get("seed")
-    stop = payload.get("stop", [])
 
-    # Tokenize using the tokenizer (resolve from model family)
-    tokenizer = active._get_tokenizer()
-    if not tokenizer:
-        raise HTTPException(status_code=500, detail="No tokenizer available for dflash model")
+    for name in DFLASH_IGNORED_SAMPLING:
+        if payload.get(name) is not None:
+            logger.warning(
+                f"dflash: ignoring unsupported sampling param '{name}' on model {active.name}"
+            )
 
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    try:
+        tokenizer = active.get_tokenizer()
+    except Exception as e:
+        logger.error(f"Failed to load tokenizer for {active.name}: {e}")
+        raise HTTPException(status_code=503, detail=f"Tokenizer unavailable: {e}")
 
-    # Stop IDs
-    stop_ids = set()
-    for s in [stop] if isinstance(stop, str) else (stop or []):
-        stop_ids.update(tokenizer.encode(s, add_special_tokens=False))
-    if tokenizer.eos_token_id:
-        stop_ids.add(tokenizer.eos_token_id)
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to render chat template: {e}")
+
+    ctx_size = int(model_cfg.get("ctx-size", DEFAULT_CTX_SIZE))
+    if len(prompt_ids) + max_tokens > ctx_size:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"prompt ({len(prompt_ids)} tokens) + max_tokens ({max_tokens}) "
+                f"exceeds context size {ctx_size}"
+            ),
+        )
+
+    stop_ids = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
+    boundaries = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
-    ctx_size = model_cfg.get("ctx-size", DEFAULT_CTX_SIZE)
 
-    if stream:
-        async def sse_iter():
+    async def sse_stream():
+        daemon = active.dflash_daemon
+        if daemon is None or not daemon.is_running():
+            yield _sse_error_frames(completion_id, created, "dflash daemon not running")
+            return
+
+        async with active.dflash_lock():
+            # Long-context compression
+            effective_ids = prompt_ids
+            if active.prefill_config and active.prefill_config.enabled:
+                try:
+                    effective_ids, _ = await maybe_compress(
+                        prompt_ids, daemon, active.prefill_config
+                    )
+                except Exception as e:
+                    logger.error(f"pflash compression failed: {e}")
+                    effective_ids = prompt_ids
+
+            prefix_hit = None
+            snap_slot = None
+            snap_pos = None
+            pc = active.prefix_cache
+            if pc and not pc.disabled:
+                prefix_hit = pc.lookup(effective_ids, boundaries=boundaries)
+                if boundaries:
+                    prep = pc.prepare_inline_snap(effective_ids, boundaries[0])
+                    if prep:
+                        snap_slot, snap_pos = prep
+
+            cmd_path = await asyncio.to_thread(
+                daemon.send_generate_cmd,
+                effective_ids,
+                max_tokens,
+                prefix_hit[0] if prefix_hit else None,
+                snap_slot,
+                snap_pos,
+                temperature,
+                top_p,
+                top_k,
+                seed,
+            )
+
+            decoded_prefix = ""
+            tokens_emitted = []
+            t0 = time.monotonic()
             try:
-                tokens = active.generate(
-                    prompt_ids=prompt_ids,
-                    n_gen=max_tokens,
-                    stop_ids=stop_ids,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    seed=seed,
-                )
-                text = tokenizer.decode(tokens)
-                for i, tok in enumerate(tokens):
-                    chunk_text = tokenizer.decode([tok])
-                    sse = f"data: {json.dumps(_delta_sse(completion_id, created, chunk_text, i))}\n\n"
-                    yield sse.encode()
-                yield f"data: {json.dumps(_final_sse(completion_id, created, len(prompt_ids), len(tokens), text, ctx_size))}\n\n".encode()
-                yield b"data: [DONE]\n\n"
-            except Exception as e:
-                logger.error(f"dflash generation error: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n".encode()
+                index = 0
+                while True:
+                    tok = await asyncio.to_thread(daemon.read_next_token)
+                    if tok is None:
+                        break
+                    if tok in stop_ids:
+                        break
+                    tokens_emitted.append(tok)
+                    # Incremental decode against the running prefix avoids
+                    # BPE/SentencePiece per-token artefacts.
+                    new_full = tokenizer.decode(
+                        tokens_emitted,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    if len(new_full) > len(decoded_prefix):
+                        delta = new_full[len(decoded_prefix):]
+                        decoded_prefix = new_full
+                        frame = _delta_sse(completion_id, created, delta, index)
+                        index += 1
+                        yield f"data: {json.dumps(frame)}\n\n".encode()
+                    if len(tokens_emitted) >= max_tokens:
+                        break
+            finally:
+                try:
+                    os.unlink(cmd_path)
+                except OSError:
+                    pass
 
-        return StreamingResponse(sse_iter(), media_type="text/event-stream",
-                                 headers={"x-request-id": requested_model})
-    else:
-        tokens = active.generate(
-            prompt_ids=prompt_ids,
-            n_gen=max_tokens,
-            stop_ids=stop_ids,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
+            elapsed = max(time.monotonic() - t0, 1e-6)
+            tps = len(tokens_emitted) / elapsed
+
+            if snap_slot is not None and snap_pos is not None:
+                if tokens_emitted:
+                    pc.confirm_inline_snap(snap_slot, snap_pos, effective_ids)
+                else:
+                    pc.abort_inline_snap(snap_slot)
+
+            final = _final_sse(
+                completion_id, created,
+                len(effective_ids), len(tokens_emitted),
+                decoded_prefix, ctx_size,
+            )
+            final["timings"] = {
+                "predicted_n": len(tokens_emitted),
+                "predicted_ms": elapsed * 1000.0,
+                "predicted_per_second": tps,
+            }
+            yield f"data: {json.dumps(final)}\n\n".encode()
+            yield b"data: [DONE]\n\n"
+
+    async def safe_stream():
+        try:
+            async for chunk in sse_stream():
+                yield chunk
+        except Exception as e:
+            logger.exception(f"dflash generation error: {e}")
+            yield _sse_error_frames(completion_id, created, str(e))
+
+    stream = safe_stream()
+    stream = plugin_manager.wrap_response_stream(stream, active.name, model_cfg)
+    if user_hash:
+        stream = _record_response_stream(
+            stream, user_hash, conversation_id, active.name,
+            model_cfg, payload, gpu_index=active.gpu, record_history=True,
         )
-        text = tokenizer.decode(tokens)
-        return JSONResponse({
-            "id": completion_id,
-            "object": "chat.completion",
-            "created": created,
-            "model": requested_model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
-            "usage": {
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": len(tokens),
-                "total_tokens": len(prompt_ids) + len(tokens),
-            },
-            "context_window": ctx_size,
-        })
+
+    if want_stream:
+        return StreamingResponse(
+            stream,
+            media_type="text/event-stream",
+            headers={"x-request-id": requested_model},
+        )
+
+    body = bytearray()
+    async for chunk in stream:
+        body.extend(chunk)
+    text = _extract_assistant_text(bytes(body))
+    usage = _extract_usage(bytes(body)) or {"input_tokens": len(prompt_ids), "output_tokens": 0}
+    return JSONResponse({
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": created,
+        "model": requested_model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop",
+        }],
+        "usage": {
+            "prompt_tokens": usage["input_tokens"],
+            "completion_tokens": usage["output_tokens"],
+            "total_tokens": usage["input_tokens"] + usage["output_tokens"],
+        },
+        "context_window": ctx_size,
+    })
+
+
+def _sse_error_frames(completion_id, created, message):
+    """SSE error payload plus the [DONE] terminator clients expect."""
+    err = {
+        "id": completion_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "error": {"message": message, "type": "server_error"},
+    }
+    return (
+        f"data: {json.dumps(err)}\n\n".encode()
+        + b"data: [DONE]\n\n"
+    )
 
 
 def _delta_sse(completion_id, created, content, index=0):
@@ -1589,6 +1716,8 @@ async def chat_completions(request: Request):
         conversation_id = _history_conversation_id(request, payload)
         conversation_id = _validated_history_conversation_id(user_hash, conversation_id)
         return await _proxy_chat(requested_model, payload, active, user_hash=user_hash, conversation_id=conversation_id)
+    except HTTPException:
+        raise
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except FileNotFoundError as e:
@@ -1624,6 +1753,14 @@ async def proxy_v1(request: Request, path: str):
     client = None
     try:
         active = await manager.start_model(model_name)
+        if active.backend_type == BACKEND_DFLASH:
+            raise HTTPException(
+                status_code=501,
+                detail=(
+                    f"/v1/{path} is not supported on dflash backend "
+                    f"'{active.name}'; only /v1/chat/completions and /v1/models are wired up"
+                ),
+            )
         client = httpx.AsyncClient(timeout=None)
         headers = _backend_request_headers(request.headers)
 

@@ -114,22 +114,18 @@ COPY dflash/ /app/dflash-hub
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/dflash-build \
     set -eux; \
-    if [ ! -f /app/.cache/dflash-build/.built ]; then \
-        rm -rf /app/.cache/dflash-build/build; \
-        cd /app/dflash-hub/dflash; \
-        git submodule update --init --recursive; \
-        cmake -B /app/.cache/dflash-build/build -S . \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CUDA_ARCHITECTURES=86 \
-            -DDFLASH27B_TESTS=OFF \
-            -DDFLASH27B_FA_ALL_QUANTS=ON; \
-        cmake --build /app/.cache/dflash-build/build \
-            --target dflash --parallel $(nproc); \
-        mkdir -p /opt/dflash; \
-        cp /app/.cache/dflash-build/build/dflash /opt/dflash/; \
-        cp -r /app/.cache/dflash-build/build/lib/* /opt/dflash/ 2>/dev/null || true; \
-        touch /app/.cache/dflash-build/.built; \
-    fi
+    cd /app/dflash-hub/dflash; \
+    git submodule update --init --recursive; \
+    cmake -B /app/.cache/dflash-build/build -S . \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CUDA_ARCHITECTURES=86 \
+        -DDFLASH27B_TESTS=OFF \
+        -DDFLASH27B_FA_ALL_QUANTS=ON; \
+    cmake --build /app/.cache/dflash-build/build \
+        --target dflash --parallel "$(nproc)"; \
+    mkdir -p /opt/dflash; \
+    cp /app/.cache/dflash-build/build/dflash /opt/dflash/; \
+    cp -r /app/.cache/dflash-build/build/lib/* /opt/dflash/ 2>/dev/null || true
 
 
 # =============================================================================

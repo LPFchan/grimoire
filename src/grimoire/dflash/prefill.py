@@ -8,9 +8,10 @@ The gateway detects long prompts, calls compress() to get the reduced token
 list, then feeds that to the daemon's generate() instead of the full prompt.
 """
 
+import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 logger = logging.getLogger(__name__)

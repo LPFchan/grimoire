@@ -4,19 +4,23 @@ Spawns the DFlash binary, communicates via stdin/stdout protocol,
 and provides the generate() and compress() interfaces used by the gateway.
 """
 
-import asyncio
 import logging
 import os
 import struct
 import subprocess
 import tempfile
 import time
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 DFLASH_BIN = "/opt/dflash/dflash"
+
+# VRAM delta (MiB) above the pre-spawn baseline that signals the daemon
+# has loaded weights. Target+draft for a 27B model is ~18 GB; we use a
+# conservative threshold so other processes on the same GPU can't satisfy
+# it.
+LOADED_VRAM_DELTA_MIB = 12000
 
 
 class DflashDaemon:
@@ -25,7 +29,7 @@ class DflashDaemon:
     Handles:
       - Spawning the daemon with target + draft models
       - stdin/stdout protocol communication
-      - VRAM-based health checks
+      - VRAM-delta-based health check
       - Token streaming via pipe
       - PFlash compress commands
       - Park/unpark for VRAM management
@@ -38,7 +42,6 @@ class DflashDaemon:
         max_ctx: int = 16384,
         budget: int = 22,
         gpu_id: int = 0,
-        drafter_path: Optional[str] = None,
         prefill_threshold: int = 32000,
         prefill_keep_ratio: float = 0.05,
         kv_k_type: str = "q8_0",
@@ -46,7 +49,6 @@ class DflashDaemon:
     ):
         self.target_path = target_path
         self.draft_path = draft_path
-        self.drafter_path = drafter_path
         self.max_ctx = max_ctx
         self.budget = budget
         self.gpu_id = gpu_id
@@ -57,13 +59,14 @@ class DflashDaemon:
 
         self.proc: Optional[subprocess.Popen] = None
         self.r_pipe: int = -1
-        self.w_pipe: int = -1
 
     def spawn(self, timeout: float = 600.0) -> None:
         """Spawn the dflash daemon and wait for it to load.
 
         Raises RuntimeError if the daemon fails to load within timeout.
         """
+        baseline_vram = self._read_gpu_vram_mib()
+
         r_pipe, w_pipe = os.pipe()
         stream_fd = w_pipe
 
@@ -96,12 +99,27 @@ class DflashDaemon:
         )
         os.close(w_pipe)
         self.r_pipe = r_pipe
-        self.w_pipe = w_pipe
 
-        self._wait_until_loaded(timeout=timeout)
+        self._wait_until_loaded(timeout=timeout, baseline_mib=baseline_vram)
 
-    def _wait_until_loaded(self, timeout: float) -> None:
-        """Wait for daemon to load by checking VRAM usage."""
+    def _read_gpu_vram_mib(self) -> int:
+        """Return MiB used on this daemon's GPU, or 0 if nvidia-smi fails."""
+        try:
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used",
+                    "--format=csv,noheader,nounits",
+                    "-i",
+                    str(self.gpu_id),
+                ]
+            ).decode()
+            return int(output.strip().split("\n")[0])
+        except Exception:
+            return 0
+
+    def _wait_until_loaded(self, timeout: float, baseline_mib: int) -> None:
+        """Wait for daemon to load by checking VRAM delta above baseline."""
         boot = time.time()
         while time.time() - boot < timeout:
             time.sleep(1)
@@ -109,22 +127,13 @@ class DflashDaemon:
                 raise RuntimeError(
                     f"dflash daemon exited before loading (code {self.proc.returncode})"
                 )
-            try:
-                output = subprocess.check_output(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=memory.used",
-                        "--format=csv,noheader,nounits",
-                        "-i",
-                        str(self.gpu_id),
-                    ]
-                ).decode()
-                vram = int(output.strip().split("\n")[0])
-                if vram > 16000:
-                    logger.info(f"dflash daemon loaded, VRAM={vram} MiB")
-                    return
-            except Exception:
-                pass
+            current = self._read_gpu_vram_mib()
+            if current - baseline_mib >= LOADED_VRAM_DELTA_MIB:
+                logger.info(
+                    f"dflash daemon loaded, VRAM={current} MiB "
+                    f"(delta {current - baseline_mib} MiB)"
+                )
+                return
         raise RuntimeError(
             f"dflash daemon failed to load within {timeout:.0f}s"
         )
@@ -168,25 +177,72 @@ class DflashDaemon:
             if struct.unpack("<i", b)[0] == -1:
                 break
 
-    def _read_tokens(self, n_gen: int, stop_ids: set = None) -> list:
-        """Read generated token IDs from the stream pipe.
+    def read_next_token(self) -> Optional[int]:
+        """Read one int32 token from the stream pipe.
 
-        Returns list of token IDs (stops on -1 sentinel or n_gen limit).
+        Blocking. Returns the token id, or None when the daemon emits the
+        -1 sentinel or the pipe is closed. Callers iterating this from an
+        asyncio context should wrap each call in `asyncio.to_thread`.
         """
-        tokens = []
-        while True:
-            b = os.read(self.r_pipe, 4)
-            if not b or len(b) < 4:
-                break
-            tok = struct.unpack("<i", b)[0]
-            if tok == -1:
-                break
-            if stop_ids and tok in stop_ids:
-                break
-            tokens.append(tok)
-            if len(tokens) >= n_gen:
-                break
-        return tokens
+        b = os.read(self.r_pipe, 4)
+        if not b or len(b) < 4:
+            return None
+        tok = struct.unpack("<i", b)[0]
+        if tok == -1:
+            return None
+        return tok
+
+    def send_generate_cmd(
+        self,
+        prompt_ids: list,
+        n_gen: int,
+        prefix_cache_slot: Optional[int] = None,
+        snap_slot: Optional[int] = None,
+        snap_pos: Optional[int] = None,
+        temperature: Optional[float] = 0.8,
+        top_p: Optional[float] = 0.9,
+        top_k: Optional[int] = 40,
+        seed: Optional[int] = None,
+    ) -> str:
+        """Send a generate command to the daemon and return the temp prompt path.
+
+        The caller owns the returned path and must unlink it after the
+        stream finishes (recommended: after read_next_token returns None).
+        """
+        fd, path = tempfile.mkstemp(suffix=".bin")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for t in prompt_ids:
+                    f.write(struct.pack("<i", int(t)))
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+
+        if prefix_cache_slot is not None:
+            cmd = f"RESTORE {prefix_cache_slot} {path} {n_gen}"
+        else:
+            cmd = f"{path} {n_gen}"
+
+        if snap_slot is not None and snap_pos is not None:
+            cmd += f" snap={snap_pos}:{snap_slot}"
+
+        samp_parts = []
+        if temperature is not None:
+            samp_parts.append(f"temp={temperature:.4f}")
+        if top_p is not None:
+            samp_parts.append(f"top_p={top_p:.4f}")
+        if top_k is not None:
+            samp_parts.append(f"top_k={top_k}")
+        if seed is not None:
+            samp_parts.append(f"seed={seed}")
+        if samp_parts:
+            cmd += " " + " ".join(samp_parts)
+
+        self._send(cmd + "\n")
+        return path
 
     def generate(
         self,
@@ -202,56 +258,34 @@ class DflashDaemon:
         top_k: int = 40,
         seed: Optional[int] = None,
     ) -> list:
-        """Generate tokens via the daemon.
+        """Generate tokens via the daemon (blocking, full-response).
 
-        Args:
-            prompt_ids: Input token IDs
-            n_gen: Maximum tokens to generate
-            stop_ids: Token IDs that stop generation
-            prefix_cache_slot: If set, restore from prefix cache slot before prefill
-            prefix_cache_prefix_len: Length of prefix already in cache
-            snap_slot: If set, take inline snapshot at snap_pos during prefill
-            snap_pos: Token position to snapshot
-            temperature: Sampling temperature
-            top_p: Nucleus sampling top_p
-            top_k: Top-k sampling
-            seed: Random seed for reproducibility
-
-        Returns:
-            List of generated token IDs
+        Prefer send_generate_cmd + read_next_token for streaming. This helper
+        is kept for non-streaming callers and tests.
         """
-        # Write prompt to temp .bin file
-        fd, path = tempfile.mkstemp(suffix=".bin")
+        path = self.send_generate_cmd(
+            prompt_ids=prompt_ids,
+            n_gen=n_gen,
+            prefix_cache_slot=prefix_cache_slot,
+            snap_slot=snap_slot,
+            snap_pos=snap_pos,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+        )
         try:
-            with os.fdopen(fd, "wb") as f:
-                for t in prompt_ids:
-                    f.write(struct.pack("<i", int(t)))
-
-            # Build command line
-            if prefix_cache_slot is not None:
-                cmd = f"RESTORE {prefix_cache_slot} {path} {n_gen}"
-            else:
-                cmd = f"{path} {n_gen}"
-
-            # Inline snapshot
-            if snap_slot is not None and snap_pos is not None:
-                cmd += f" snap={snap_pos}:{snap_slot}"
-
-            # Sampling parameters
-            samp_parts = []
-            if temperature is not None:
-                samp_parts.append(f"temp={temperature:.4f}")
-            if top_p is not None:
-                samp_parts.append(f"top_p={top_p:.4f}")
-            if top_k is not None:
-                samp_parts.append(f"top_k={top_k}")
-            if seed is not None:
-                samp_parts.append(f"seed={seed}")
-            if samp_parts:
-                cmd += " " + " ".join(samp_parts)
-
-            self._send(cmd + "\n")
-            return self._read_tokens(n_gen, stop_ids)
+            tokens = []
+            while True:
+                tok = self.read_next_token()
+                if tok is None:
+                    break
+                if stop_ids and tok in stop_ids:
+                    break
+                tokens.append(tok)
+                if len(tokens) >= n_gen:
+                    break
+            return tokens
         finally:
             try:
                 os.unlink(path)
@@ -287,11 +321,8 @@ class DflashDaemon:
 
             tokens = []
             while True:
-                b = os.read(self.r_pipe, 4)
-                if not b or len(b) < 4:
-                    break
-                tok = struct.unpack("<i", b)[0]
-                if tok == -1:
+                tok = self.read_next_token()
+                if tok is None:
                     break
                 tokens.append(tok)
             return tokens
@@ -330,16 +361,6 @@ class DflashDaemon:
             slot: Daemon slot ID (0-7)
         """
         self._send(f"FREE_SNAPSHOT {slot}\n")
-
-    def list_slots(self) -> list:
-        """List occupied prefix cache slots.
-
-        Returns:
-            List of slot IDs that have active snapshots
-        """
-        self._send("LIST_SLOTS\n")
-        # Read response from stdout — handled by stdout bus
-        return []
 
     def park_draft(self) -> None:
         """Park draft model to free ~3.3 GB VRAM."""
