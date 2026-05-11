@@ -75,13 +75,15 @@ async def maybe_compress(
     compress_end = len(prompt_ids)
 
     if boundaries and len(boundaries) >= 2:
-        # Head: system prompt ends at first boundary.
-        compress_start = boundaries[0]
+        # Head: system prompt + first user message (opencode compaction summary).
+        # Protecting the first user message preserves the compaction context
+        # and the original user prompt when no compaction is active.
+        compress_start = boundaries[1]
 
         # Tail: walk backwards from the end, protecting whole turns until
         # tail_budget is consumed. Each turn = boundaries[i] - boundaries[i-1].
         tail_so_far = 0
-        for i in range(len(boundaries) - 1, 0, -1):
+        for i in range(len(boundaries) - 1, 1, -1):
             turn_len = boundaries[i] - boundaries[i - 1]
             if tail_so_far + turn_len > config.tail_budget:
                 compress_end = boundaries[i - 1]
@@ -89,10 +91,10 @@ async def maybe_compress(
             tail_so_far += turn_len
         else:
             # All turns fit in tail_budget — nothing to compress in the middle.
-            compress_end = boundaries[0]
+            compress_end = boundaries[1]
 
-    elif boundaries and len(boundaries) == 1:
-        # Only system message boundary — protect head, compress everything after.
+    elif boundaries and len(boundaries) >= 1:
+        # Only system boundary (or system + 1 msg) — protect head.
         compress_start = boundaries[0]
 
     # If the middle portion is too small to benefit from compression, skip.
