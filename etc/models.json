@@ -72,20 +72,6 @@
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
-    "qwen-3.6-27B-std": {
-      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
-      "family": "qwen",
-      "capabilities": ["completion", "multimodal"],
-      "cost": {"input": 0.33, "output": 3.25},
-      "ctx-size": 262144,
-      "predict": 16384,
-      "parallel": 1,
-      "image-min-tokens": 1024,
-      "image-max-tokens": 1024,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4"
-    },
     "dflash-qwen-27B": {
       "backend": "dflash",
       "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
