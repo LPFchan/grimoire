@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig
+from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV
 from grimoire.dflash.prefill import maybe_compress
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
@@ -285,6 +285,7 @@ class ActiveModel:
         self.dflash_daemon: Optional[DflashDaemon] = None
         self.prefix_cache: Optional[PrefixCache] = None
         self.prefill_config: Optional[PrefillConfig] = None
+        self.session_kv: Optional[SessionKV] = None
         self._tokenizer = None
         # Serializes generate() calls against the single daemon stdin/stdout
         # pair. Created lazily so the unit-test path that constructs an
@@ -330,7 +331,13 @@ class ActiveModel:
             threshold=self.cfg.get("prefill-threshold", 32000),
             keep_ratio=self.cfg.get("prefill-keep-ratio", 0.05),
             drafter_path=drafter_path,
-            tail_budget=self.cfg.get("prefill-tail-budget", 16000),
+            tail_budget=self.cfg.get("prefill-tail-budget", 12288),
+        )
+
+        session_cap = self.cfg.get("session-kv-slots", 2)
+        self.session_kv = SessionKV(
+            cap=session_cap,
+            prefix_cap=pc_cap,
         )
 
         self.dflash_daemon = DflashDaemon(
@@ -1540,13 +1547,27 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             prefix_hit = None
             snap_slot = None
             snap_pos = None
-            pc = active.prefix_cache
-            if pc and not pc.disabled:
-                prefix_hit = pc.lookup(effective_ids, boundaries=boundaries)
-                if boundaries:
-                    prep = pc.prepare_inline_snap(effective_ids, boundaries[0])
-                    if prep:
-                        snap_slot, snap_pos = prep
+            session_slot = None
+            sk = active.session_kv
+            # Session KV: check if this conversation has a cached snapshot.
+            # If hit, RESTORE from that slot — only prefill the new delta.
+            if conversation_id and sk:
+                sess = sk.get_session(conversation_id)
+                if sess is not None:
+                    prefix_hit = (sess[0], sess[1])
+                    session_slot = sess[0]
+            # Prefix cache: fallback for new conversations or cache-miss sessions.
+            if prefix_hit is None:
+                pc = active.prefix_cache
+                if pc and not pc.disabled:
+                    prefix_hit = pc.lookup(effective_ids, boundaries=boundaries)
+                    if boundaries:
+                        prep = pc.prepare_inline_snap(effective_ids, boundaries[0])
+                        if prep:
+                            snap_slot, snap_pos = prep
+            # New conversation: reserve a session slot for post-gen snapshot.
+            if conversation_id and sk and session_slot is None:
+                session_slot = sk.reserve_slot()
 
             cmd_path = await asyncio.to_thread(
                 daemon.send_generate_cmd,
@@ -1596,6 +1617,16 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
             elapsed = max(time.monotonic() - t0, 1e-6)
             tps = len(tokens_emitted) / elapsed
+
+            # Post-generation snapshot: capture KV at end of effective_ids
+            # so the next turn only needs to prefill the new delta.
+            if session_slot is not None and tokens_emitted:
+                try:
+                    daemon.snapshot_at(session_slot, len(effective_ids))
+                    sk.update(conversation_id, session_slot, len(effective_ids))
+                except Exception as e:
+                    logger.warning(f"session snapshot failed: {e}")
+                    sk.evict(conversation_id)
 
             if snap_slot is not None and snap_pos is not None:
                 if tokens_emitted:

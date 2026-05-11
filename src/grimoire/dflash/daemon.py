@@ -387,6 +387,21 @@ class DflashDaemon:
         self._send("free drafter\n")
         self._drain_sentinel()
 
+    def snapshot_at(self, slot: int, pos: int) -> None:
+        """Take a KV cache snapshot at the given token position.
+
+        Sends a SNAPSHOT command after generation completes. The caller
+        must ensure the daemon is at the end of generation (no pending
+        token reads) before calling this.
+
+        Args:
+            slot: Daemon slot ID (0-7)
+            pos: Token position to snapshot at (e.g., len(effective_ids))
+        """
+        if slot < 0 or slot >= 8:
+            raise ValueError(f"Invalid snapshot slot: {slot}")
+        self._send(f"SNAPSHOT {slot} {pos}\n")
+
 
 def _spawn_preexec():
     """Pre-exec function for daemon subprocess.

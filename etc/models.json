@@ -90,6 +90,7 @@
       "cache-type-v": "tq3_0",
       "fa-window": 2048,
       "prefix-cache-slots": 2,
+      "session-kv-slots": 2,
       "prefill-threshold": 32768,
       "prefill-keep-ratio": 0.10,
       "prefill-tail-budget": 12288,
