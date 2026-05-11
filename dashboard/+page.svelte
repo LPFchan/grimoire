@@ -35,14 +35,8 @@
 		{ id: 'all', label: 'All' }
 	] as const;
 
-	const FREQUENCIES = [
-		{ ms: 1000, label: '1s' },
-		{ ms: 2000, label: '2s' },
-		{ ms: 5000, label: '5s' }
-	] as const;
-
 	let selectedWindow = $state<(typeof WINDOWS)[number]['id']>('1h');
-	let pollingMs = $state<number>(5000);
+	let pollingMs = $state<number>(1000);
 	let data = $state<DashboardResponse | null>(null);
 	let error = $state<string | null>(null);
 	let loading = $state(false);
@@ -220,22 +214,6 @@
 					onclick={() => (selectedWindow = w.id)}
 				>
 					{w.label}
-				</button>
-			{/each}
-		</div>
-
-		<div class="inline-flex items-center gap-1 rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Frequency">
-			{#each FREQUENCIES as f}
-				<button
-					type="button"
-					role="tab"
-					aria-selected={pollingMs === f.ms}
-					class="rounded-md px-3 py-1 text-sm transition {pollingMs === f.ms
-						? 'bg-background font-medium shadow-sm'
-						: 'text-muted-foreground hover:text-foreground'}"
-					onclick={() => (pollingMs = f.ms)}
-				>
-					{f.label}
 				</button>
 			{/each}
 		</div>
