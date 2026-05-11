@@ -190,9 +190,11 @@ def main():
                 if not b or len(b) < 4:
                     break
                 tok_id = struct.unpack("<i", b)[0]
-                generated += 1
+                if tok_id == -1:
+                    break
                 if tok_id == im_end_id:
                     break
+                generated += 1
                 sys.stdout.write(tokenizer.decode([tok_id]))
                 sys.stdout.flush()
         except KeyboardInterrupt:

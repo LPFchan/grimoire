@@ -128,6 +128,21 @@ class DaemonStdoutBus:
             try: self._waiters.remove(entry)
             except ValueError: pass
 
+    def register_waiter(self, prefix: str) -> asyncio.Future:
+        """Register a waiter immediately so a soon-to-arrive reply is not missed."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        self._waiters.append((prefix, fut))
+        return fut
+
+    def cancel_waiter(self, prefix: str, fut: asyncio.Future) -> None:
+        try:
+            self._waiters.remove((prefix, fut))
+        except ValueError:
+            pass
+        if not fut.done():
+            fut.cancel()
+
 
 # ---------------------------------------------------------------------------
 # Qwen chat template helpers
@@ -802,7 +817,7 @@ class PrefixCache:
             if token_stream_consumer is not None:
                 await token_stream_consumer()
             self._send(f"SNAPSHOT {slot}\n")
-            await self._await_reply("[snap] slot=")
+            await self._await_reply("[snap] inline slot=")
             self.confirm_inline_snap(slot, cut, prompt_ids)
             confirmed = True
         finally:

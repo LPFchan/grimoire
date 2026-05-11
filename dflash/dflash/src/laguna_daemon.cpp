@@ -517,6 +517,10 @@ int run_laguna_daemon(const LagunaDaemonArgs & args) {
                 }
                 cache.cur_pos = prefix_len - 1;
             }
+            if (N + n_gen > args.max_ctx) {
+                std::printf("err overflow\n"); std::fflush(stdout);
+                stream_emit(-1); continue;
+            }
             const int kv_start = cache.cur_pos;
             const int diff_n   = N - kv_start;
             std::vector<float> embed_diff((size_t)diff_n * w.n_embd);

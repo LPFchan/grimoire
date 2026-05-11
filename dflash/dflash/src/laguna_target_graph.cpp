@@ -191,24 +191,6 @@ void free_laguna_target_cache(LagunaTargetCache & c) {
 void reset_laguna_target_cache(LagunaTargetCache & c) {
     c.cur_pos  = 0;
     c.last_tok = -1;
-    if (!c.base_ctx) return;
-    std::vector<uint8_t> zeros(64 * 1024 * 1024, 0);
-    for (auto * t : c.attn_k) {
-        if (!t) continue;
-        const size_t sz = ggml_nbytes(t);
-        for (size_t off = 0; off < sz; off += zeros.size()) {
-            const size_t chunk = std::min(zeros.size(), sz - off);
-            ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-        }
-    }
-    for (auto * t : c.attn_v) {
-        if (!t) continue;
-        const size_t sz = ggml_nbytes(t);
-        for (size_t off = 0; off < sz; off += zeros.size()) {
-            const size_t chunk = std::min(zeros.size(), sz - off);
-            ggml_backend_tensor_set(t, zeros.data(), off, chunk);
-        }
-    }
 }
 
 // ---- Helpers ------------------------------------------------------------
@@ -655,6 +637,16 @@ bool laguna_step(
     bool                        no_mask,
     std::vector<float> &        out_logits)
 {
+    if (n_tok <= 0 || kv_start < 0) {
+        std::fprintf(stderr, "laguna_step: invalid step args n_tok=%d kv_start=%d\n",
+                     n_tok, kv_start);
+        return false;
+    }
+    if (kv_start + n_tok > w.max_ctx) {
+        std::fprintf(stderr, "laguna_step: kv overflow kv_start=%d n_tok=%d max_ctx=%d\n",
+                     kv_start, n_tok, w.max_ctx);
+        return false;
+    }
     ggml_init_params ip{};
     ip.mem_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead() + 16 * 1024 * 1024;
     ip.no_alloc = true;

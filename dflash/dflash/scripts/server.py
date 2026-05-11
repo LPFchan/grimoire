@@ -860,6 +860,72 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if timing:
             timing["t_last_tok"] = time.monotonic()
 
+    def _thinking_enabled(chat_template_kwargs) -> bool:
+        if not chat_template_kwargs:
+            return True
+        return chat_template_kwargs.get("enable_thinking", True)
+
+    def prompt_starts_in_thinking(prompt: str) -> bool:
+        return bool(re.search(r"<think>\s*$", prompt))
+
+    def consume_stream_piece(window: str, mode: str, piece: str):
+        outputs: list[tuple[str, str]] = []
+        window += piece
+        holdback = max(len(THINK_OPEN_TAG), len(THINK_CLOSE_TAG), len(TOOL_OPEN_TAG))
+
+        while True:
+            if mode == "tool_buffer":
+                break
+
+            if mode == "reasoning":
+                idx = window.find(THINK_CLOSE_TAG)
+                if idx != -1:
+                    pre = window[:idx]
+                    if pre:
+                        outputs.append(("reasoning_content", pre))
+                    window = window[idx + len(THINK_CLOSE_TAG):]
+                    mode = "content"
+                    continue
+                if len(window) > holdback:
+                    safe = window[:-holdback]
+                    if safe:
+                        outputs.append(("reasoning_content", safe))
+                    window = window[-holdback:]
+                break
+
+            think_idx = window.find(THINK_OPEN_TAG)
+            tool_idx = window.find(TOOL_OPEN_TAG)
+            hits = [(i, t) for i, t in ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+            if hits:
+                hits.sort()
+                idx, which = hits[0]
+                pre = window[:idx]
+                if pre:
+                    outputs.append(("content", pre))
+                if which == "think":
+                    window = window[idx + len(THINK_OPEN_TAG):]
+                    mode = "reasoning"
+                else:
+                    mode = "tool_buffer"
+                continue
+            if len(window) > holdback:
+                safe = window[:-holdback]
+                if safe:
+                    outputs.append(("content", safe))
+                window = window[-holdback:]
+            break
+
+        return outputs, window, mode
+
+    def flush_stream_deltas(window: str, mode: str):
+        if not window:
+            return []
+        if mode == "reasoning":
+            return [("reasoning_content", window)]
+        if mode == "content":
+            return [("content", window)]
+        return []
+
     # FIX 6: _collect_tokens_sync — non-streaming paths previously called
     # list(_token_stream(...)) directly (blocking the event loop) or used
     # an async comprehension over _astream_tokens inside daemon_lock
@@ -991,27 +1057,62 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cmd_line += f" snap={snap_prep[1]}:{snap_prep[0]}"
             return cmd_line + _samp_suffix(req) + "\n", snap_prep
 
-    def _confirm_or_abort_snap(n_tokens: int, full_snap_prep, snap_prep,
-                                  prompt_ids, cur_bin, cur_ids):
+    def _register_snap_ack(full_snap_prep, snap_prep):
+        if full_snap_prep is not None:
+            slot, _ = full_snap_prep
+            prefix = f"[snap] inline slot={slot} cur_pos="
+        elif snap_prep:
+            prefix = f"[snap] inline slot={snap_prep[0]} cur_pos="
+        else:
+            return None, None
+        return prefix, bus.register_waiter(prefix)
+
+    def _cancel_snap_ack(snap_ack_prefix, snap_ack) -> None:
+        if snap_ack_prefix is None or snap_ack is None:
+            return
+        bus.cancel_waiter(snap_ack_prefix, snap_ack)
+
+    async def _confirm_or_abort_snap(n_tokens: int, full_snap_prep, snap_prep,
+                                     prompt_ids, cur_bin, cur_ids,
+                                     snap_ack=None, snap_ack_prefix=None):
         """Confirm prefix-cache snapshots only when the daemon actually
         generated tokens.  When the daemon returns 0 tokens (e.g. empty
         prompt / file read failure), confirming would register a snapshot
         slot that was never written, corrupting future RESTORE commands."""
-        if n_tokens > 0:
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.confirm_full_snap(
-                    fslot, prompt_ids, cur_bin, len(cur_ids))
-            elif snap_prep:
-                prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
-        else:
-            # Abort: release the reservation without registering.
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.abort_full_snap(fslot)
-            elif snap_prep:
-                prefix_cache.abort_inline_snap(snap_prep[0])
-            log.warning("0 output tokens — aborted snapshot reservation")
+        ack_ok = snap_ack is None
+        try:
+            if snap_ack is not None:
+                try:
+                    await asyncio.wait_for(snap_ack, timeout=2.0)
+                    ack_ok = True
+                except Exception:
+                    ack_ok = False
+            if n_tokens > 0:
+                if full_snap_prep is not None:
+                    if ack_ok:
+                        fslot, _ = full_snap_prep
+                        prefix_cache.confirm_full_snap(
+                            fslot, prompt_ids, cur_bin, len(cur_ids))
+                    else:
+                        fslot, _ = full_snap_prep
+                        prefix_cache.abort_full_snap(fslot)
+                elif snap_prep:
+                    if ack_ok:
+                        prefix_cache.confirm_inline_snap(*snap_prep, cur_ids)
+                    else:
+                        prefix_cache.abort_inline_snap(snap_prep[0])
+            else:
+                # Abort: release the reservation without registering.
+                if full_snap_prep is not None:
+                    fslot, _ = full_snap_prep
+                    prefix_cache.abort_full_snap(fslot)
+                elif snap_prep:
+                    prefix_cache.abort_inline_snap(snap_prep[0])
+                log.warning("0 output tokens — aborted snapshot reservation")
+            if not ack_ok:
+                log.warning("snapshot reservation aborted: daemon never acknowledged inline snapshot")
+        finally:
+            _cancel_snap_ack(snap_ack_prefix, snap_ack)
 
     def _gen_len_for(prompt_len: int, max_tokens: int) -> int:
         return min(max_tokens, max_ctx - prompt_len - 20)
@@ -1044,11 +1145,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     timing = {}
                     full_snap_prep_ref = [None]
                     snap_prep = None
+                    snap_ack_prefix = None
+                    snap_ack = None
 
                     full_hit = prefix_cache.lookup_full(prompt_ids)
                     if full_hit is not None:
                         slot, cached_cur_bin, cached_cur_ids_len = full_hit
                         cur_bin = Path(cached_cur_bin)
+                        cur_ids = None
                         prompt_len = cached_cur_ids_len
                         started_in_thinking = False  # cached: no think prefill
                         gen_len = _gen_len_for(prompt_len, req.max_tokens)
@@ -1085,11 +1189,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         cmd_line, snap_prep = _build_cmd_line(
                             req, cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
+                        snap_ack_prefix, snap_ack = _register_snap_ack(
+                            full_snap_prep_ref[0], snap_prep)
 
                     # FIX 7: guard against dead daemon
                     try:
                         _write_cmd(cmd_line, timing)
                     except RuntimeError as e:
+                        _cancel_snap_ack(snap_ack_prefix, snap_ack)
                         yield f"data: {json.dumps({'error': str(e)})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
@@ -1251,9 +1358,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
 
-                    _confirm_or_abort_snap(
+                    await _confirm_or_abort_snap(
                         completion_tokens, full_snap_prep_ref[0], snap_prep,
-                        prompt_ids, cur_bin, cur_ids)
+                        prompt_ids, cur_bin, cur_ids, snap_ack, snap_ack_prefix)
                     _park_draft_if_lazy(timing)
 
                     yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
@@ -1284,6 +1391,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             timing = {}
             full_snap_prep_ref = [None]
             snap_prep = None
+            snap_ack_prefix = None
+            snap_ack = None
 
             full_hit = prefix_cache.lookup_full(prompt_ids)
             if full_hit is not None:
@@ -1317,18 +1426,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cmd_line, snap_prep = _build_cmd_line(
                     req, cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
+                snap_ack_prefix, snap_ack = _register_snap_ack(
+                    full_snap_prep_ref[0], snap_prep)
 
             try:
                 _write_cmd(cmd_line, timing)
             except RuntimeError as e:
+                _cancel_snap_ack(snap_ack_prefix, snap_ack)
                 return JSONResponse({"detail": str(e)}, status_code=503)
 
             # FIX 6: use run_in_executor instead of list() blocking event loop
             tokens = await _collect_tokens_sync(r_pipe, gen_len, timing)
 
-            _confirm_or_abort_snap(
+            await _confirm_or_abort_snap(
                 len(tokens), full_snap_prep_ref[0], snap_prep,
-                prompt_ids, cur_bin, cur_ids)
+                prompt_ids, cur_bin, cur_ids, snap_ack, snap_ack_prefix)
             _park_draft_if_lazy(timing)
 
         if full_hit is None:
@@ -1416,6 +1528,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     timing = {}
                     full_snap_prep_ref = [None]
                     snap_prep = None
+                    snap_ack_prefix = None
+                    snap_ack = None
 
                     full_hit = prefix_cache.lookup_full(prompt_ids)
                     if full_hit is not None:
@@ -1453,6 +1567,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                         cmd_line, snap_prep = _build_cmd_line(
                             req, cur_bin, cur_ids, gen_len, prefix_cache,
                             prompt_ids, full_snap_prep_ref, compression_fired)
+                        snap_ack_prefix, snap_ack = _register_snap_ack(
+                            full_snap_prep_ref[0], snap_prep)
 
                     message_start = {
                         "type": "message_start",
@@ -1468,6 +1584,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     try:
                         _write_cmd(cmd_line, timing)
                     except RuntimeError as e:
+                        _cancel_snap_ack(snap_ack_prefix, snap_ack)
                         yield f"event: error\ndata: {json.dumps({'type':'error','error':{'type':'server_error','message':str(e)}})}\n\n"
                         return
 
@@ -1521,9 +1638,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                 "stream ended before daemon sentinel; "
                                 "retaining prompt .bin for in-flight daemon read")
 
-                    _confirm_or_abort_snap(
+                    await _confirm_or_abort_snap(
                         out_tokens, full_snap_prep_ref[0], snap_prep,
-                        prompt_ids, cur_bin, cur_ids)
+                        prompt_ids, cur_bin, cur_ids, snap_ack, snap_ack_prefix)
                     _park_draft_if_lazy(timing)
 
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
@@ -1542,6 +1659,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
             timing = {}
             full_snap_prep_ref = [None]
             snap_prep = None
+            snap_ack_prefix = None
+            snap_ack = None
 
             full_hit = prefix_cache.lookup_full(prompt_ids)
             if full_hit is not None:
@@ -1577,19 +1696,22 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cmd_line, snap_prep = _build_cmd_line(
                     req, cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
+                snap_ack_prefix, snap_ack = _register_snap_ack(
+                    full_snap_prep_ref[0], snap_prep)
 
             try:
                 _write_cmd(cmd_line, timing)
             except RuntimeError as e:
+                _cancel_snap_ack(snap_ack_prefix, snap_ack)
                 return JSONResponse({"type": "error", "error": {"type": "server_error",
                                      "message": str(e)}}, status_code=503)
 
             # FIX 6: use run_in_executor — same fix as OpenAI non-streaming path
             tokens = await _collect_tokens_sync(r_pipe, gen_len, timing)
 
-            _confirm_or_abort_snap(
+            await _confirm_or_abort_snap(
                 len(tokens), full_snap_prep_ref[0], snap_prep,
-                prompt_ids, cur_bin, cur_ids)
+                prompt_ids, cur_bin, cur_ids, snap_ack, snap_ack_prefix)
             _park_draft_if_lazy(timing)
 
         if full_hit is None:
@@ -1819,10 +1941,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 cmd_line, snap_prep = _build_cmd_line(
                     chat_req, cur_bin, cur_ids, gen_len, prefix_cache,
                     prompt_ids, full_snap_prep_ref, compression_fired)
+                snap_ack_prefix, snap_ack = _register_snap_ack(
+                    full_snap_prep_ref[0], snap_prep)
 
             try:
                 _write_cmd(cmd_line, timing)
             except RuntimeError as e:
+                _cancel_snap_ack(snap_ack_prefix, snap_ack)
                 return JSONResponse({
                     "type": "error",
                     "error": {"type": "server_error", "message": str(e)}
@@ -1830,9 +1955,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
             tokens = await _collect_tokens_sync(r_pipe, gen_len, timing)
 
-            _confirm_or_abort_snap(
+            await _confirm_or_abort_snap(
                 len(tokens), full_snap_prep_ref[0], snap_prep,
-                prompt_ids, cur_bin, cur_ids)
+                prompt_ids, cur_bin, cur_ids, snap_ack, snap_ack_prefix)
             _park_draft_if_lazy(timing)
 
         if full_hit is None:
@@ -1909,11 +2034,14 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                 timing = {}
                 full_snap_prep_ref = [None]
                 snap_prep = None
+                snap_ack_prefix = None
+                snap_ack = None
 
                 full_hit = prefix_cache.lookup_full(prompt_ids)
                 if full_hit is not None:
                     slot, cached_cur_bin, cached_cur_ids_len = full_hit
                     cur_bin = Path(cached_cur_bin)
+                    cur_ids = None
                     prompt_len = cached_cur_ids_len
                     started_in_thinking = False
                     gen_len = _gen_len_for(prompt_len, chat_req.max_tokens)
@@ -1952,10 +2080,13 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                     cmd_line, snap_prep = _build_cmd_line(
                         chat_req, cur_bin, cur_ids, gen_len, prefix_cache,
                         prompt_ids, full_snap_prep_ref, compression_fired)
+                    snap_ack_prefix, snap_ack = _register_snap_ack(
+                        full_snap_prep_ref[0], snap_prep)
 
                 try:
                     _write_cmd(cmd_line, timing)
                 except RuntimeError as e:
+                    _cancel_snap_ack(snap_ack_prefix, snap_ack)
                     yield _resp_sse("error", {
                         "error": {"type": "server_error", "message": str(e)}})
                     return
@@ -2064,9 +2195,9 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                             "stream ended before daemon sentinel; "
                             "retaining prompt .bin for in-flight daemon read")
 
-                _confirm_or_abort_snap(
+                await _confirm_or_abort_snap(
                     completion_tokens, full_snap_prep_ref[0], snap_prep,
-                    prompt_ids, cur_bin, cur_ids)
+                    prompt_ids, cur_bin, cur_ids, snap_ack, snap_ack_prefix)
                 _park_draft_if_lazy(timing)
 
                 # Build final output items

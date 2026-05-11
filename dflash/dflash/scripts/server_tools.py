@@ -506,6 +506,24 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             if generated >= n_gen:
                 hit_stop = True
 
+    async def _collect_tokens_sync(r, n_gen) -> list[int]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: list(_token_stream(r, n_gen)))
+
+    def _confirm_or_abort_snap(n_tokens, full_snap_prep, snap_prep, prompt_ids, cur_bin, cur_ids):
+        if n_tokens > 0:
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
+            elif snap_prep:
+                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+        else:
+            if full_snap_prep is not None:
+                fslot, _ = full_snap_prep
+                prefix_cache.abort_full_snap(fslot)
+            elif snap_prep:
+                prefix_cache.abort_inline_snap(snap_prep[0])
+
     async def _drain_pipe_to_sentinel():
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, lambda: list(_token_stream(r_pipe, 0)))
@@ -607,12 +625,8 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                 cmd_line += "\n"
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
-            tokens = list(_token_stream(r_pipe, gen_len))
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-            elif snap_prep:
-                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+            tokens = await _collect_tokens_sync(r_pipe, gen_len)
+            _confirm_or_abort_snap(len(tokens), full_snap_prep, snap_prep, prompt_ids, cur_bin, cur_ids)
         if full_hit is None:
             try: cur_bin.unlink()
             except Exception: pass
@@ -851,11 +865,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                         try: prompt_bin.unlink()
                         except Exception: pass
 
-                if full_snap_prep is not None:
-                    fslot, _ = full_snap_prep
-                    prefix_cache.confirm_full_snap(fslot, prompt_ids, prompt_bin, len(cur_ids))
-                elif snap_prep:
-                    prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+                _confirm_or_abort_snap(completion_tokens, full_snap_prep, snap_prep, prompt_ids, prompt_bin, cur_ids)
 
                 yield f"data: {json.dumps(chunk({}, finish=finish_reason))}\n\n"
                 if include_usage:
@@ -1085,11 +1095,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
                             try: prompt_bin.unlink()
                             except Exception: pass
 
-                    if full_snap_prep is not None:
-                        fslot, _ = full_snap_prep
-                        prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-                    elif snap_prep:
-                        prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+                    _confirm_or_abort_snap(out_tokens, full_snap_prep, snap_prep, prompt_ids, cur_bin, cur_ids)
 
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
 
@@ -1130,11 +1136,7 @@ def build_app(target: Path, draft: Path, bin_path: Path, budget: int,
             daemon_proc.stdin.write(cmd_line.encode("utf-8"))
             daemon_proc.stdin.flush()
             tokens = [t async for t in _astream_tokens(r_pipe, gen_len)]
-            if full_snap_prep is not None:
-                fslot, _ = full_snap_prep
-                prefix_cache.confirm_full_snap(fslot, prompt_ids, cur_bin, len(cur_ids))
-            elif snap_prep:
-                prefix_cache.confirm_inline_snap(*snap_prep, prompt_ids)
+            _confirm_or_abort_snap(len(tokens), full_snap_prep, snap_prep, prompt_ids, cur_bin, cur_ids)
 
         if full_hit is None:
             try: cur_bin.unlink()
