@@ -474,7 +474,7 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         from grimoire.dflash.prefill import PrefillConfig
         self.PrefillConfig = PrefillConfig
 
-    def _run(self, prompt_ids, boundaries, keep_ratio=0.5, threshold=10):
+    def _run(self, prompt_ids, boundaries, keep_ratio=0.5, threshold=10, tail_budget=600):
         """Drive maybe_compress synchronously with a stub daemon."""
         import asyncio
         from grimoire.dflash.prefill import maybe_compress
@@ -492,7 +492,11 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
 
         daemon = StubDaemon(keep_ratio)
         cfg = self.PrefillConfig(
-            enabled=True, threshold=threshold, keep_ratio=keep_ratio, drafter_path="/dummy"
+            enabled=True,
+            threshold=threshold,
+            keep_ratio=keep_ratio,
+            drafter_path="/dummy",
+            tail_budget=tail_budget,
         )
         compressed, fired = asyncio.run(
             maybe_compress(prompt_ids, daemon, cfg, boundaries=boundaries)
@@ -500,23 +504,76 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         return compressed, fired, daemon
 
     def test_head_and_tail_are_preserved_byte_identical(self):
-        # 4000-token prompt: head [0:500), middle [500:3500), tail [3500:4000).
-        prompt_ids = list(range(4000))
-        head_end, tail_start = 500, 3500
-        # boundaries semantic: per-message end positions; helper drops final == len.
-        # So we feed [head_end, ..., tail_start, somewhere_in_tail].
-        boundaries = [head_end, 1500, 2500, tail_start, 3900]
+        # 3000-token prompt, 5 boundaries:
+        #   msg 0 ends at 200   (system / head)
+        #   msg 1 ends at 1500  (1300-tok turn — the middle to compress)
+        #   msg 2 ends at 2000  (500-tok turn)
+        #   msg 3 ends at 2500  (500-tok turn)
+        #   msg 4 ends at 2800  (300-tok turn — last user content)
+        # tail_budget=700: walking backwards, msg 4 (300) fits (tail=300), but
+        # adding msg 3 (500) → 800 > 700, so break at i=3 with compress_end =
+        # boundaries[2] = 2000. Protected tail spans msgs 3 and 4 (overshooting
+        # budget by msg 3's 500 tokens — intentional whole-turn protection).
+        prompt_ids = list(range(3000))
+        boundaries = [200, 1500, 2000, 2500, 2800]
+        expected_tail_start = 2000
         compressed, fired, daemon = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=1000
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=1000, tail_budget=700
         )
         self.assertTrue(fired)
         # Head untouched.
-        self.assertEqual(compressed[:head_end], prompt_ids[:head_end])
+        self.assertEqual(compressed[:200], prompt_ids[:200])
         # Tail untouched (slice from end since compressed length differs).
-        tail_len = len(prompt_ids) - tail_start
-        self.assertEqual(compressed[-tail_len:], prompt_ids[tail_start:])
-        # Daemon saw only the middle slice.
-        self.assertEqual(daemon.compress_called_with, prompt_ids[head_end:tail_start])
+        tail_len = len(prompt_ids) - expected_tail_start
+        self.assertEqual(compressed[-tail_len:], prompt_ids[expected_tail_start:])
+        # Daemon saw only the middle slice (head_end .. tail_start).
+        self.assertEqual(daemon.compress_called_with, prompt_ids[200:expected_tail_start])
+
+    def test_all_turns_fit_in_tail_budget_no_compression(self):
+        # 4 boundaries totalling 1500 tokens of conversation, tail_budget=2000:
+        # the loop's else clause fires, compress_end == compress_start, no compress.
+        prompt_ids = list(range(2500))
+        boundaries = [500, 1000, 1500, 2000]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=2000
+        )
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+        self.assertIsNone(daemon.compress_called_with)
+
+    def test_single_huge_last_turn_overshoots_budget(self):
+        # Last turn alone is 3000 tokens, tail_budget=500. The first iteration
+        # of the backwards walk sees turn_len > budget and breaks immediately,
+        # setting compress_end = boundaries[-2]. The huge turn is still protected
+        # (intentional overshoot — never truncate mid-turn).
+        prompt_ids = list(range(4500))
+        boundaries = [100, 600, 1100, 1400, 4400]  # last turn = 4400-1400 = 3000
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=500
+        )
+        self.assertTrue(fired)
+        # Tail begins at boundaries[-2]=1400; everything from there onwards intact.
+        tail_len = len(prompt_ids) - 1400
+        self.assertEqual(compressed[-tail_len:], prompt_ids[1400:])
+        # Middle is [100:1400] (msgs 1..3).
+        self.assertEqual(daemon.compress_called_with, prompt_ids[100:1400])
+
+    def test_tail_walk_accumulates_until_break(self):
+        # 6 boundaries; tail_budget=900 accommodates msg5 (200) + msg4 (300) +
+        # msg3 (200) = 700, but msg2 (500) would push to 1200 > 900 → break at
+        # i=2, compress_end = boundaries[1] = 1300. (Middle = [100:1300] = 1200
+        # tokens, large enough to clear the 1024-min-middle short-circuit.)
+        prompt_ids = list(range(3000))
+        boundaries = [100, 1300, 1800, 2000, 2300, 2500]
+        compressed, fired, daemon = self._run(
+            prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=900
+        )
+        self.assertTrue(fired)
+        # Tail starts at boundaries[1] = 1300 (msgs 2..5 + generation suffix).
+        tail_len = len(prompt_ids) - 1300
+        self.assertEqual(compressed[-tail_len:], prompt_ids[1300:])
+        # Middle is [100:1300] (msg 1 only).
+        self.assertEqual(daemon.compress_called_with, prompt_ids[100:1300])
 
     def test_skip_when_middle_too_small(self):
         # Middle < 1024 → no compression even if threshold is exceeded.
