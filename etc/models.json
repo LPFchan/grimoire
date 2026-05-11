@@ -77,7 +77,7 @@
       "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
       "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
-      "tokenizer": "Qwen/Qwen3.6-27B",
+      "tokenizer": "tokenizers/qwen3.6-27B",
       "tokenizer-trust-remote-code": true,
       "stop-strings": ["<|im_end|>"],
       "family": "qwen",

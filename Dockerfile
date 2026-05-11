@@ -120,7 +120,8 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES=86 \
         -DDFLASH27B_TESTS=OFF \
-        -DDFLASH27B_FA_ALL_QUANTS=ON; \
+        -DDFLASH27B_FA_ALL_QUANTS=ON \
+        -DDFLASH27B_ENABLE_BSA=ON; \
     cmake --build /app/.cache/dflash-build/build \
         --target dflash --parallel "$(nproc)"; \
     mkdir -p /opt/dflash; \
@@ -226,12 +227,16 @@ COPY --from=dflash-build /opt/dflash /opt/dflash
 # Copy built llama.cpp webui
 COPY --from=webui /opt/grimoire-webui /opt/grimoire-webui
 
-# Copy jinja chat templates (for huihui/super gemma variants)
+ # Copy jinja chat templates (for huihui/super gemma variants)
 COPY templates/ /templates/
 
 # Create registry and state directories
 RUN mkdir -p /etc/grimoire /var/lib/grimoire
 COPY etc/models.json /etc/grimoire/models.json
+
+# Tokenizer files are mounted at runtime via /models volume (see compose)
+# No COPY needed — the dflash model config points to 'tokenizers/qwen3.6-27B'
+# which resolves to /models/tokenizers/qwen3.6-27B via MODELS_DIR
 
 # Install Python dependencies
 COPY pyproject.toml README.md /app/
