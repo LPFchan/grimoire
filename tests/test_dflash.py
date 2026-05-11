@@ -624,11 +624,14 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
 
 
 class SessionKVTests(unittest.TestCase):
-    """SessionKV maps conversation_id -> (slot, prefix_len) for cross-turn KV reuse."""
+    """SessionKV maps conversation_id -> (slot, prefix_len, prefix_hash) for cross-turn KV reuse."""
+
+    # Long enough to cover every prefix_len used by these tests.
+    PROMPT = list(range(256))
 
     def test_get_session_returns_none_for_unknown_conv(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        self.assertIsNone(sk.get_session("nope"))
+        self.assertIsNone(sk.get_session("nope", []))
 
     def test_reserve_slot_uses_offset_for_cold_cache(self):
         sk = SessionKV(cap=2, prefix_cap=2)
@@ -638,9 +641,9 @@ class SessionKVTests(unittest.TestCase):
     def test_reserve_then_update_keeps_consecutive_slots_distinct(self):
         sk = SessionKV(cap=2, prefix_cap=2)
         slot_a = sk.reserve_slot()
-        sk.update("a", slot_a, prefix_len=100)
+        sk.update("a", slot_a, 100, self.PROMPT)
         slot_b = sk.reserve_slot()
-        sk.update("b", slot_b, prefix_len=200)
+        sk.update("b", slot_b, 200, self.PROMPT)
         self.assertNotEqual(slot_a, slot_b)
         self.assertEqual({slot_a, slot_b}, {2, 3})
 
@@ -648,12 +651,12 @@ class SessionKVTests(unittest.TestCase):
         # Regression: reserve_slot used to compute idx=len(sessions) after
         # popping the LRU, which gave the SAME slot as the surviving MRU
         # session. Two conversations ended up mapped to one daemon slot and
-        # the survivor's snapshot was clobbered on the next snapshot_at.
+        # the survivor's snapshot was clobbered on the next snapshot.
         sk = SessionKV(cap=2, prefix_cap=2)
         slot_a = sk.reserve_slot()
-        sk.update("a", slot_a, prefix_len=100)
+        sk.update("a", slot_a, 100, self.PROMPT)
         slot_b = sk.reserve_slot()
-        sk.update("b", slot_b, prefix_len=200)
+        sk.update("b", slot_b, 200, self.PROMPT)
         # 'a' is LRU; reserving for 'c' must evict 'a' and reuse its slot.
         slot_c = sk.reserve_slot()
         self.assertEqual(slot_c, slot_a, "evicted slot should be reused")
@@ -661,35 +664,61 @@ class SessionKVTests(unittest.TestCase):
 
     def test_get_session_promotes_lru(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 10)
-        sk.update("b", 3, 20)
+        sk.update("a", 2, 10, self.PROMPT)
+        sk.update("b", 3, 20, self.PROMPT)
         # Touching 'a' promotes it; 'b' is now LRU and gets evicted on next reserve.
-        sk.get_session("a")
+        sk.get_session("a", self.PROMPT)
         slot_c = sk.reserve_slot()
-        sk.update("c", slot_c, 30)
-        self.assertIsNone(sk.get_session("b"))
-        self.assertIsNotNone(sk.get_session("a"))
+        sk.update("c", slot_c, 30, self.PROMPT)
+        self.assertIsNone(sk.get_session("b", self.PROMPT))
+        self.assertIsNotNone(sk.get_session("a", self.PROMPT))
 
     def test_evict_is_idempotent(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 10)
+        sk.update("a", 2, 10, self.PROMPT)
         sk.evict("a")
         sk.evict("a")  # Must not raise.
-        self.assertIsNone(sk.get_session("a"))
+        self.assertIsNone(sk.get_session("a", self.PROMPT))
 
     def test_clear_drops_all_state(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 10)
-        sk.update("b", 3, 20)
+        sk.update("a", 2, 10, self.PROMPT)
+        sk.update("b", 3, 20, self.PROMPT)
         sk.clear()
-        self.assertIsNone(sk.get_session("a"))
-        self.assertIsNone(sk.get_session("b"))
+        self.assertIsNone(sk.get_session("a", self.PROMPT))
+        self.assertIsNone(sk.get_session("b", self.PROMPT))
         # After clear, reservations restart from offset.
         self.assertEqual(sk.reserve_slot(), 2)
 
     def test_cap_zero_disables_reservation(self):
         sk = SessionKV(cap=0, prefix_cap=2)
         self.assertIsNone(sk.reserve_slot())
+
+    def test_get_session_accepts_extended_prompt(self):
+        # Continuation: the next-turn prompt is the cached prefix plus a delta.
+        sk = SessionKV(cap=2, prefix_cap=2)
+        cached = list(range(100))
+        sk.update("a", 2, 50, cached)
+        extended = cached + list(range(100, 150))
+        self.assertEqual(sk.get_session("a", extended), (2, 50))
+
+    def test_get_session_evicts_on_hash_mismatch(self):
+        # In-place edit: same conversation_id, but tokens within the cached
+        # prefix changed. Must NOT restore stale KV.
+        sk = SessionKV(cap=2, prefix_cap=2)
+        original = list(range(100))
+        sk.update("a", 2, 50, original)
+        edited = original[:10] + list(range(1000, 1040)) + original[50:]
+        self.assertIsNone(sk.get_session("a", edited))
+        # The mismatch evicted the entry — even the original prompt now misses.
+        self.assertIsNone(sk.get_session("a", original))
+
+    def test_get_session_evicts_when_prompt_shorter_than_prefix(self):
+        # Truncation: caller retried with a shorter prompt than the cached
+        # prefix. The snapshot can't possibly match; evict.
+        sk = SessionKV(cap=2, prefix_cap=2)
+        sk.update("a", 2, 100, list(range(200)))
+        self.assertIsNone(sk.get_session("a", list(range(50))))
 
 
 class DflashProxyIntegrationTests(unittest.TestCase):
