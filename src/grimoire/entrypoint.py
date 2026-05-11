@@ -1552,7 +1552,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             # Session KV: check if this conversation has a cached snapshot.
             # If hit, RESTORE from that slot — only prefill the new delta.
             if conversation_id and sk:
-                sess = sk.get_session(conversation_id)
+                sess = sk.get_session(conversation_id, effective_ids)
                 if sess is not None:
                     prefix_hit = (sess[0], sess[1])
                     session_slot = sess[0]
@@ -1623,7 +1623,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             if session_slot is not None and tokens_emitted:
                 try:
                     daemon.snapshot_at(session_slot, len(effective_ids))
-                    sk.update(conversation_id, session_slot, len(effective_ids))
+                    sk.update(conversation_id, session_slot, len(effective_ids), effective_ids)
                 except Exception as e:
                     logger.warning(f"session snapshot failed: {e}")
                     sk.evict(conversation_id)

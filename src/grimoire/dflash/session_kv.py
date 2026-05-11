@@ -1,13 +1,19 @@
 """Session-aware KV management for DFlash models.
 
-Maps conversation_id -> (slot, prefix_len) so continuation turns only prefill
-the delta (new messages since last turn) instead of the full prompt.
+Maps conversation_id -> (slot, prefix_len, prefix_hash) so continuation turns
+only prefill the delta (new messages since last turn) instead of the full
+prompt. The hash is a truncated SHA-1 of the cached token prefix; on a
+returning conversation the caller validates that the current prompt still
+starts with that prefix before restoring. If content was edited/regenerated
+in place, the hash mismatch causes eviction and a full prefill fallback.
 
 After each generation, a snapshot is taken at len(effective_ids) so the next
 turn can RESTORE from it.
 """
 
+import hashlib
 import logging
+import struct
 from collections import OrderedDict
 from typing import Optional
 
@@ -20,12 +26,23 @@ SESSION_SLOT_OFFSET = 2
 DEFAULT_SESSION_CAP = 2
 
 
+def _prefix_hash(prompt_ids: list) -> bytes:
+    """Compute a 12B truncated hash of a token prefix."""
+    h = hashlib.sha1()
+    h.update(struct.pack("<I", len(prompt_ids)))
+    h.update(struct.pack(f"<{len(prompt_ids)}i", *prompt_ids))
+    return h.digest()[:12]
+
+
 class SessionKV:
     """Manages per-conversation KV snapshot slots.
 
-    Tracks which slot each conversation owns and the prefix length
-    (position of the last snapshot). On a returning conversation, the caller
-    can RESTORE that slot and only prefill the new delta tokens.
+    Tracks which slot each conversation owns, the prefix length
+    (position of the last snapshot), and a content hash of the cached token
+    prefix. On a returning conversation, the caller validates the hash
+    against the current prompt before restoring. Content edits, truncations,
+    or regenerations with the same conversation_id will cause a hash mismatch
+    and trigger a full prefill fallback instead of corrupting generation.
 
     Args:
         cap: Maximum concurrent session slots.
@@ -36,23 +53,39 @@ class SessionKV:
     def __init__(self, cap: int = DEFAULT_SESSION_CAP, prefix_cap: int = SESSION_SLOT_OFFSET):
         self.cap = cap
         self.slot_offset = prefix_cap
-        # LRU: conversation_id -> (slot, prefix_len)
+        # LRU: conversation_id -> (slot, prefix_len, prefix_hash)
         self.sessions: OrderedDict[str, tuple] = OrderedDict()
 
     def _slot_for_index(self, index: int) -> int:
         """Return daemon slot ID for session index 0..cap-1."""
         return (self.slot_offset + index) % 8
 
-    def get_session(self, conversation_id: str) -> Optional[tuple]:
-        """Get cached slot for a conversation, or None.
+    def get_session(self, conversation_id: str, prompt_ids: list) -> Optional[tuple]:
+        """Get cached slot for a conversation if the prompt prefix matches.
 
-        Returns (slot, prefix_len) if the conversation has an active
-        snapshot slot. Moves the entry to the end (LRU).
+        Returns (slot, prefix_len) if the conversation has an active snapshot
+        slot AND the current prompt starts with the same prefix that was
+        cached. Returns None on miss or hash mismatch (stale snapshot).
+
+        Args:
+            conversation_id: The conversation identifier.
+            prompt_ids: Current full prompt token IDs (used for hash validation).
         """
         if conversation_id not in self.sessions:
             return None
         self.sessions.move_to_end(conversation_id)
-        return self.sessions[conversation_id]
+        slot, prefix_len, prefix_hash = self.sessions[conversation_id]
+        # Validate: current prompt must start with the cached prefix.
+        if len(prompt_ids) < prefix_len:
+            logger.debug(f"session kv: prompt shorter than cached prefix ({len(prompt_ids)} < {prefix_len}), evicting")
+            self.sessions.pop(conversation_id)
+            return None
+        current_hash = _prefix_hash(prompt_ids[:prefix_len])
+        if current_hash != prefix_hash:
+            logger.debug(f"session kv: hash mismatch for {conversation_id[:8]}, evicting stale snapshot")
+            self.sessions.pop(conversation_id)
+            return None
+        return (slot, prefix_len)
 
     def reserve_slot(self) -> Optional[int]:
         """Reserve a slot for a new session, evicting LRU if full.
@@ -78,9 +111,17 @@ class SessionKV:
                 return slot
         return None
 
-    def update(self, conversation_id: str, slot: int, prefix_len: int) -> None:
-        """Record or update the snapshot position for a conversation."""
-        self.sessions[conversation_id] = (slot, prefix_len)
+    def update(self, conversation_id: str, slot: int, prefix_len: int, prompt_ids: list) -> None:
+        """Record or update the snapshot position and content hash.
+
+        Args:
+            conversation_id: The conversation identifier.
+            slot: Daemon slot ID that holds the snapshot.
+            prefix_len: Number of tokens captured in the snapshot.
+            prompt_ids: Full prompt token IDs (used to compute content hash).
+        """
+        prefix_hash = _prefix_hash(prompt_ids[:prefix_len])
+        self.sessions[conversation_id] = (slot, prefix_len, prefix_hash)
         self.sessions.move_to_end(conversation_id)
 
     def evict(self, conversation_id: str) -> None:
