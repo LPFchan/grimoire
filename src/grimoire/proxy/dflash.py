@@ -242,59 +242,73 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
                 try:
                     index = 0
+                    hit_stop = False
                     while True:
                         tok = await asyncio.to_thread(daemon.read_next_token)
                         if tok is None:
                             break
                         if tok in stop_ids:
+                            hit_stop = True
                             break
-                        tokens_emitted.append(tok)
-                        stop_hit = False
-                        for seq_len in stop_seq_lens:
-                            if len(tokens_emitted) < seq_len:
-                                continue
-                            if tuple(tokens_emitted[-seq_len:]) in stop_seqs:
-                                del tokens_emitted[-seq_len:]
-                                stop_hit = True
+
+                        # Collect tokens up to max_tokens, but keep draining
+                        # the daemon stream so the -1 sentinel is consumed and
+                        # the pipe is clean for the next request.
+                        if len(tokens_emitted) < max_tokens:
+                            tokens_emitted.append(tok)
+                            stop_hit = False
+                            for seq_len in stop_seq_lens:
+                                if len(tokens_emitted) < seq_len:
+                                    continue
+                                if tuple(tokens_emitted[-seq_len:]) in stop_seqs:
+                                    del tokens_emitted[-seq_len:]
+                                    stop_hit = True
+                                    break
+
+                            if stop_hit:
+                                # The trim may have removed tokens we already emitted
+                                # bytes for; re-decode against the shortened buffer
+                                # and reconcile decoded_prefix so the final usage
+                                # text matches what's actually in tokens_emitted.
+                                read_offset = min(read_offset, len(tokens_emitted))
+                                prefix_offset = min(prefix_offset, read_offset)
+                                final_text = _decode(0, len(tokens_emitted))
+                                if len(final_text) > len(decoded_prefix):
+                                    delta = final_text[len(decoded_prefix):]
+                                    decoded_prefix = final_text
+                                    frame = _delta_sse(completion_id, created, delta, index)
+                                    index += 1
+                                    yield f"data: {json.dumps(frame)}\n\n".encode()
+                                else:
+                                    decoded_prefix = final_text
+                                read_offset = len(tokens_emitted)
+                                prefix_offset = read_offset
+                                hit_stop = True
                                 break
 
-                        if stop_hit:
-                            # The trim may have removed tokens we already emitted
-                            # bytes for; re-decode against the shortened buffer
-                            # and reconcile decoded_prefix so the final usage
-                            # text matches what's actually in tokens_emitted.
-                            read_offset = min(read_offset, len(tokens_emitted))
-                            prefix_offset = min(prefix_offset, read_offset)
-                            final_text = _decode(0, len(tokens_emitted))
-                            if len(final_text) > len(decoded_prefix):
-                                delta = final_text[len(decoded_prefix):]
-                                decoded_prefix = final_text
+                            # Wait for a complete UTF-8 sequence before emitting:
+                            # multi-byte chars can straddle BPE/SentencePiece pieces,
+                            # so we keep accumulating while the window still ends in
+                            # the replacement char U+FFFD.
+                            prefix_text = _decode(prefix_offset, read_offset)
+                            new_text = _decode(prefix_offset, len(tokens_emitted))
+                            if not new_text.endswith("�") and len(new_text) > len(prefix_text):
+                                delta = new_text[len(prefix_text):]
+                                decoded_prefix += delta
+                                prefix_offset = read_offset
+                                read_offset = len(tokens_emitted)
                                 frame = _delta_sse(completion_id, created, delta, index)
                                 index += 1
                                 yield f"data: {json.dumps(frame)}\n\n".encode()
-                            else:
-                                decoded_prefix = final_text
-                            read_offset = len(tokens_emitted)
-                            prefix_offset = read_offset
-                            break
 
-                        # Wait for a complete UTF-8 sequence before emitting:
-                        # multi-byte chars can straddle BPE/SentencePiece pieces,
-                        # so we keep accumulating while the window still ends in
-                        # the replacement char U+FFFD.
-                        prefix_text = _decode(prefix_offset, read_offset)
-                        new_text = _decode(prefix_offset, len(tokens_emitted))
-                        if not new_text.endswith("�") and len(new_text) > len(prefix_text):
-                            delta = new_text[len(prefix_text):]
-                            decoded_prefix += delta
-                            prefix_offset = read_offset
-                            read_offset = len(tokens_emitted)
-                            frame = _delta_sse(completion_id, created, delta, index)
-                            index += 1
-                            yield f"data: {json.dumps(frame)}\n\n".encode()
-
-                        if len(tokens_emitted) >= max_tokens:
-                            break
+                    # If we broke early (stop hit, max_tokens), drain the
+                    # daemon's remaining tokens and the -1 sentinel so the
+                    # pipe is clean for the next request.
+                    if hit_stop:
+                        while True:
+                            leftover = await asyncio.to_thread(daemon.read_next_token)
+                            if leftover is None:
+                                break
 
                     # Flush any complete bytes still trapped in the sliding
                     # window (loop exited via EOS, max_tokens, or pipe close —
@@ -317,6 +331,16 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 tps = len(tokens_emitted) / elapsed
+
+                # Detect silent failures where no tokens were emitted.
+                if not tokens_emitted and max_tokens > 0:
+                    yield _sse_error_frames(
+                        completion_id, created,
+                        "DFlash generation failed: model produced zero tokens. "
+                        "This usually means the context size + budget combination "
+                        "exceeds available VRAM. Try reducing ctx-size or budget.",
+                    )
+                    return
 
                 if tokens_emitted or had_session:
                     try:
@@ -406,6 +430,17 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         from grimoire.proxy.sse import _extract_assistant_text, _extract_usage
         text = _extract_assistant_text(bytes(body))
         usage = _extract_usage(bytes(body)) or {"input_tokens": len(effective_ids), "output_tokens": 0}
+
+        # Detect silent dflash failures (e.g. OOM during decode) that produce
+        # no tokens and empty content but don't raise an exception.
+        if not text and usage["output_tokens"] == 0 and max_tokens > 0:
+            raise HTTPException(
+                status_code=503,
+                detail="DFlash generation failed: model produced zero tokens. "
+                       "This usually means the context size + budget combination "
+                       "exceeds available VRAM. Try reducing ctx-size or budget.",
+            )
+
         return JSONResponse({
             "id": completion_id,
             "object": "chat.completion",
