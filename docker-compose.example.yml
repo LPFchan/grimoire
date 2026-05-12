@@ -5,6 +5,7 @@ services:
     container_name: grimoire
     mem_limit: 28g
     memswap_limit: 28g
+    oom_score_adj: 500
     ports:
       - "9001:9001"
     volumes:
