@@ -56,14 +56,15 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
       "tokenizer": "tokenizers/qwen3.6-27B",
       "ctx-size": 262144,
+      "max-raw-context": 100000,
       "budget": 22,
-      "cache-type-k": "tq3_0",
-      "cache-type-v": "tq3_0",
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
       "prefix-cache-slots": 2,
       "session-kv-slots": 2,
-      "prefill-threshold": 95000,
-      "prefill-keep-ratio": 0.10,
-      "prefill-tail-budget": 76500,
+      "prefill-threshold": 48000,
+      "prefill-keep-ratio": 0.05,
+      "prefill-tail-budget": 16000,
       "prefill-compression": "auto"
     }
   },
@@ -85,10 +86,11 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 | `drafter` | Compression scorer GGUF (1.2 GB, parked except during compression) |
 | `tokenizer` | Local tokenizer dir |
 | `budget` | DDTree page pool (22 = 262K ctx) |
+| `max-raw-context` | Hard cap for raw prompt tokens before compression |
 | `prefix-cache-slots` | VRAM slots for prefix cache snapshots |
 | `session-kv-slots` | VRAM slots for per-session KV snapshots |
 | `prefill-threshold` | Token count to trigger PFlash compression |
-| `prefill-keep-ratio` | Middle keep fraction (0.10 = 10%) |
+| `prefill-keep-ratio` | Middle keep fraction (0.05 = 5%) |
 | `prefill-tail-budget` | Protected tail tokens (uncompressed) |
 | `prefill-compression` | `"auto"` or `"never"` |
 
@@ -100,9 +102,9 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 
 ```
 target weights:                  16.0 GB  (resident)
-active KV (tq3_0, 25KB/token):   variable
+active KV (q8_0):                variable
 session KV snapshots (×2):        variable  (mirrors active)
-prefix cache (15K head):          0.375 GB  (fixed)
+prefix cache:                      variable
 ───────────────────────────────────────────────
 remaining budget:                 8.0 GB
 ```
@@ -111,21 +113,22 @@ remaining budget:                 8.0 GB
 vram = 16.0 + effective_tokens × 25000 × 3 / 1e9 + 0.375  ≤ 23.5 GB
 ```
 
-`effective_tokens = head(15K) + middle_raw × keep_ratio + tail_budget`
+`effective_tokens = protected_head + protected_tool_blocks + middle_raw × keep_ratio + protected_tail`
 
 ### PFlash Compression
 
 Prompt split on `len(prompt_ids) >= prefill_threshold`:
 
 ```
-[ HEAD: 15K fixed ── sysprompt + compaction ]
-[ MIDDLE: compressed at 10% via drafter      ]
-[ TAIL:   protected, uncompressed             ]
+[ HEAD: system + first user block             ]
+[ MIDDLE: compressible blocks at 5%           ]
+[ TAIL: protected recent whole blocks         ]
+[ TOOLS: protected tool blocks stay exact     ]
 ```
 
-Head/tail always uncompressed. Middle scored by drafter (loads 1.2 GB, ~2s, parks).
+Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressible middle blocks are scored by the drafter (loads 1.2 GB, ~2s, parks).
 
-**Tuned values**: threshold=95000, tail=76500 (Opus 4.7). Leaves ~10K gap → 100+ turns between compressions. GPT-5.5 recommends tail=61428 for 200K+ stress safety.
+**Tuned values**: `max-raw-context=100000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`.
 
 ### Session KV
 
