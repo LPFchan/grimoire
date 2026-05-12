@@ -11,6 +11,7 @@
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
+      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
@@ -39,6 +40,7 @@
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
+      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
@@ -69,6 +71,7 @@
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
+      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
