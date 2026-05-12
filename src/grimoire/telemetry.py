@@ -239,33 +239,33 @@ def _read_cpu_power():
 
 
 def _read_system_ram_mb():
-	"""Read total system RAM usage from /proc/meminfo (MB)."""
-	try:
-		with open("/proc/meminfo") as f:
-			lines = dict(
-				line.split(":", 1) for line in f.read().strip().splitlines() if ":" in line
-			)
-		total = float(lines.get("MemTotal", "0 kB").strip().split()[0])
-		available = float(lines.get("MemAvailable", "0 kB").strip().split()[0])
-		return (total - available) / 1024.0
-	except (OSError, ValueError, KeyError):
-		return None
+    """Read total system RAM usage from /proc/meminfo (MB)."""
+    try:
+        with open("/proc/meminfo") as f:
+            lines = dict(
+                line.split(":", 1) for line in f.read().strip().splitlines() if ":" in line
+            )
+        total = float(lines.get("MemTotal", "0 kB").strip().split()[0])
+        available = float(lines.get("MemAvailable", "0 kB").strip().split()[0])
+        return (total - available) / 1024.0
+    except (OSError, ValueError, KeyError):
+        return None
 
 
 def _read_container_ram_mb():
-	"""Read container memory usage from cgroup v2 (MB)."""
-	try:
-		with open("/sys/fs/cgroup/memory.current") as f:
-			return int(f.read().strip()) / (1024 * 1024)
-	except (OSError, ValueError):
-		return None
+    """Read container memory usage from cgroup v2 (MB)."""
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            return int(f.read().strip()) / (1024 * 1024)
+    except (OSError, ValueError):
+        return None
 
 
 def _read_fan_rpm():
-	"""Read fan1_input and fan2_input from the main fan-controller hwmon chip.
+    """Read fan1_input and fan2_input from the main fan-controller hwmon chip.
 
-	Returns a list of (fan_index, metric, rpm) tuples, or empty list.
-	"""
+    Returns a list of (fan_index, metric, rpm) tuples, or empty list.
+    """
     for hw_dir in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
         try:
             with open(os.path.join(hw_dir, "name")) as f:
@@ -297,14 +297,14 @@ def collect_one_sample():
     cpu_power = _read_cpu_power()
     if cpu_power is not None and cpu_power >= 0:
         rows.append((0, "cpu_power", cpu_power))
-	for fan_idx, metric, rpm in _read_fan_rpm():
-		rows.append((0, metric, rpm))
-	sys_ram = _read_system_ram_mb()
-	if sys_ram is not None:
-		rows.append((0, "system_ram_mb", sys_ram))
-	ctr_ram = _read_container_ram_mb()
-	if ctr_ram is not None:
-		rows.append((0, "container_ram_mb", ctr_ram))
+    for fan_idx, metric, rpm in _read_fan_rpm():
+        rows.append((0, metric, rpm))
+    sys_ram = _read_system_ram_mb()
+    if sys_ram is not None:
+        rows.append((0, "system_ram_mb", sys_ram))
+    ctr_ram = _read_container_ram_mb()
+    if ctr_ram is not None:
+        rows.append((0, "container_ram_mb", ctr_ram))
     if rows:
         telemetry_store.record(time.time(), rows)
     return rows
