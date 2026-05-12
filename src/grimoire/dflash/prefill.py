@@ -208,11 +208,11 @@ async def maybe_compress(
         return prompt_ids, False, materialize_blocks(prompt_ids, raw_blocks)
 
     protected_indexes = _protected_block_indexes(raw_blocks, config.tail_budget)
-    compressible_indexes = [
+    compressible_indexes = {
         index
         for index, block in enumerate(raw_blocks)
         if index not in protected_indexes and block.token_count >= 256
-    ]
+    }
 
     total_compressible = sum(raw_blocks[index].token_count for index in compressible_indexes)
     if total_compressible < 1024:
@@ -264,9 +264,10 @@ async def maybe_compress(
         cursor += len(compressed_ids)
 
     elapsed = time.monotonic() - t0
+    total_compressed = sum(block.token_count for block in effective_blocks if block.compressed)
     logger.info(
-        f"pflash blocks {total_compressible} -> {sum(block.token_count for block in effective_blocks if block.compressed)} tokens "
-        f"({total_compressible / max(sum(block.token_count for block in effective_blocks if block.compressed), 1):.1f}x, "
+        f"pflash blocks {total_compressible} -> {total_compressed} tokens "
+        f"({total_compressible / max(total_compressed, 1):.1f}x, "
         f"total {len(prompt_ids)} -> {len(compressed)}) in {elapsed:.1f}s"
     )
 
