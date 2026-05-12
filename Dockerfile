@@ -118,15 +118,15 @@ RUN --mount=type=cache,target=/root/.ccache \
     set -eux; \
     cd /app/dflash-hub/dflash; \
     rm -f .git && git init && git add -A && git -c user.name=build -c user.email=build commit -qm snapshot; \
-	git submodule update --init --recursive; \
+    git submodule update --init --recursive; \
     cmake -B /app/.cache/dflash-build/build -S . \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES=86 \
         -DDFLASH27B_TESTS=ON \
         -DDFLASH27B_FA_ALL_QUANTS=ON \
         -DDFLASH27B_ENABLE_BSA=ON; \
-	cmake --build /app/.cache/dflash-build/build \
-		--target test_dflash --parallel "$(nproc)"; \
+    cmake --build /app/.cache/dflash-build/build \
+        --target test_dflash --parallel "$(nproc)"; \
     mkdir -p /opt/dflash; \
     cp /app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash; \
     cp -r /app/.cache/dflash-build/build/lib/* /opt/dflash/ 2>/dev/null || true

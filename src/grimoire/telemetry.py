@@ -253,19 +253,19 @@ def _read_system_ram_mb():
 
 
 def _read_container_ram_mb():
-	"""Read container anonymous memory from cgroup v2 memory.stat (MB)."""
-	try:
-		with open("/sys/fs/cgroup/memory.stat") as f:
-			for line in f:
-				if line.startswith("anon "):
-					return int(line.split()[1]) / (1024 * 1024)
-	except (OSError, ValueError):
-		pass
-	try:
-		with open("/sys/fs/cgroup/memory.current") as f:
-			return int(f.read().strip()) / (1024 * 1024)
-	except (OSError, ValueError):
-		return None
+    """Read container anonymous memory from cgroup v2 memory.stat (MB)."""
+    try:
+        with open("/sys/fs/cgroup/memory.stat") as f:
+            for line in f:
+                if line.startswith("anon "):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except (OSError, ValueError):
+        pass
+    try:
+        with open("/sys/fs/cgroup/memory.current") as f:
+            return int(f.read().strip()) / (1024 * 1024)
+    except (OSError, ValueError):
+        return None
 
 
 def _read_fan_rpm():
