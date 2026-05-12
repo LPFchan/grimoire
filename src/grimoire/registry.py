@@ -53,7 +53,7 @@ def _looks_like_local_path(spec: str) -> bool:
         return True
     if spec.startswith("./") or spec.startswith("../"):
         return True
-    return spec.count(os.sep) >= 2
+    return os.sep in spec
 
 
 class ModelRegistry:
