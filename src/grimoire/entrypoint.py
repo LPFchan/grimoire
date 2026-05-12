@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import copy
 import ctypes
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 import hmac
 import json
@@ -71,6 +72,7 @@ def _env_bool(name, default=False):
 DEFAULT_STARTUP_TIMEOUT = _env_int("GRIMOIRE_STARTUP_TIMEOUT", 600)
 MAX_HISTORY_CAPTURE_BYTES = _env_int("GRIMOIRE_HISTORY_CAPTURE_BYTES", 2 * 1024 * 1024)
 MAX_USAGE_CAPTURE_BYTES = _env_int("GRIMOIRE_USAGE_CAPTURE_BYTES", 1024 * 1024)
+QWEN_PROMPT_BLOCK_CACHE_SIZE = max(0, _env_int("GRIMOIRE_QWEN_PROMPT_BLOCK_CACHE_SIZE", 2048))
 LEGACY_STATS_PATH = os.environ.get("GRIMOIRE_LEGACY_STATS_PATH", "/var/lib/grimoire/token-stats.json")
 ALLOW_ANONYMOUS = _env_bool("GRIMOIRE_ALLOW_ANONYMOUS", False)
 WEBUI_DIR = os.environ.get("GRIMOIRE_WEBUI_DIR", "/opt/grimoire-webui")
@@ -288,6 +290,7 @@ class ActiveModel:
         self.session_kv: Optional[SessionKV] = None
         self.snapshot_swap: Optional[SnapshotSwap] = None
         self._tokenizer = None
+        self._qwen_prompt_block_cache = OrderedDict()
         # Serializes generate() calls against the single daemon stdin/stdout
         # pair. Created lazily so the unit-test path that constructs an
         # ActiveModel outside an event loop doesn't crash.
@@ -1059,11 +1062,15 @@ async def get_dashboard_stats(request: Request):
             "temp": _system("cpu_temp", 0),
             "power": _system("cpu_power", 0),
         },
-        "fans": {
-            "fan1": _system("fan1_rpm", 0),
-            "fan2": _system("fan2_rpm", 0),
-        },
-    }
+		"fans": {
+			"fan1": _system("fan1_rpm", 0),
+			"fan2": _system("fan2_rpm", 0),
+		},
+		"ram": {
+			"system": _system("system_ram_mb", 0),
+			"container": _system("container_ram_mb", 0),
+		},
+	}
 
 
 @app.post("/switch/{model_name}")
@@ -1148,11 +1155,208 @@ def _history_conversation_id(request, payload):
 def _validated_history_conversation_id(user_hash, conversation_id):
     if not conversation_id:
         return None
-    try:
-        history_store.get_conversation(user_hash, conversation_id)
-    except KeyError:
+    if not history_store.conversation_exists(user_hash, conversation_id):
         return None
     return conversation_id
+
+
+def _qwen_render_content(content, is_system_content=False):
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    if isinstance(content, list):
+        rendered = []
+        for item in content:
+            if not isinstance(item, dict):
+                raise ValueError("Unexpected item type in content.")
+            item_type = item.get("type")
+            if "image" in item or "image_url" in item or item_type == "image":
+                if is_system_content:
+                    raise ValueError("System message cannot contain images.")
+                rendered.append("<|vision_start|><|image_pad|><|vision_end|>")
+                continue
+            if "video" in item or item_type == "video":
+                if is_system_content:
+                    raise ValueError("System message cannot contain videos.")
+                rendered.append("<|vision_start|><|video_pad|><|vision_end|>")
+                continue
+            if "text" in item:
+                rendered.append(str(item.get("text", "")))
+                continue
+            raise ValueError("Unexpected item type in content.")
+        return "".join(rendered)
+    raise ValueError("Unexpected content type.")
+
+
+def _qwen_last_query_index(messages):
+    for index in range(len(messages) - 1, -1, -1):
+        msg = messages[index]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = _qwen_render_content(msg.get("content")).strip()
+        if not (content.startswith("<tool_response>") and content.endswith("</tool_response>")):
+            return index
+    raise ValueError("No user query found in messages.")
+
+
+def _qwen_prompt_blocks(messages, add_generation_prompt=False):
+    if not messages:
+        raise ValueError("No messages provided.")
+
+    blocks = []
+    if isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        content = _qwen_render_content(messages[0].get("content"), is_system_content=True).strip()
+        blocks.append(f"<|im_start|>system\n{content}<|im_end|>\n")
+
+    last_query_index = _qwen_last_query_index(messages)
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict):
+            raise ValueError("Unexpected message role.")
+        role = message.get("role")
+        if role == "system":
+            if index != 0:
+                raise ValueError("System message must be at the beginning.")
+            index += 1
+            continue
+        if role == "user":
+            content = _qwen_render_content(message.get("content")).strip()
+            blocks.append(f"<|im_start|>user\n{content}<|im_end|>\n")
+            index += 1
+            continue
+        if role == "assistant":
+            content = _qwen_render_content(message.get("content")).strip()
+            reasoning_content = ""
+            raw_reasoning = message.get("reasoning_content")
+            if isinstance(raw_reasoning, str):
+                reasoning_content = raw_reasoning
+            elif "</think>" in content:
+                reasoning_content = content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n")
+                content = content.split("</think>")[-1].lstrip("\n")
+            reasoning_content = reasoning_content.strip()
+            if index > last_query_index:
+                block = f"<|im_start|>assistant\n<think>\n{reasoning_content}\n</think>\n\n{content}"
+            else:
+                block = f"<|im_start|>assistant\n{content}"
+
+            tool_calls = message.get("tool_calls") or []
+            if isinstance(tool_calls, dict):
+                tool_calls = []
+            for i, tool_call in enumerate(tool_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else tool_call
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                if i == 0:
+                    if content:
+                        block += f"\n\n<tool_call>\n<function={name}>\n"
+                    else:
+                        block += f"<tool_call>\n<function={name}>\n"
+                else:
+                    block += f"\n<tool_call>\n<function={name}>\n"
+                arguments = fn.get("arguments")
+                if isinstance(arguments, dict):
+                    for arg_name, arg_value in arguments.items():
+                        block += f"<parameter={arg_name}>\n"
+                        if isinstance(arg_value, str):
+                            rendered_value = arg_value
+                        else:
+                            rendered_value = json.dumps(arg_value, ensure_ascii=False)
+                        block += f"{rendered_value}\n</parameter>\n"
+                block += "</function>\n</tool_call>"
+
+            block += "<|im_end|>\n"
+            blocks.append(block)
+            index += 1
+            continue
+        if role == "tool":
+            parts = ["<|im_start|>user"]
+            while index < len(messages):
+                tool_msg = messages[index]
+                if not isinstance(tool_msg, dict) or tool_msg.get("role") != "tool":
+                    break
+                content = _qwen_render_content(tool_msg.get("content")).strip()
+                parts.append(f"\n<tool_response>\n{content}\n</tool_response>")
+                index += 1
+            parts.append("<|im_end|>\n")
+            blocks.append("".join(parts))
+            continue
+        raise ValueError("Unexpected message role.")
+
+    if add_generation_prompt:
+        blocks.append("<|im_start|>assistant\n<think>\n")
+    return blocks
+
+
+def _prompt_block_cache_for(active):
+    if active is None or QWEN_PROMPT_BLOCK_CACHE_SIZE <= 0:
+        return None
+    cache = getattr(active, "_qwen_prompt_block_cache", None)
+    if cache is None:
+        cache = OrderedDict()
+        setattr(active, "_qwen_prompt_block_cache", cache)
+    return cache
+
+
+def _encode_qwen_prompt_blocks(tokenizer, blocks, cache=None):
+    prompt_ids = []
+    for block in blocks:
+        block_ids = None
+        if cache is not None:
+            block_ids = cache.get(block)
+            if block_ids is not None:
+                cache.move_to_end(block)
+        if block_ids is None:
+            block_ids = tuple(tokenizer.encode(block, add_special_tokens=False))
+            if cache is not None:
+                cache[block] = block_ids
+                cache.move_to_end(block)
+                while len(cache) > QWEN_PROMPT_BLOCK_CACHE_SIZE:
+                    cache.popitem(last=False)
+        prompt_ids.extend(block_ids)
+    return prompt_ids
+
+
+def _prompt_ids_from_messages(tokenizer, messages, add_generation_prompt=False, model_cfg=None, active=None):
+    family = model_cfg.get("family") if isinstance(model_cfg, dict) else None
+    qwen_error = None
+    if family == "qwen":
+        try:
+            blocks = _qwen_prompt_blocks(messages, add_generation_prompt=add_generation_prompt)
+            return _encode_qwen_prompt_blocks(
+                tokenizer,
+                blocks,
+                cache=_prompt_block_cache_for(active),
+            )
+        except Exception as e:
+            qwen_error = e
+
+    try:
+        prompt_ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=False,
+        )
+        if not isinstance(prompt_ids, list):
+            prompt_ids = list(prompt_ids)
+        return prompt_ids
+    except Exception as e:
+        try:
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt
+            )
+            return tokenizer.encode(prompt_text, add_special_tokens=False)
+        except Exception:
+            if qwen_error is not None:
+                raise qwen_error
+            raise e
 
 
 def _extract_assistant_text(raw_bytes):
@@ -1280,8 +1484,8 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
     try:
         messages = payload.get("messages") if isinstance(payload, dict) else None
         if record_history and conversation_id and isinstance(messages, list):
-            message = next((m for m in reversed(messages) if isinstance(m, dict) and m.get("role") != "assistant"), None)
-            if message:
+            message = next((m for m in reversed(messages) if isinstance(m, dict)), None)
+            if message and message.get("role") != "assistant":
                 try:
                     history_store.append_message(
                         user_hash,
@@ -1572,10 +1776,13 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         raise HTTPException(status_code=503, detail=f"Tokenizer unavailable: {e}")
 
     try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        prompt_ids = _prompt_ids_from_messages(
+            tokenizer,
+            messages,
+            add_generation_prompt=True,
+            model_cfg=model_cfg,
+            active=active,
         )
-        prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to render chat template: {e}")
 
@@ -1589,8 +1796,18 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             ),
         )
 
+    prefix_cache = active.prefix_cache
+    prefill_config = active.prefill_config
+    boundaries = None
+    protected_ranges = None
+
+    def _get_prefix_boundaries():
+        nonlocal boundaries, protected_ranges
+        if boundaries is None:
+            boundaries, protected_ranges = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
+        return boundaries, protected_ranges
+
     stop_ids, stop_seqs = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
-    boundaries, protected_ranges = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -1604,11 +1821,15 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         async with active.dflash_lock():
             # Long-context compression
             effective_ids = prompt_ids
-            if active.prefill_config and active.prefill_config.enabled:
+            if prefill_config and prefill_config.enabled:
+                compress_boundaries = None
+                compress_protected = None
+                if prefill_config.drafter_path and len(prompt_ids) >= prefill_config.threshold:
+                    compress_boundaries, compress_protected = _get_prefix_boundaries()
                 try:
                     effective_ids, _ = await maybe_compress(
-                        prompt_ids, daemon, active.prefill_config, boundaries=boundaries,
-                        protected_ranges=protected_ranges if protected_ranges else None
+                        prompt_ids, daemon, prefill_config, boundaries=compress_boundaries,
+                        protected_ranges=compress_protected if compress_protected else None
                     )
                 except Exception as e:
                     logger.error(f"pflash compression failed: {e}")
@@ -1650,9 +1871,10 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     await asyncio.to_thread(swap.discard, daemon, session_key)
             # Prefix cache: fallback for new conversations or cache-miss sessions.
             if prefix_hit is None:
-                pc = active.prefix_cache
+                pc = prefix_cache
                 if pc and not pc.disabled:
-                    prefix_hit = pc.lookup(effective_ids, boundaries=boundaries)
+                    cache_boundaries, _ = _get_prefix_boundaries()
+                    prefix_hit = pc.lookup(effective_ids, boundaries=cache_boundaries)
             # New conversation: reserve a session slot for an inline prompt snapshot.
             if conversation_id and sk and session_slot is None:
                 if swap and session_key is not None:
@@ -1670,9 +1892,10 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             if session_slot is not None:
                 snap_slot, snap_pos = session_slot, len(effective_ids)
             else:
-                pc = active.prefix_cache
-                if pc and not pc.disabled and boundaries:
-                    prep = pc.prepare_inline_snap(effective_ids, boundaries[0])
+                pc = prefix_cache
+                if pc and not pc.disabled:
+                    cache_boundaries, _ = _get_prefix_boundaries()
+                    prep = pc.prepare_inline_snap(effective_ids, cache_boundaries[0]) if cache_boundaries else None
                     if prep:
                         snap_slot, snap_pos = prep
 

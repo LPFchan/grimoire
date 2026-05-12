@@ -22,6 +22,7 @@
 		gpus: Array<{ index: number; temp: Series; power: Series; vram: Series; tokens_per_sec: Series }>;
 		cpu: { temp: Series; power: Series };
 		fans: { fan1: Series; fan2: Series };
+		ram: { system: Series; container: Series };
 	};
 
 	const WINDOWS = [
@@ -108,6 +109,12 @@
 	function fmtTps(n: number | null | undefined): string {
 		if (n == null) return '—';
 		return `${n.toFixed(1)} t/s`;
+	}
+
+	function fmtRam(mb: number | null | undefined): string {
+		if (mb == null) return '—';
+		if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
+		return `${Math.round(mb)} MB`;
 	}
 
 	type Sparkline = { line: string; area: string; lo: number; hi: number };
@@ -355,6 +362,22 @@
 				fmtTps
 			)}
 		{/each}
+
+		{@render statCard(
+			'System RAM',
+			fmtRam(data?.ram.system.current),
+			data?.ram.system.series,
+			'oklch(0.72 0.17 200)',
+			fmtRam
+		)}
+
+		{@render statCard(
+			'Grimoire RAM',
+			fmtRam(data?.ram.container.current),
+			data?.ram.container.series,
+			'oklch(0.74 0.16 222)',
+			fmtRam
+		)}
 
 		{@render statCard(
 			'Fan 1',

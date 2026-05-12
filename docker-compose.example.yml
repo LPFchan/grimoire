@@ -3,6 +3,8 @@ services:
     build: .
     image: grimoire:local
     container_name: grimoire
+    mem_limit: 28g
+    memswap_limit: 28g
     ports:
       - "9001:9001"
     volumes:
@@ -19,6 +21,8 @@ services:
       - STRUCTURED_TOOL_FALLBACK=0
       - TOOL_STRUCTURED_PLAN_TIMEOUT_S=8
       - TOOL_STRUCTURED_PLAN_MAX_TOKENS=192
+      # Keep llama.cpp's CPU prompt checkpoint cache from exhausting host RAM.
+      - LLAMA_ARG_CACHE_RAM=2048
     deploy:
       resources:
         reservations:

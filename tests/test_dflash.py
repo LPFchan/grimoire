@@ -1,5 +1,6 @@
 """Tests for the dflash backend (registry, prefix cache, helpers, daemon, proxy)."""
 
+import asyncio
 import io
 import json
 import os
@@ -7,6 +8,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,6 +28,395 @@ from grimoire.dflash.daemon import DflashDaemon
 from grimoire.dflash.prefix_cache import PrefixCache
 from grimoire.dflash.session_kv import SessionKV
 from grimoire.dflash.snapshot_swap import SnapshotSwap
+from grimoire.history import HistoryStore, identity_hash
+
+
+OPENCODE_SESSION_FIXTURES_DIR = Path(
+    os.environ.get("GRIMOIRE_OPENCODE_SESSION_FIXTURES", "/home/yeowool/opencode_splits")
+)
+REAL_QWEN_TOKENIZER_PATH = Path(
+    os.environ.get(
+        "GRIMOIRE_REAL_QWEN_TOKENIZER",
+        "/home/yeowool/models/tokenizers/qwen3.6-27B",
+    )
+)
+
+_REAL_QWEN_TOKENIZER = None
+
+
+def _loads_json_blob(blob):
+    if not isinstance(blob, str):
+        return {}
+    try:
+        return json.loads(blob)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _get_real_qwen_tokenizer():
+    global _REAL_QWEN_TOKENIZER
+    if _REAL_QWEN_TOKENIZER is None:
+        if not REAL_QWEN_TOKENIZER_PATH.exists():
+            raise unittest.SkipTest(f"Missing real Qwen tokenizer: {REAL_QWEN_TOKENIZER_PATH}")
+        from transformers import AutoTokenizer
+
+        _REAL_QWEN_TOKENIZER = AutoTokenizer.from_pretrained(
+            str(REAL_QWEN_TOKENIZER_PATH),
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        # The replay harness only exercises chat-template/tokenization behavior,
+        # not model forward passes, so do not warn on long real transcripts.
+        _REAL_QWEN_TOKENIZER.model_max_length = max(
+            getattr(_REAL_QWEN_TOKENIZER, "model_max_length", 0),
+            1_048_576,
+        )
+    return _REAL_QWEN_TOKENIZER
+
+
+def _json_text(value):
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def _tool_call_arguments(raw_input):
+    if isinstance(raw_input, dict):
+        return raw_input
+    if raw_input is None:
+        return {}
+    return {"input": raw_input}
+
+
+def _iter_opencode_session_turns(session_doc):
+    for raw_msg in session_doc.get("messages", []):
+        meta = _loads_json_blob(raw_msg.get("data"))
+        role = meta.get("role")
+        parts = []
+        for raw_part in raw_msg.get("parts", []):
+            part = _loads_json_blob(raw_part.get("data"))
+            if part:
+                parts.append(part)
+
+        if role == "user":
+            text = "".join(
+                part.get("text", "")
+                for part in parts
+                if part.get("type") == "text" and isinstance(part.get("text"), str)
+            )
+            if text:
+                yield {
+                    "kind": "user",
+                    "messages": [{"role": "user", "content": text}],
+                }
+            continue
+
+        if role != "assistant":
+            continue
+
+        for part in parts:
+            part_type = part.get("type")
+            if part_type == "reasoning" and isinstance(part.get("text"), str) and part.get("text"):
+                yield {
+                    "kind": "reasoning",
+                    "messages": [{
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": part["text"],
+                    }],
+                }
+                continue
+
+            if part_type == "text" and isinstance(part.get("text"), str) and part.get("text"):
+                yield {
+                    "kind": "assistant_text",
+                    "messages": [{"role": "assistant", "content": part["text"]}],
+                }
+                continue
+
+            if part_type != "tool":
+                continue
+
+            tool_name = part.get("tool")
+            call_id = part.get("callID")
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            if not isinstance(tool_name, str) or not isinstance(call_id, str):
+                continue
+
+            output = _json_text(state.get("output", ""))
+            yield {
+                "kind": "tool",
+                "tool_name": tool_name,
+                "call_id": call_id,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": _tool_call_arguments(state.get("input")),
+                            },
+                        }],
+                    },
+                    {
+                        "role": "tool",
+                        "tool": {"name": tool_name},
+                        "tool_call_id": call_id,
+                        "content": output,
+                    },
+                ],
+            }
+
+
+def _normalize_opencode_session_messages(session_doc):
+    messages = []
+    for turn in _iter_opencode_session_turns(session_doc):
+        messages.extend(turn["messages"])
+    return messages
+
+
+def _load_opencode_session_messages(filename):
+    path = OPENCODE_SESSION_FIXTURES_DIR / filename
+    if not path.exists():
+        raise unittest.SkipTest(f"Missing OpenCode session fixture: {path}")
+    return _normalize_opencode_session_messages(json.loads(path.read_text()))
+
+
+def _load_opencode_session_turns(filename):
+    path = OPENCODE_SESSION_FIXTURES_DIR / filename
+    if not path.exists():
+        raise unittest.SkipTest(f"Missing OpenCode session fixture: {path}")
+    return list(_iter_opencode_session_turns(json.loads(path.read_text())))
+
+
+def _list_opencode_session_files():
+    if not OPENCODE_SESSION_FIXTURES_DIR.exists():
+        raise unittest.SkipTest(f"Missing OpenCode session fixture dir: {OPENCODE_SESSION_FIXTURES_DIR}")
+    return sorted(OPENCODE_SESSION_FIXTURES_DIR.glob("opencode_ses_*.json"))
+
+
+class _ReplayRequest:
+    def __init__(self, payload, headers=None, cookies=None):
+        self._payload = payload
+        self.headers = {str(k).lower(): v for k, v in (headers or {}).items()}
+        self.cookies = cookies or {}
+
+    async def json(self):
+        return self._payload
+
+
+def _response_json(response):
+    body = getattr(response, "body", None)
+    if not body:
+        return {}
+    if isinstance(body, bytes):
+        return json.loads(body)
+    if isinstance(body, bytearray):
+        return json.loads(bytes(body))
+    return json.loads(body)
+
+
+async def _replay_session_file_async(filename):
+    token = "test-key"
+    user_hash = identity_hash(token)
+    tmp_dir = "/dev/shm" if Path("/dev/shm").exists() else None
+    tokenizer = _get_real_qwen_tokenizer()
+    cfg = {
+        "backend": "dflash",
+        "ctx-size": 1_048_576,
+        "predict": 64,
+        "family": "qwen",
+    }
+    daemon = FakeDflashDaemon([3793, 248046])
+    active = FakeActive("dflash-replay", cfg, daemon, tokenizer)
+    active.session_kv = SessionKV(cap=2, prefix_cap=2)
+    auth = {"authorization": f"Bearer {token}"}
+
+    async def fake_start_model(model_name):
+        return active
+
+    with tempfile.TemporaryDirectory(dir=tmp_dir) as tmp:
+        old_store = entrypoint.history_store
+        old_api = entrypoint.API_KEY
+        old_admin = entrypoint.ADMIN_TOKEN
+        entrypoint.history_store = HistoryStore(str(Path(tmp) / "replay-history.sqlite3"))
+        entrypoint.API_KEY = token
+        entrypoint.ADMIN_TOKEN = token
+        entrypoint.manager.active.clear()
+        try:
+            with patch.object(entrypoint.manager, "start_model", fake_start_model), patch.object(
+                entrypoint.registry, "resolve", lambda _model_id: "dflash-replay"
+            ), patch.object(entrypoint.usage_store, "record", lambda *args, **kwargs: None), patch.object(
+                entrypoint.telemetry_store, "record", lambda *args, **kwargs: None
+            ):
+                turns = _load_opencode_session_turns(filename)
+                if not turns:
+                    return {"filename": filename, "turns": 0}
+
+                conversation_id = entrypoint.history_store.create_conversation(
+                    user_hash,
+                    title=Path(filename).stem,
+                    model="dflash-replay",
+                    messages=[],
+                )["id"]
+                transcript = []
+                expected_history_count = 0
+                saw_obsidian_tool_turn = False
+
+                for turn in turns:
+                    transcript.extend(turn["messages"])
+                    daemon._tokens = [3793, 248046]
+                    response = await entrypoint.chat_completions(
+                        _ReplayRequest(
+                            {
+                                "model": "dflash-replay",
+                                "conversation_id": conversation_id,
+                                "messages": transcript,
+                                "stream": False,
+                                "max_tokens": 8,
+                            },
+                            headers=auth,
+                        )
+                    )
+                    if response.status_code != 200:
+                        raise AssertionError(
+                            f"{filename}: {turn['kind']} -> {response.status_code} {_response_json(response)}"
+                        )
+                    body = _response_json(response)
+                    if body["choices"][0]["message"]["content"] != "OK":
+                        raise AssertionError(f"{filename}: unexpected assistant text {body}")
+                    if body["usage"]["completion_tokens"] != 1:
+                        raise AssertionError(f"{filename}: unexpected usage {body['usage']}")
+
+                    if turn["kind"] == "tool" and turn.get("tool_name") == "obsidian_read-note":
+                        saw_obsidian_tool_turn = True
+
+                    if turn["messages"][-1]["role"] != "assistant":
+                        expected_history_count += 1
+                    expected_history_count += 1
+
+                    count, tail = _history_tail_for_test(entrypoint.history_store, conversation_id, limit=2)
+                    if count != expected_history_count:
+                        raise AssertionError(
+                            f"{filename}: expected {expected_history_count} history rows, got {count}"
+                        )
+                    if not tail or tail[-1]["role"] != "assistant" or tail[-1]["content"] != "OK":
+                        raise AssertionError(f"{filename}: bad assistant tail {tail}")
+
+                    if turn["kind"] == "tool":
+                        if len(tail) < 2 or tail[-2]["role"] != "tool":
+                            raise AssertionError(f"{filename}: missing tool tail {tail}")
+                        if tail[-2]["content"] != turn["messages"][-1]["content"]:
+                            raise AssertionError(f"{filename}: wrong tool content tail")
+
+                    if turn["kind"] in {"user", "assistant_text", "tool"}:
+                        prompt_ids = daemon.last_cmd_args["prompt_ids"]
+                        if not active.session_kv.has_session(conversation_id):
+                            raise AssertionError(f"{filename}: missing session kv entry")
+                        slot, prefix_len = active.session_kv.get_session(conversation_id, prompt_ids)
+                        if slot is None or prefix_len != len(prompt_ids):
+                            raise AssertionError(f"{filename}: bad session kv state")
+                        if daemon.last_cmd_args["snap_pos"] != len(prompt_ids):
+                            raise AssertionError(f"{filename}: bad snap_pos")
+
+                final_count, _ = _history_tail_for_test(entrypoint.history_store, conversation_id, limit=1)
+                if final_count <= 0:
+                    raise AssertionError(f"{filename}: empty history after replay")
+                if saw_obsidian_tool_turn:
+                    final_prompt_ids = daemon.last_cmd_args["prompt_ids"]
+                    _, final_protected = entrypoint._dflash_prefix_boundaries(
+                        transcript, active.get_tokenizer(), final_prompt_ids
+                    )
+                    expected = _expected_protected_tool_ranges(
+                        transcript,
+                        tokenizer=active.get_tokenizer(),
+                        prompt_ids=final_prompt_ids,
+                    )
+                    if final_protected != expected:
+                        raise AssertionError(
+                            f"{filename}: protected ranges mismatch {final_protected} != {expected}"
+                        )
+                return {"filename": filename, "turns": len(turns), "history_count": final_count}
+        finally:
+            entrypoint.history_store = old_store
+            entrypoint.API_KEY = old_api
+            entrypoint.ADMIN_TOKEN = old_admin
+            entrypoint.manager.active.clear()
+
+
+def _replay_session_file_worker(filename):
+    return asyncio.run(_replay_session_file_async(filename))
+
+
+def _history_tail_for_test(store, conversation_id, limit=2):
+    with store._lock, store._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()["n"]
+        rows = conn.execute(
+            """
+            SELECT role, content_json
+            FROM messages
+            WHERE conversation_id = ?
+            ORDER BY COALESCE(timestamp_ms, 0) DESC, created_at DESC
+            LIMIT ?
+            """,
+            (conversation_id, limit),
+        ).fetchall()
+    tail = []
+    for row in reversed(rows):
+        try:
+            content = json.loads(row["content_json"])
+        except json.JSONDecodeError:
+            content = row["content_json"]
+        tail.append({"role": row["role"], "content": content})
+    return count, tail
+
+
+def _expected_protected_tool_ranges(messages, boundaries=None, protected_tools=None, tokenizer=None, prompt_ids=None):
+    protected_names = set(protected_tools or {"obsidian_read-note"})
+    tool_call_names = {}
+    expected = []
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                fn_name = fn.get("name")
+                if isinstance(tc_id, str) and isinstance(fn_name, str):
+                    tool_call_names[tc_id] = fn_name
+            continue
+        if msg.get("role") != "tool":
+            continue
+        tc_id = msg.get("tool_call_id")
+        if tool_call_names.get(tc_id) not in protected_names:
+            continue
+        if tokenizer is not None and prompt_ids is not None:
+            rendered_before = tokenizer.apply_chat_template(
+                messages[:i], tokenize=False, add_generation_prompt=False
+            )
+            rendered_after = tokenizer.apply_chat_template(
+                messages[: i + 1], tokenize=False, add_generation_prompt=False
+            )
+            start = len(tokenizer.encode(rendered_before, add_special_tokens=False))
+            end = len(tokenizer.encode(rendered_after, add_special_tokens=False))
+            if not (0 <= start < end <= len(prompt_ids)):
+                continue
+        else:
+            start = boundaries[i - 1] if i > 0 else 0
+            end = boundaries[i]
+        expected.append((start, end))
+    return expected
 
 
 class DflashRegistryValidationTests(unittest.TestCase):
@@ -584,6 +975,42 @@ class DflashHelperTests(unittest.TestCase):
         self.assertEqual(protected[0], (boundaries[2], boundaries[3]))
 
 
+class OpenCodeSessionFixtureTests(unittest.TestCase):
+    """Real-world OpenCode session dumps should map cleanly onto DFlash helpers."""
+
+    def setUp(self):
+        self.tok = FakeTokenizer()
+
+    def test_real_session_obsidian_tool_outputs_become_protected_ranges(self):
+        messages = _load_opencode_session_messages(
+            "opencode_ses_1eb7_Update_machine_config_with_Obsidian_resume.json"
+        )
+        prompt_ids = self.tok.encode(
+            self.tok.apply_chat_template(messages, add_generation_prompt=True)
+        )
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(messages, self.tok, prompt_ids)
+
+        self.assertGreaterEqual(len(messages), 6)
+        self.assertEqual(len(boundaries), len(messages))
+        self.assertTrue(protected)
+        self.assertEqual(
+            protected,
+            _expected_protected_tool_ranges(messages, boundaries),
+        )
+
+    def test_real_session_without_obsidian_reads_has_no_protected_ranges(self):
+        messages = _load_opencode_session_messages(
+            "opencode_ses_1e9c_Export_10_latest_opencode_conversations_to_JSON.json"
+        )
+        prompt_ids = self.tok.encode(
+            self.tok.apply_chat_template(messages, add_generation_prompt=True)
+        )
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(messages, self.tok, prompt_ids)
+
+        self.assertEqual(len(boundaries), len(messages))
+        self.assertEqual(protected, [])
+
+
 class MaybeCompressHeadTailTests(unittest.TestCase):
     """maybe_compress must protect head + tail and only compress the middle slice."""
 
@@ -1088,7 +1515,7 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         entrypoint.ADMIN_TOKEN = "test-key"
         entrypoint.manager.active.clear()
         self.client = TestClient(entrypoint.app)
-        self.auth = {"Authorization": "Bearer test-key"}
+        self.auth = {"authorization": "Bearer test-key"}
 
     def tearDown(self):
         entrypoint.API_KEY = self._old_api
@@ -1241,6 +1668,167 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 501)
         self.assertIn("not supported on dflash", response.json()["detail"])
+
+    def test_non_streaming_assistant_tail_does_not_duplicate_previous_user_in_history(self):
+        self._install_fake_active([ord("o"), ord("k"), 0])
+        hist = self.client.post(
+            "/history",
+            json={"title": "assistant tail history", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        )
+        self.assertEqual(hist.status_code, 200)
+        conv_id = hist.json()["id"]
+
+        payload = {
+            "model": "dflash-test",
+            "conversation_id": conv_id,
+            "messages": [
+                {"role": "user", "content": "first user"},
+                {"role": "assistant", "content": "prior assistant"},
+            ],
+            "stream": False,
+        }
+        response = self.client.post(
+            "/v1/chat/completions",
+            json=payload,
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+
+        conv = self.client.get(f"/history/{conv_id}", headers=self.auth).json()
+        self.assertEqual([m["role"] for m in conv["messages"]], ["assistant"])
+        self.assertEqual(conv["messages"][0]["content"], "ok")
+
+    def test_real_session_passes_obsidian_protected_ranges_to_compression(self):
+        active, _ = self._install_fake_active(
+            [ord("o"), ord("k"), 0],
+            cfg_overrides={"ctx-size": 200000, "predict": 64},
+        )
+        messages = _load_opencode_session_messages(
+            "opencode_ses_1eb7_Update_machine_config_with_Obsidian_resume.json"
+        )
+        active.prefill_config = type(
+            "PrefillCfg",
+            (),
+            {"enabled": True, "threshold": 1, "keep_ratio": 0.5, "drafter_path": "/dummy", "tail_budget": 512},
+        )()
+
+        calls = {}
+
+        async def fake_maybe_compress(prompt_ids, daemon, config, boundaries=None, protected_ranges=None):
+            calls["boundaries"] = list(boundaries or [])
+            calls["protected_ranges"] = list(protected_ranges or [])
+            return prompt_ids, False
+
+        with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={"model": "dflash-test", "messages": messages, "stream": False},
+                headers=self.auth,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("boundaries", calls)
+        self.assertIn("protected_ranges", calls)
+        self.assertTrue(calls["protected_ranges"])
+        self.assertEqual(
+            calls["protected_ranges"],
+            _expected_protected_tool_ranges(messages, calls["boundaries"]),
+        )
+
+
+class OpenCodeSessionReplayTests(unittest.TestCase):
+    """Stress replay real OpenCode sessions across history + session-KV using the real Qwen tokenizer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "replay-history.sqlite3")
+        self._old_store = entrypoint.history_store
+        entrypoint.history_store = HistoryStore(self.db_path)
+        self._old_api = entrypoint.API_KEY
+        self._old_admin = entrypoint.ADMIN_TOKEN
+        entrypoint.API_KEY = "test-key"
+        entrypoint.ADMIN_TOKEN = "test-key"
+        entrypoint.manager.active.clear()
+        self.user_hash = identity_hash("test-key")
+
+    def tearDown(self):
+        entrypoint.history_store = self._old_store
+        entrypoint.API_KEY = self._old_api
+        entrypoint.ADMIN_TOKEN = self._old_admin
+        entrypoint.manager.active.clear()
+        self.tmp.cleanup()
+
+    def _install_real_tokenizer_active(self, tokens, cfg_overrides=None):
+        tokenizer = _get_real_qwen_tokenizer()
+        cfg = {
+            "backend": "dflash",
+            "ctx-size": 1_048_576,
+            "predict": 64,
+            "family": "qwen",
+        }
+        if cfg_overrides:
+            cfg.update(cfg_overrides)
+        daemon = FakeDflashDaemon(tokens)
+        active = FakeActive("dflash-replay", cfg, daemon, tokenizer)
+        active.session_kv = SessionKV(cap=2, prefix_cap=2)
+
+        async def fake_start_model(model_name):
+            return active
+
+        if "dflash-replay" not in entrypoint.registry.list_all():
+            entrypoint.registry.add("dflash-replay", cfg)
+        self.addCleanup(self._remove_alias, "dflash-replay")
+        self._patch_start = patch.object(entrypoint.manager, "start_model", fake_start_model)
+        self._patch_start.start()
+        self.addCleanup(self._patch_start.stop)
+        return active, daemon
+
+    def _remove_alias(self, name):
+        try:
+            entrypoint.registry.remove(name)
+        except KeyError:
+            pass
+
+    def _create_conversation(self, title):
+        return entrypoint.history_store.create_conversation(
+            self.user_hash,
+            title=title,
+            model="dflash-replay",
+            messages=[],
+        )["id"]
+
+    def _history_messages(self, conversation_id):
+        return entrypoint.history_store.get_conversation_tree(self.user_hash, conversation_id)["messages"]
+
+    def _history_tail(self, conversation_id, limit=2):
+        return _history_tail_for_test(entrypoint.history_store, conversation_id, limit=limit)
+
+    def _assert_history_tail(self, conversation_id, expected_count, response_text):
+        count, tail = self._history_tail(conversation_id, limit=1)
+        self.assertEqual(count, expected_count)
+        self.assertEqual(tail[-1]["role"], "assistant")
+        self.assertEqual(tail[-1]["content"], response_text)
+
+    def test_replay_all_session_files_across_every_turn(self):
+        session_files = _list_opencode_session_files()
+        self.assertTrue(session_files)
+        max_workers = min(len(session_files), 3)
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_replay_session_file_worker, path.name): path.name
+                for path in session_files
+            }
+            completed = 0
+            total_turns = 0
+            for future in as_completed(futures):
+                result = future.result()
+                completed += 1
+                total_turns += result["turns"]
+                self.assertGreaterEqual(result["turns"], 0, result["filename"])
+
+        self.assertEqual(completed, len(session_files))
+        self.assertGreater(total_turns, 0)
 
 
 if __name__ == "__main__":

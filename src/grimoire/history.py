@@ -196,6 +196,15 @@ class HistoryStore:
             ]
             return result
 
+    def conversation_exists(self, user_hash, conversation_id):
+        """Return True if the caller owns the conversation."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM conversations WHERE id = ? AND user_hash = ?",
+                (conversation_id, user_hash),
+            ).fetchone()
+        return row is not None
+
     def replace_conversation(self, user_hash, conversation_id, title=None, model=None, messages=None):
         now = utcnow()
         with self._lock, self._connect() as conn:
