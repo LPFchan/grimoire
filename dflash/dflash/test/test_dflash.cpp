@@ -2975,7 +2975,7 @@ if (starts_with(line, "compress ")) {
                     v = (uint32_t)ps.ssm_state_snap.size();
                     sf.write(reinterpret_cast<char *>(&v), 4);
 
-                    auto write_tensor = [&sf](ggml_tensor * t) -> bool {
+                    auto write_tensor = [&sf, &v](ggml_tensor * t) -> bool {
                         if (!t) return true;
                         v = (uint32_t)t->type;
                         sf.write(reinterpret_cast<char *>(&v), 4);

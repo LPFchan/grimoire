@@ -14,9 +14,14 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "ggml.h"
 
 namespace dflash27b {
+
+// Prompt-file helpers shared between laguna_daemon.cpp and test_dflash.cpp
+std::vector<int32_t> read_uncounted_i32(const std::string & path);
+bool write_counted_i32(const std::string & path, const std::vector<int32_t> & ids);
 
 struct LagunaDaemonArgs {
     std::string target_path;       // path to laguna-*.gguf

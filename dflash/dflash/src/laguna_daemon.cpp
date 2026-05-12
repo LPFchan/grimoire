@@ -69,9 +69,12 @@ std::vector<int32_t> read_counted_i32(const std::string & path) {
     return ids;
 }
 
-// scripts/server.py writes prompts as a raw int32 stream (no length prefix);
-// the file size implies the token count. Used by the bare-prompt path so the
-// daemon stays drop-in for the qwen35 server.py protocol.
+// laguna_step lives in src/laguna_target_graph.cpp as a public helper so the
+// daemon, benches, and any future caller share one forward-step
+// implementation. We just call it from the daemon loop below.
+
+}  // namespace
+
 std::vector<int32_t> read_uncounted_i32(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return {};
@@ -94,12 +97,6 @@ bool write_counted_i32(const std::string & path, const std::vector<int32_t> & id
     if (n > 0) f.write(reinterpret_cast<const char *>(ids.data()), (std::streamsize)ids.size() * sizeof(int32_t));
     return (bool)f;
 }
-
-// laguna_step lives in src/laguna_target_graph.cpp as a public helper so the
-// daemon, benches, and any future caller share one forward-step
-// implementation. We just call it from the daemon loop below.
-
-}  // namespace
 
 
 int run_laguna_daemon(const LagunaDaemonArgs & args) {
