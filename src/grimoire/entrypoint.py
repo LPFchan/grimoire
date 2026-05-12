@@ -1945,7 +1945,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         ),
     )
 
-    prefix_cache = active.prefix_cache
     prefill_config = active.prefill_config
     daemon = active.dflash_daemon
 
@@ -2034,7 +2033,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     await asyncio.to_thread(swap.discard, daemon, session_key)
             # Prefix cache: fallback for new conversations or cache-miss sessions.
             if prefix_hit is None:
-                pc = prefix_cache
+                pc = active.prefix_cache
                 if pc and not pc.disabled:
                     prefix_hit = pc.lookup(effective_ids, boundaries=effective_boundaries)
             # New conversation: reserve a session slot for an inline prompt snapshot.
@@ -2054,7 +2053,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             if session_slot is not None:
                 snap_slot, snap_pos = session_slot, len(effective_ids)
             else:
-                pc = prefix_cache
+                pc = active.prefix_cache
                 if pc and not pc.disabled:
                     prep = pc.prepare_inline_snap(effective_ids, effective_boundaries[0]) if effective_boundaries else None
                     if prep:
