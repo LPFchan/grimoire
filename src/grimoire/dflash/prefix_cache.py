@@ -33,6 +33,13 @@ class PrefixCache:
     survives daemon reloads. The actual KV data lives in the daemon's VRAM
     and is restored via the daemon's SNAPSHOT/RESTORE protocol.
 
+    Concurrency: a single `_pending_evict_key` is held between
+    `prepare_inline_snap` and the matching `confirm_inline_snap` /
+    `abort_inline_snap`. Callers must serialize that reserve→confirm
+    pair under the per-model `active.dflash_lock()` — concurrent
+    reservations would race on the pending key and either lose an
+    eviction or pick the same slot for two prompts.
+
     Args:
         cap: Maximum number of snapshot slots (0-8). 0 disables caching.
         cache_dir: Directory for persistent metadata. Snapshots save/restore
