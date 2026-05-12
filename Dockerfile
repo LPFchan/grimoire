@@ -111,6 +111,8 @@ WORKDIR /app
 
 COPY dflash/ /app/dflash-hub
 
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/dflash-build \
     set -eux; \
