@@ -132,7 +132,10 @@ RUN --mount=type=cache,target=/root/.ccache \
         --target test_dflash --parallel "$(nproc)"; \
     mkdir -p /opt/dflash; \
     cp /app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash; \
-    cp -r /app/.cache/dflash-build/build/lib/* /opt/dflash/ 2>/dev/null || true
+    # Copy dflash's own ggml shared libs so the binary resolves symbols
+    # against its build-time llama.cpp, not the independently-built one.
+    find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
+    ls -la /opt/dflash/
 
 
 # =============================================================================
@@ -205,7 +208,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GRIMOIRE_MODELS_DIR=/models \
     GRIMOIRE_REGISTRY_PATH=/var/lib/grimoire/models.json \
     GRIMOIRE_REGISTRY_SEED_PATH=/etc/grimoire/models.json \
-    LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
+    LD_LIBRARY_PATH=/opt/dflash:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
     PATH=/opt/grimoire-venv/bin:$PATH
 
 RUN apt-get update \
