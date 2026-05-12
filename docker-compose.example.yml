@@ -14,6 +14,7 @@ services:
       - /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro
       - /path/to/token-stats.json:/var/lib/grimoire/token-stats.json:ro
       - grimoire_state:/var/lib/grimoire
+      - /path/to/grimoire/etc/models.json:/etc/grimoire/models.json:ro
       - /sys/devices/virtual/powercap:/host-powercap:ro
       - type: tmpfs
         target: /dev/shm/grimoire-snapshots
