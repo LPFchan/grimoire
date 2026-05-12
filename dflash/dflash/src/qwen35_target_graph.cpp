@@ -388,9 +388,29 @@ bool snapshot_target_cache(const TargetWeights & w,
                            PrefixSnapshot & snap) {
     const int n_full_attn = w.n_layer / w.full_attention_interval; // 16
     const int n_delta     = w.n_layer - n_full_attn;               // 48
+    const int kv_tokens   = cache.cur_pos;
 
-    // Lazy allocation: only allocate on the first call.
-    if (snap.ctx == nullptr) {
+    if (kv_tokens <= 0 || kv_tokens > cache.max_ctx) {
+        set_last_error("snapshot_target_cache: cache.cur_pos out of range");
+        return false;
+    }
+
+    bool needs_alloc = snap.ctx == nullptr || snap.is_thin;
+    if (!needs_alloc) {
+        if ((int)snap.attn_k_snap.size() != n_full_attn ||
+            (int)snap.attn_v_snap.size() != n_full_attn ||
+            (int)snap.ssm_state_snap.size() != n_delta ||
+            (int)snap.conv_state_snap.size() != n_delta) {
+            needs_alloc = true;
+        } else if (n_full_attn > 0 && snap.attn_k_snap[0] != nullptr) {
+            needs_alloc = snap.attn_k_snap[0]->ne[1] != kv_tokens;
+        }
+    }
+
+    // Compact full snapshots keep only the used KV prefix [0, cur_pos) while
+    // preserving the full hybrid-model state (SSM/conv/target_feat).
+    if (needs_alloc) {
+        free_prefix_snapshot(snap);
         const int total_tensors = 2 * n_full_attn + 2 * n_delta + 1; // 65
         ggml_init_params ip{};
         ip.mem_size   = (size_t)(total_tensors + 16) * ggml_tensor_overhead();
@@ -408,8 +428,8 @@ bool snapshot_target_cache(const TargetWeights & w,
         for (int i = 0; i < n_full_attn; i++) {
             ggml_tensor * sk = cache.attn_k[i];
             ggml_tensor * sv = cache.attn_v[i];
-            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], sk->ne[1], sk->ne[2]);
-            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], sv->ne[1], sv->ne[2]);
+            ggml_tensor * K = ggml_new_tensor_3d(snap.ctx, sk->type, sk->ne[0], kv_tokens, sk->ne[2]);
+            ggml_tensor * V = ggml_new_tensor_3d(snap.ctx, sv->type, sv->ne[0], kv_tokens, sv->ne[2]);
             char name[64];
             std::snprintf(name, sizeof(name), "snap_cache_k_%d", i); ggml_set_name(K, name);
             std::snprintf(name, sizeof(name), "snap_cache_v_%d", i); ggml_set_name(V, name);
@@ -451,10 +471,25 @@ bool snapshot_target_cache(const TargetWeights & w,
         }
     }
 
-    // Copy live cache tensors into snapshot (works for both first call and refreshes).
+    // Copy only the used KV prefix into the compact snapshot.
     for (int i = 0; i < n_full_attn; i++) {
-        ggml_backend_tensor_copy(cache.attn_k[i], snap.attn_k_snap[i]);
-        ggml_backend_tensor_copy(cache.attn_v[i], snap.attn_v_snap[i]);
+        ggml_tensor * sk = cache.attn_k[i];
+        ggml_tensor * sv = cache.attn_v[i];
+        ggml_tensor * dk = snap.attn_k_snap[i];
+        ggml_tensor * dv = snap.attn_v_snap[i];
+        const size_t k_strip = (size_t)kv_tokens * sk->nb[1];
+        const size_t v_strip = (size_t)kv_tokens * sv->nb[1];
+        std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
+        for (int kh = 0; kh < (int)sk->ne[2]; kh++) {
+            size_t k_src = (size_t)kh * sk->nb[2];
+            size_t k_dst = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_get(sk, bufk.data(), k_src, k_strip);
+            ggml_backend_tensor_set(dk, bufk.data(), k_dst, k_strip);
+            size_t v_src = (size_t)kh * sv->nb[2];
+            size_t v_dst = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_get(sv, bufv.data(), v_src, v_strip);
+            ggml_backend_tensor_set(dv, bufv.data(), v_dst, v_strip);
+        }
     }
     for (int i = 0; i < n_delta; i++) {
         ggml_backend_tensor_copy(cache.ssm_state[i],  snap.ssm_state_snap[i]);
@@ -468,6 +503,9 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.kv_v_type       = cache.kv_v_type;
     snap.max_ctx         = cache.max_ctx;
     snap.target_feat_cap = cache.target_feat_cap;
+    snap.is_thin         = false;
+    snap.kv_start        = 0;
+    snap.kv_end          = 0;
 
     return true;
 }
@@ -505,8 +543,36 @@ bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
     const int n_delta     = (int)snap.ssm_state_snap.size();
 
     for (int i = 0; i < n_full_attn; i++) {
-        ggml_backend_tensor_copy(snap.attn_k_snap[i], cache.attn_k[i]);
-        ggml_backend_tensor_copy(snap.attn_v_snap[i], cache.attn_v[i]);
+        ggml_tensor * sk = snap.attn_k_snap[i];
+        ggml_tensor * sv = snap.attn_v_snap[i];
+        ggml_tensor * dk = cache.attn_k[i];
+        ggml_tensor * dv = cache.attn_v[i];
+        if (!sk || !sv || !dk || !dv) {
+            set_last_error("restore_target_cache: missing KV tensor");
+            return false;
+        }
+        if (sk->type != dk->type || sv->type != dv->type ||
+            sk->ne[0] != dk->ne[0] || sv->ne[0] != dv->ne[0] ||
+            sk->ne[2] != dk->ne[2] || sv->ne[2] != dv->ne[2] ||
+            sk->ne[1] > dk->ne[1] || sv->ne[1] > dv->ne[1]) {
+            set_last_error("restore_target_cache: KV shape/type mismatch");
+            return false;
+        }
+        const int k_tokens = (int)sk->ne[1];
+        const int v_tokens = (int)sv->ne[1];
+        const size_t k_strip = (size_t)k_tokens * dk->nb[1];
+        const size_t v_strip = (size_t)v_tokens * dv->nb[1];
+        std::vector<uint8_t> bufk(k_strip), bufv(v_strip);
+        for (int kh = 0; kh < (int)dk->ne[2]; kh++) {
+            size_t k_src = (size_t)kh * sk->nb[2];
+            size_t k_dst = (size_t)kh * dk->nb[2];
+            ggml_backend_tensor_get(sk, bufk.data(), k_src, k_strip);
+            ggml_backend_tensor_set(dk, bufk.data(), k_dst, k_strip);
+            size_t v_src = (size_t)kh * sv->nb[2];
+            size_t v_dst = (size_t)kh * dv->nb[2];
+            ggml_backend_tensor_get(sv, bufv.data(), v_src, v_strip);
+            ggml_backend_tensor_set(dv, bufv.data(), v_dst, v_strip);
+        }
     }
     for (int i = 0; i < n_delta; i++) {
         ggml_backend_tensor_copy(snap.ssm_state_snap[i],  cache.ssm_state[i]);
@@ -533,6 +599,7 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.kv_v_type       = GGML_TYPE_COUNT;
     snap.max_ctx         = 0;
     snap.target_feat_cap = 0;
+    snap.last_tok        = -1;
     snap.is_thin         = false;
     snap.kv_start        = 0;
     snap.kv_end          = 0;
@@ -623,9 +690,11 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
     snap.kv_start  = kv_start;
     snap.kv_end    = kv_end;
     snap.cur_pos   = kv_end;
+    snap.last_tok  = cache.last_tok;
     snap.kv_k_type = cache.kv_k_type;
     snap.kv_v_type = cache.kv_v_type;
     snap.max_ctx   = cache.max_ctx;
+    snap.target_feat_cap = cache.target_feat_cap;
     return true;
 }
 
@@ -678,9 +747,9 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
         if (thin->kv_end > max_kv_end) max_kv_end = thin->kv_end;
     }
     cache.cur_pos = max_kv_end;
-    // Note: cache.last_tok is NOT updated by chain restore; the caller must
-    // ensure that the LAST thin's kv_end matches the prompt position where
-    // last_tok was captured, or fall back to bare-prompt prefill afterward.
+    // Note: cache.last_tok is not reconstructed from thin layers. Chain restore
+    // is intended for the normal append-only path where prefill continues past
+    // max_kv_end and computes a fresh last_tok for the new prompt boundary.
     return true;
 }
 
