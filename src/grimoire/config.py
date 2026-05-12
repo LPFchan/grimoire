@@ -25,7 +25,7 @@ def _env_bool(name, default=False):
 
 
 # Backend binary
-LLAMA_SERVER_BIN = "/opt/model-a-llama-cpp/bin/llama-server"
+LLAMA_SERVER_BIN = "/opt/grimoire-llama-cpp/bin/llama-server"
 
 # Model defaults
 DEFAULT_CTX_SIZE = 131072

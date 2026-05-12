@@ -11,7 +11,7 @@ from grimoire.registry import registry, MODELS_DIR
 
 logger = logging.getLogger(__name__)
 
-LLAMA_SERVER_BIN = "/opt/model-a-llama-cpp/bin/llama-server"
+LLAMA_SERVER_BIN = "/opt/grimoire-llama-cpp/bin/llama-server"
 
 
 def parse_args():

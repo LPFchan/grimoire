@@ -90,7 +90,7 @@ RUN --mount=type=cache,target=/root/.ccache \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_TOOLS_INSTALL=ON \
             "-DCMAKE_CUDA_ARCHITECTURES=${GRIMOIRE_CMAKE_CUDA_ARCHITECTURES}" \
-            -DCMAKE_INSTALL_PREFIX=/opt/model-a-llama-cpp \
+            -DCMAKE_INSTALL_PREFIX=/opt/grimoire-llama-cpp \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -205,7 +205,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GRIMOIRE_MODELS_DIR=/models \
     GRIMOIRE_REGISTRY_PATH=/var/lib/grimoire/models.json \
     GRIMOIRE_REGISTRY_SEED_PATH=/etc/grimoire/models.json \
-    LD_LIBRARY_PATH=/opt/model-a-llama-cpp/lib:/opt/model-a-llama-cpp/lib64 \
+    LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
     PATH=/opt/grimoire-venv/bin:$PATH
 
 RUN apt-get update \
@@ -225,10 +225,13 @@ RUN apt-get update \
 WORKDIR /app
 
 # Copy compiled llama-server
-COPY --from=build /opt/model-a-llama-cpp /opt/model-a-llama-cpp
+COPY --from=build /opt/grimoire-llama-cpp /opt/grimoire-llama-cpp
 
 # Copy compiled dflash daemon
 COPY --from=dflash-build /opt/dflash /opt/dflash
+
+# Purge legacy directory name from older images
+RUN rm -rf /opt/model-a-llama-cpp
 
 # Copy built llama.cpp webui
 COPY --from=webui /opt/grimoire-webui /opt/grimoire-webui
