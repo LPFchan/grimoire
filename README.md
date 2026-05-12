@@ -128,6 +128,8 @@ Prompt split on `len(prompt_ids) >= prefill_threshold`:
 
 Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressible middle blocks are scored by the drafter (loads 1.2 GB, ~2s, parks).
 
+When a request includes the `conversation_recall` tool, Grimoire also injects a small DFlash runtime system note. It tells the model that older middle context may be compressed on long prompts and that exact older wording should be recovered with `conversation_recall` instead of assumed to be verbatim.
+
 **Tuned values**: `max-effective-context=100000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`.
 
 ### Session KV

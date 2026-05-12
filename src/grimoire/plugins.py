@@ -20,12 +20,29 @@ HUIHUI_CONTROL_PATTERNS = [
     re.compile(r"<\|im_start\|>\s*(?:thought|assistant)\s*", re.IGNORECASE),
 ]
 
+DFLASH_AWARENESS_MARKER = "Grimoire DFlash runtime note:"
+DFLASH_RECALL_TOOL = "conversation_recall"
+
 
 def env_flag(name, default):
     value = os.environ.get(name)
     if value is None:
         return default
     return value.lower() not in {"0", "false", "no", "off", ""}
+
+
+def payload_tool_names(payload):
+    names = set()
+    for tool in payload.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") if tool.get("type") == "function" else tool
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"]:
+            names.add(fn["name"])
+    for fn in payload.get("functions") or []:
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn["name"]:
+            names.add(fn["name"])
+    return names
 
 
 class Plugin:
@@ -121,6 +138,58 @@ class QwenStructuredCotPlugin(Plugin):
             return payload
 
         payload["grammar"] = self.grammar
+        return payload
+
+
+class DflashPflashAwarenessPlugin(Plugin):
+    """Inject a runtime note when retrieval-aware sessions run on DFlash/PFlash."""
+
+    def before_request(self, payload, model_name, model_cfg):
+        if model_cfg.get("backend") != "dflash":
+            return payload
+        if model_cfg.get("prefill-compression", model_cfg.get("prefill_compression")) == "never":
+            return payload
+        if not model_cfg.get("drafter"):
+            return payload
+        if DFLASH_RECALL_TOOL not in payload_tool_names(payload):
+            return payload
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            return payload
+
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "system":
+                continue
+            if isinstance(message.get("content"), str) and DFLASH_AWARENESS_MARKER in message["content"]:
+                return payload
+
+        threshold = model_cfg.get("prefill-threshold", model_cfg.get("prefill_threshold"))
+        try:
+            threshold = int(threshold) if threshold is not None else None
+        except (TypeError, ValueError):
+            threshold = None
+
+        threshold_hint = (
+            f"On long prompts (around {threshold:,}+ rendered tokens before compression), "
+            if threshold and threshold > 0
+            else "On long prompts, "
+        )
+        context = (
+            f"{DFLASH_AWARENESS_MARKER} This session runs on Grimoire DFlash with PFlash long-context compression available. "
+            f"{threshold_hint}older middle context may be compressed before target prefill, while the head, recent tail, "
+            "and protected tool blocks are preferentially kept exact. If you need exact older wording or the original "
+            "contents of an older message block, use the `conversation_recall` tool instead of assuming the compressed "
+            "middle is verbatim."
+        )
+
+        if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+            existing = messages[0].get("content")
+            if isinstance(existing, str):
+                messages[0]["content"] = f"{existing}\n\n{context}" if existing else context
+                return payload
+
+        payload["messages"] = [{"role": "system", "content": context}, *messages]
         return payload
 
 
@@ -383,6 +452,7 @@ class StructuredToolPlanPlugin(Plugin):
 
 plugin_manager = PluginManager([
     QwenStructuredCotPlugin(),
+    DflashPflashAwarenessPlugin(),
     StructuredToolPlanPlugin(),
     HuihuiPlugin(),
 ])
