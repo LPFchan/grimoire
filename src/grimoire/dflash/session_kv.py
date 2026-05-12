@@ -30,9 +30,8 @@ def _session_key(conversation_id: str) -> bytes:
 class SessionKV:
     """Manage per-conversation compact full snapshot metadata."""
 
-    def __init__(self, cap: int = DEFAULT_SESSION_CAP, prefix_cap: int = 0):
+    def __init__(self, cap: int = DEFAULT_SESSION_CAP):
         self.cap = max(0, int(cap))
-        self.prefix_cap = max(0, int(prefix_cap))
         self.sessions: OrderedDict[str, tuple[bytes, int, bytes]] = OrderedDict()
 
     def swap_key(self, conversation_id: str) -> bytes:
