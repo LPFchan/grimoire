@@ -231,6 +231,14 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("/src/patches/grimoire-webui-*.patch", dockerfile)
         self.assertIn("grimoire-webui-*", dockerfile)
 
+    def test_dflash_runtime_uses_test_dflash_binary(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("-DDFLASH27B_TESTS=ON", dockerfile)
+        self.assertIn("--target test_dflash", dockerfile)
+        self.assertIn("/app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash", dockerfile)
+        self.assertNotIn("--target pflash_daemon", dockerfile)
+        self.assertNotIn("/app/.cache/dflash-build/build/pflash_daemon /opt/dflash/dflash", dockerfile)
+
 
 if __name__ == "__main__":
     unittest.main()
