@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
@@ -332,7 +332,7 @@ class ActiveModel:
         self.prefix_cache.load()
 
         self.prefill_config = PrefillConfig(
-            enabled=self.cfg.get("prefill-compression", "auto") != "off",
+            enabled=self.cfg.get("prefill-compression", "auto") != "never",
             threshold=self.cfg.get("prefill-threshold", 32000),
             keep_ratio=self.cfg.get("prefill-keep-ratio", 0.05),
             drafter_path=drafter_path,
@@ -1944,7 +1944,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
     prefix_cache = active.prefix_cache
     prefill_config = active.prefill_config
-    prefix_boundaries = _prefix_cache_boundaries(prompt_blocks)
 
     stop_ids, stop_seqs = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
 
