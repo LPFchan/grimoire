@@ -113,6 +113,9 @@ COPY dflash/ /app/dflash-hub
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates cmake build-essential && rm -rf /var/lib/apt/lists/*
 
+# test_dflash is the daemon entrypoint upstream ships under the test tree;
+# pflash_daemon doesn't exist as a standalone target, so we build and rename
+# test_dflash to /opt/dflash/dflash at install.
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/dflash-build \
     set -eux; \
@@ -253,7 +256,7 @@ EXPOSE 9001
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl -f http://localhost:9001/health || exit 1
+    CMD curl -fsS http://localhost:9001/health
 
 # Default entrypoint
 ENTRYPOINT ["python", "-m", "grimoire.entrypoint"]
