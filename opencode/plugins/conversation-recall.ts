@@ -58,7 +58,7 @@ const formatSearchRow = (row: RecallRow, index: number) => {
   return `${header}\n${session}\n${content}`
 }
 
-const formatPartRow = (row: RecallRow) => {
+const formatPartRow = (row: RecallRow, includeToolOutput: boolean) => {
   const lines = [
     `part: ${row.part_id}`,
     `message: ${row.message_id}`,
@@ -74,8 +74,12 @@ const formatPartRow = (row: RecallRow) => {
     lines.push(`tool_status: ${row.tool_status ?? "unknown"}`)
     if (row.tool_command) lines.push(`tool_command: ${row.tool_command}`)
     lines.push("")
-    lines.push("output:")
-    lines.push(row.tool_output ?? "(no inline tool output stored in part.state.output)")
+    if (includeToolOutput) {
+      lines.push("output:")
+      lines.push(row.tool_output ?? "(no inline tool output stored in part.state.output)")
+    } else {
+      lines.push("tool output omitted; rerun with includeToolOutput=true to retrieve it")
+    }
     return lines.join("\n")
   }
 
@@ -316,7 +320,7 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
             }
 
             return {
-              output: formatPartRow(row),
+              output: formatPartRow(row, includeToolOutput),
               metadata: {
                 action,
                 partID: args.partID.trim(),
