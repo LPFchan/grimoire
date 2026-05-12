@@ -7,10 +7,10 @@ This reduces prefill time by ~10x for 64K-128K prompts.
 The gateway detects long prompts, calls compress() to get the reduced token
 list, then feeds that to the daemon's generate() instead of the full prompt.
 
-Compression protects the system prompt (head) and the last N turns that fit
-within tail_budget tokens (tail), compressing only the middle conversation
-history. Boundaries are passed from the caller as token positions that mark
-message boundaries.
+Compression is block-aware: the caller supplies a prompt manifest with stable
+block ids, token spans, and metadata. PFlash preserves head/tail protection and
+protected tool blocks, but only compresses whole blocks so metadata survives the
+raw -> effective prompt transform.
 """
 
 import asyncio
@@ -42,153 +42,232 @@ class PrefillConfig:
     tail_budget: int = 16000
 
 
+@dataclass(frozen=True)
+class PromptBlock:
+    """One logical prompt block in raw token space."""
+
+    block_id: str
+    index: int
+    start: int
+    end: int
+    role: str
+    kind: str
+    message_start: int
+    message_end: int
+    protected: bool = False
+    metadata: Optional[dict] = None
+
+    @property
+    def token_count(self) -> int:
+        return max(0, self.end - self.start)
+
+
+@dataclass(frozen=True)
+class EffectivePromptBlock:
+    """One logical prompt block after PFlash transforms token spans."""
+
+    block_id: str
+    index: int
+    start: int
+    end: int
+    raw_start: int
+    raw_end: int
+    role: str
+    kind: str
+    message_start: int
+    message_end: int
+    protected: bool = False
+    compressed: bool = False
+    metadata: Optional[dict] = None
+
+    @property
+    def token_count(self) -> int:
+        return max(0, self.end - self.start)
+
+
+def _default_prompt_blocks(prompt_ids: list[int]) -> list[PromptBlock]:
+    if not prompt_ids:
+        return []
+    return [
+        PromptBlock(
+            block_id="prompt:0",
+            index=0,
+            start=0,
+            end=len(prompt_ids),
+            role="prompt",
+            kind="prompt",
+            message_start=0,
+            message_end=0,
+            protected=False,
+            metadata={"default": True},
+        )
+    ]
+
+
+def materialize_blocks(
+    prompt_ids: list[int],
+    blocks: Optional[list[PromptBlock]] = None,
+) -> list[EffectivePromptBlock]:
+    """Project raw prompt blocks into effective-token space unchanged."""
+    raw_blocks = blocks or _default_prompt_blocks(prompt_ids)
+    effective = []
+    cursor = 0
+    for block in raw_blocks:
+        length = block.token_count
+        effective.append(
+            EffectivePromptBlock(
+                block_id=block.block_id,
+                index=block.index,
+                start=cursor,
+                end=cursor + length,
+                raw_start=block.start,
+                raw_end=block.end,
+                role=block.role,
+                kind=block.kind,
+                message_start=block.message_start,
+                message_end=block.message_end,
+                protected=block.protected,
+                compressed=False,
+                metadata=block.metadata,
+            )
+        )
+        cursor += length
+    return effective
+
+
+def _is_default_prompt_block(blocks: list[PromptBlock]) -> bool:
+    return (
+        len(blocks) == 1
+        and blocks[0].kind == "prompt"
+        and blocks[0].message_start == 0
+        and blocks[0].message_end == 0
+    )
+
+
+def _protected_block_indexes(blocks: list[PromptBlock], tail_budget: int) -> set[int]:
+    if not blocks:
+        return set()
+    if _is_default_prompt_block(blocks):
+        return set()
+
+    protected = {
+        index
+        for index, block in enumerate(blocks)
+        if block.protected or block.kind == "generation_prompt" or block.message_start == block.message_end
+    }
+
+    content_indexes = [
+        index
+        for index, block in enumerate(blocks)
+        if block.message_end > block.message_start and block.kind != "generation_prompt"
+    ]
+    if not content_indexes:
+        return protected
+
+    head_count = 2 if len(content_indexes) >= 2 else 1
+    protected.update(content_indexes[:head_count])
+
+    tail_so_far = 0
+    for index in reversed(content_indexes[head_count:]):
+        protected.add(index)
+        tail_so_far += blocks[index].token_count
+        if tail_so_far > tail_budget:
+            break
+
+    return protected
+
+
 async def maybe_compress(
     prompt_ids: list,
     daemon,
     config: PrefillConfig,
-    boundaries: Optional[list] = None,
-    protected_ranges: Optional[list] = None,
+    blocks: Optional[list[PromptBlock]] = None,
 ) -> tuple:
     """Compress prompt if it exceeds the threshold.
 
-    Protects the system prompt (head) and the last turns that fit within
-    tail_budget (tail), compressing only the middle conversation history.
-    Additional protected_ranges (e.g., obsidian_read-note tool outputs) are
-    also exempted from compression.
+    Protects the head block set, the last blocks that fit within tail_budget,
+    and any caller-marked protected blocks (for example obsidian note reads).
+    Compression only happens on whole block spans so metadata can be preserved.
 
     Args:
         prompt_ids: Original prompt token IDs
         daemon: DflashDaemon instance
         config: PrefillConfig
-        boundaries: List of token positions marking message boundaries,
-            derived from _dflash_prefix_boundaries(). Each element is an int
-            (token offset) where a message ends.
-        protected_ranges: List of (start, end) tuples marking token ranges
-            that must not be compressed (e.g., tool outputs).
+        blocks: Prompt manifest in raw token space.
 
     Returns:
-        (compressed_ids, compression_fired) tuple. If compression didn't
-        fire, returns the original prompt_ids unchanged.
+        (compressed_ids, compression_fired, effective_blocks). If compression
+        doesn't fire, returns the original prompt_ids plus identity spans.
     """
+    raw_blocks = blocks or _default_prompt_blocks(prompt_ids)
+
     if not config.enabled or config.drafter_path is None:
-        return prompt_ids, False
+        return prompt_ids, False, materialize_blocks(prompt_ids, raw_blocks)
 
     if len(prompt_ids) < config.threshold:
-        return prompt_ids, False
+        return prompt_ids, False, materialize_blocks(prompt_ids, raw_blocks)
 
-    n = len(prompt_ids)
-    # Build list of protected intervals: [start, end) — never compressed.
-    # Start with head = [0, n) meaning "protect everything" as a default.
-    head_end = n
+    protected_indexes = _protected_block_indexes(raw_blocks, config.tail_budget)
+    compressible_indexes = [
+        index
+        for index, block in enumerate(raw_blocks)
+        if index not in protected_indexes and block.token_count >= 256
+    ]
 
-    if boundaries and len(boundaries) >= 2:
-        # Head: system prompt + first user message (opencode compaction summary).
-        head_end = boundaries[1]
-
-        # Tail: walk backwards from the end, protecting whole turns until
-        # tail_budget is consumed. Each turn = boundaries[i] - boundaries[i-1].
-        # If a turn exceeds the budget, it's still protected (overshoot).
-        tail_so_far = 0
-        tail_start = n
-        for i in range(len(boundaries) - 1, 1, -1):
-            turn_len = boundaries[i] - boundaries[i - 1]
-            if tail_so_far + turn_len > config.tail_budget:
-                tail_start = boundaries[i - 1]
-                break
-            tail_so_far += turn_len
-            tail_start = boundaries[i - 1]
-        else:
-            # All turns fit in tail_budget — nothing to compress in the middle.
-            tail_start = boundaries[1]
-
-        # Prevent head + tail from merging (which would leave nothing to compress).
-        if tail_start <= head_end:
-            tail_start = head_end
-
-        protected: list[list[int]] = [[0, head_end], [tail_start, n]]
-
-    elif boundaries and len(boundaries) >= 1:
-        # Only system boundary (or system + 1 msg) — protect head.
-        head_end = boundaries[0]
-        protected = [[0, head_end]]
-
-    else:
-        # No boundaries — protect nothing (entire prompt is compressible).
-        protected = []
-
-    # Merge additional protected ranges (e.g., obsidian_read-note outputs).
-    if protected_ranges:
-        for ps, pe in protected_ranges:
-            if 0 <= ps < pe <= n:
-                protected.append([ps, pe])
-
-    # Sort by start, then merge overlapping intervals.
-    if protected:
-        protected.sort()
-        merged = [protected[0][:]]
-        for s, e in protected[1:]:
-            if s <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], e)
-            else:
-                merged.append([s, e])
-    else:
-        merged = []
-
-    # Find compressible gaps between protected intervals (and edges of prompt).
-    gaps = []
-    prev_end = 0
-    for s, e in merged:
-        if s - prev_end >= 256:
-            gaps.append((prev_end, s))
-        prev_end = max(prev_end, e)
-    # Gap after last protected interval to end of prompt.
-    if n - prev_end >= 256:
-        gaps.append((prev_end, n))
-
-    total_compressible = sum(e - s for s, e in gaps)
+    total_compressible = sum(raw_blocks[index].token_count for index in compressible_indexes)
     if total_compressible < 1024:
-        return prompt_ids, False
+        return prompt_ids, False, materialize_blocks(prompt_ids, raw_blocks)
 
-    head_tail_len = n - total_compressible
     logger.info(
-        f"pflash compressing {total_compressible} middle tokens "
-        f"(head+tail={head_tail_len} keep={config.keep_ratio})"
+        f"pflash compressing {total_compressible} tokens across {len(compressible_indexes)} blocks "
+        f"(keep={config.keep_ratio})"
     )
 
     t0 = time.monotonic()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
-    # Compress each gap independently and rebuild the prompt.
     compressed = []
-    for i, (gstart, gend) in enumerate(gaps):
-        # Append the protected segment before this gap.
-        if i == 0:
-            compressed.extend(prompt_ids[:gstart])
-        else:
-            compressed.extend(prompt_ids[gaps[i - 1][1]:gstart])
-
-        gap = prompt_ids[gstart:gend]
-        compressed_gap = await loop.run_in_executor(
-            None,
-            lambda g=gap: daemon.compress(
-                g,
-                drafter_path=config.drafter_path,
-                keep_ratio=config.keep_ratio,
-            ),
+    effective_blocks = []
+    cursor = 0
+    for index, block in enumerate(raw_blocks):
+        raw_ids = prompt_ids[block.start:block.end]
+        compressed_ids = raw_ids
+        compressed_block = False
+        if index in compressible_indexes:
+            compressed_ids = await loop.run_in_executor(
+                None,
+                lambda g=raw_ids: daemon.compress(
+                    g,
+                    drafter_path=config.drafter_path,
+                    keep_ratio=config.keep_ratio,
+                ),
+            )
+            compressed_block = True
+        compressed.extend(compressed_ids)
+        effective_blocks.append(
+            EffectivePromptBlock(
+                block_id=block.block_id,
+                index=block.index,
+                start=cursor,
+                end=cursor + len(compressed_ids),
+                raw_start=block.start,
+                raw_end=block.end,
+                role=block.role,
+                kind=block.kind,
+                message_start=block.message_start,
+                message_end=block.message_end,
+                protected=index in protected_indexes,
+                compressed=compressed_block,
+                metadata=block.metadata,
+            )
         )
-        compressed.extend(compressed_gap)
-
-    # Append the final protected tail segment.
-    if gaps:
-        compressed.extend(prompt_ids[gaps[-1][1]:])
-    else:
-        compressed = prompt_ids[:]
+        cursor += len(compressed_ids)
 
     elapsed = time.monotonic() - t0
     logger.info(
-        f"pflash middle {total_compressible} -> {len(compressed) - head_tail_len} tokens "
-        f"({total_compressible / max(len(compressed) - head_tail_len, 1):.1f}x, "
-        f"total {n} -> {len(compressed)}) in {elapsed:.1f}s"
+        f"pflash blocks {total_compressible} -> {sum(block.token_count for block in effective_blocks if block.compressed)} tokens "
+        f"({total_compressible / max(sum(block.token_count for block in effective_blocks if block.compressed), 1):.1f}x, "
+        f"total {len(prompt_ids)} -> {len(compressed)}) in {elapsed:.1f}s"
     )
 
-    return compressed, True
+    return compressed, True, effective_blocks

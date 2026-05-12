@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 
 from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
-from grimoire.dflash.prefill import maybe_compress
+from grimoire.dflash.prefill import PromptBlock, materialize_blocks, maybe_compress
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
 from grimoire.plugins import plugin_manager
@@ -326,6 +326,7 @@ class ActiveModel:
             cap=pc_cap,
             cache_dir=f"/var/lib/grimoire/prefix_cache/{self.name}",
             kv_k_type=self.cfg.get("cache-type-k", "q8_0"),
+            kv_v_type=self.cfg.get("cache-type-v", "q8_0"),
             fa_window=self.cfg.get("fa-window", 2048),
         )
         self.prefix_cache.load()
@@ -362,6 +363,7 @@ class ActiveModel:
             prefill_threshold=self.prefill_config.threshold,
             prefill_keep_ratio=self.prefill_config.keep_ratio,
             kv_k_type=self.cfg.get("cache-type-k", "q8_0"),
+            kv_v_type=self.cfg.get("cache-type-v", "q8_0"),
             fa_window=self.cfg.get("fa-window", 2048),
         )
         self.dflash_daemon.spawn(timeout=self.cfg.get("startup-timeout", DEFAULT_STARTUP_TIMEOUT))
@@ -1200,14 +1202,38 @@ def _qwen_last_query_index(messages):
     raise ValueError("No user query found in messages.")
 
 
-def _qwen_prompt_blocks(messages, add_generation_prompt=False):
+DFLASH_PROTECTED_TOOLS = {"obsidian_read-note"}
+
+
+def _tool_name_from_message(msg, tool_call_names=None):
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("role") == "tool" and isinstance(msg.get("tool"), dict):
+        return msg["tool"].get("name")
+    if msg.get("type") == "tool" and isinstance(msg.get("tool"), str):
+        return msg["tool"]
+    if msg.get("role") == "tool" and tool_call_names and isinstance(msg.get("tool_call_id"), str):
+        return tool_call_names.get(msg.get("tool_call_id"))
+    return None
+
+
+def _qwen_prompt_block_specs(messages, add_generation_prompt=False):
     if not messages:
         raise ValueError("No messages provided.")
 
-    blocks = []
+    specs = []
+    tool_call_names = {}
     if isinstance(messages[0], dict) and messages[0].get("role") == "system":
         content = _qwen_render_content(messages[0].get("content"), is_system_content=True).strip()
-        blocks.append(f"<|im_start|>system\n{content}<|im_end|>\n")
+        specs.append({
+            "text": f"<|im_start|>system\n{content}<|im_end|>\n",
+            "role": "system",
+            "kind": "system",
+            "message_start": 0,
+            "message_end": 1,
+            "protected": False,
+            "metadata": {"message_index": 0},
+        })
 
     last_query_index = _qwen_last_query_index(messages)
     index = 0
@@ -1223,7 +1249,15 @@ def _qwen_prompt_blocks(messages, add_generation_prompt=False):
             continue
         if role == "user":
             content = _qwen_render_content(message.get("content")).strip()
-            blocks.append(f"<|im_start|>user\n{content}<|im_end|>\n")
+            specs.append({
+                "text": f"<|im_start|>user\n{content}<|im_end|>\n",
+                "role": "user",
+                "kind": "user",
+                "message_start": index,
+                "message_end": index + 1,
+                "protected": False,
+                "metadata": {"message_index": index},
+            })
             index += 1
             continue
         if role == "assistant":
@@ -1244,6 +1278,7 @@ def _qwen_prompt_blocks(messages, add_generation_prompt=False):
             tool_calls = message.get("tool_calls") or []
             if isinstance(tool_calls, dict):
                 tool_calls = []
+            tool_names = []
             for i, tool_call in enumerate(tool_calls):
                 if not isinstance(tool_call, dict):
                     continue
@@ -1253,6 +1288,10 @@ def _qwen_prompt_blocks(messages, add_generation_prompt=False):
                 name = fn.get("name")
                 if not isinstance(name, str) or not name:
                     continue
+                tc_id = tool_call.get("id")
+                if isinstance(tc_id, str):
+                    tool_call_names[tc_id] = name
+                tool_names.append(name)
                 if i == 0:
                     if content:
                         block += f"\n\n<tool_call>\n<function={name}>\n"
@@ -1272,26 +1311,68 @@ def _qwen_prompt_blocks(messages, add_generation_prompt=False):
                 block += "</function>\n</tool_call>"
 
             block += "<|im_end|>\n"
-            blocks.append(block)
+            specs.append({
+                "text": block,
+                "role": "assistant",
+                "kind": "assistant",
+                "message_start": index,
+                "message_end": index + 1,
+                "protected": False,
+                "metadata": {
+                    "message_index": index,
+                    "reasoning": bool(reasoning_content),
+                    "tool_names": tool_names,
+                },
+            })
             index += 1
             continue
         if role == "tool":
             parts = ["<|im_start|>user"]
+            group_start = index
+            tool_names = []
+            protected = False
             while index < len(messages):
                 tool_msg = messages[index]
                 if not isinstance(tool_msg, dict) or tool_msg.get("role") != "tool":
                     break
                 content = _qwen_render_content(tool_msg.get("content")).strip()
                 parts.append(f"\n<tool_response>\n{content}\n</tool_response>")
+                tool_name = _tool_name_from_message(tool_msg, tool_call_names)
+                if isinstance(tool_name, str):
+                    tool_names.append(tool_name)
+                    protected = protected or tool_name in DFLASH_PROTECTED_TOOLS
                 index += 1
             parts.append("<|im_end|>\n")
-            blocks.append("".join(parts))
+            specs.append({
+                "text": "".join(parts),
+                "role": "tool",
+                "kind": "tool_group",
+                "message_start": group_start,
+                "message_end": index,
+                "protected": protected,
+                "metadata": {
+                    "message_indexes": list(range(group_start, index)),
+                    "tool_names": tool_names,
+                },
+            })
             continue
         raise ValueError("Unexpected message role.")
 
     if add_generation_prompt:
-        blocks.append("<|im_start|>assistant\n<think>\n")
-    return blocks
+        specs.append({
+            "text": "<|im_start|>assistant\n<think>\n",
+            "role": "assistant",
+            "kind": "generation_prompt",
+            "message_start": len(messages),
+            "message_end": len(messages),
+            "protected": True,
+            "metadata": {"generation_prompt": True},
+        })
+    return specs
+
+
+def _qwen_prompt_blocks(messages, add_generation_prompt=False):
+    return [spec["text"] for spec in _qwen_prompt_block_specs(messages, add_generation_prompt=add_generation_prompt)]
 
 
 def _prompt_block_cache_for(active):
@@ -1304,8 +1385,8 @@ def _prompt_block_cache_for(active):
     return cache
 
 
-def _encode_qwen_prompt_blocks(tokenizer, blocks, cache=None):
-    prompt_ids = []
+def _tokenize_qwen_prompt_blocks(tokenizer, blocks, cache=None):
+    encoded_blocks = []
     for block in blocks:
         block_ids = None
         if cache is not None:
@@ -1319,8 +1400,148 @@ def _encode_qwen_prompt_blocks(tokenizer, blocks, cache=None):
                 cache.move_to_end(block)
                 while len(cache) > QWEN_PROMPT_BLOCK_CACHE_SIZE:
                     cache.popitem(last=False)
+        encoded_blocks.append(block_ids)
+    return encoded_blocks
+
+
+def _encode_qwen_prompt_blocks(tokenizer, blocks, cache=None):
+    prompt_ids = []
+    for block_ids in _tokenize_qwen_prompt_blocks(tokenizer, blocks, cache=cache):
         prompt_ids.extend(block_ids)
     return prompt_ids
+
+
+def _generic_prompt_blocks(messages, tokenizer, prompt_ids, add_generation_prompt=False):
+    if not messages:
+        return []
+
+    blocks = []
+    prev = 0
+    tool_call_names = {}
+    for index, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                fn_name = fn.get("name")
+                if isinstance(tc_id, str) and isinstance(fn_name, str):
+                    tool_call_names[tc_id] = fn_name
+        rendered = tokenizer.apply_chat_template(
+            messages[: index + 1], tokenize=False, add_generation_prompt=False
+        )
+        encoded = tokenizer.encode(rendered, add_special_tokens=False)
+        end = len(encoded)
+        if end <= prev or end > len(prompt_ids) or prompt_ids[:end] != encoded:
+            raise ValueError(f"Unable to build prompt block span for message {index}")
+
+        tool_name = _tool_name_from_message(msg, tool_call_names)
+        role = str(msg.get("role") or "unknown")
+        kind = role
+        if role == "assistant" and msg.get("tool_calls"):
+            kind = "assistant"
+        if role == "tool":
+            kind = "tool"
+
+        metadata = {"message_index": index}
+        if isinstance(tool_name, str):
+            metadata["tool_name"] = tool_name
+
+        blocks.append(
+            PromptBlock(
+                block_id=f"message:{index}",
+                index=len(blocks),
+                start=prev,
+                end=end,
+                role=role,
+                kind=kind,
+                message_start=index,
+                message_end=index + 1,
+                protected=tool_name in DFLASH_PROTECTED_TOOLS,
+                metadata=metadata,
+            )
+        )
+        prev = end
+
+    if add_generation_prompt and prev < len(prompt_ids):
+        blocks.append(
+            PromptBlock(
+                block_id="generation:0",
+                index=len(blocks),
+                start=prev,
+                end=len(prompt_ids),
+                role="assistant",
+                kind="generation_prompt",
+                message_start=len(messages),
+                message_end=len(messages),
+                protected=True,
+                metadata={"generation_prompt": True},
+            )
+        )
+        prev = len(prompt_ids)
+
+    if prev != len(prompt_ids):
+        raise ValueError("Prompt blocks did not cover the full prompt")
+    return blocks
+
+
+def _prompt_layout_from_messages(tokenizer, messages, add_generation_prompt=False, model_cfg=None, active=None):
+    family = model_cfg.get("family") if isinstance(model_cfg, dict) else None
+    if family == "qwen":
+        specs = _qwen_prompt_block_specs(messages, add_generation_prompt=add_generation_prompt)
+        block_texts = [spec["text"] for spec in specs]
+        encoded_blocks = _tokenize_qwen_prompt_blocks(
+            tokenizer,
+            block_texts,
+            cache=_prompt_block_cache_for(active),
+        )
+        prompt_ids = []
+        prompt_blocks = []
+        cursor = 0
+        for index, (spec, block_ids) in enumerate(zip(specs, encoded_blocks)):
+            start = cursor
+            cursor += len(block_ids)
+            prompt_ids.extend(block_ids)
+            prompt_blocks.append(
+                PromptBlock(
+                    block_id=f"block:{index}",
+                    index=index,
+                    start=start,
+                    end=cursor,
+                    role=spec["role"],
+                    kind=spec["kind"],
+                    message_start=spec["message_start"],
+                    message_end=spec["message_end"],
+                    protected=bool(spec.get("protected")),
+                    metadata=spec.get("metadata"),
+                )
+            )
+        return prompt_ids, prompt_blocks
+
+    prompt_ids = _prompt_ids_from_messages(
+        tokenizer,
+        messages,
+        add_generation_prompt=add_generation_prompt,
+        model_cfg=model_cfg,
+        active=active,
+    )
+    return prompt_ids, _generic_prompt_blocks(
+        messages,
+        tokenizer,
+        prompt_ids,
+        add_generation_prompt=add_generation_prompt,
+    )
+
+
+def _prefix_cache_boundaries(blocks):
+    return [
+        block.end
+        for block in blocks or []
+        if block.message_end > block.message_start and block.kind != "generation_prompt" and block.end > 0
+    ]
 
 
 def _prompt_ids_from_messages(tokenizer, messages, add_generation_prompt=False, model_cfg=None, active=None):
@@ -1658,93 +1879,6 @@ def _dflash_collect_stop_ids(tokenizer, payload_stop, cfg):
     return stop_ids, stop_seqs
 
 
-def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
-    """Compute message boundaries as valid prefix positions in prompt_ids.
-
-    Walks the message list, rendering progressively longer prefixes through the
-    chat template, to find the token offset of every message boundary. Only
-    boundaries that actually match prompt_ids[:n] are kept.
-
-    Load-bearing invariant: callers build prompt_ids with
-    add_generation_prompt=True, while this helper renders each prefix with
-    add_generation_prompt=False. That asymmetry is what makes the per-message
-    encoded lengths strictly less than len(prompt_ids) (the trailing generation
-    prompt lives only in prompt_ids), so boundaries[-1] lands on the end of the
-    final user-message content and boundaries[-2] on its start. maybe_compress
-    relies on this to pick the tail-protect slice.
-
-    Returns (boundaries, protected_ranges) where boundaries is a list of int
-    boundary positions (ascending), and protected_ranges is a list of
-    (start, end) tuples marking token ranges that must not be compressed.
-    """
-    boundaries = []
-    if not messages:
-        return [], []
-
-    for i, msg in enumerate(messages):
-        if not isinstance(msg, dict):
-            continue
-        prefix_msgs = messages[: i + 1]
-        try:
-            rendered = tokenizer.apply_chat_template(
-                prefix_msgs, tokenize=False, add_generation_prompt=False
-            )
-            encoded = tokenizer.encode(rendered, add_special_tokens=False)
-            n = len(encoded)
-        except Exception:
-            continue
-        if n <= 0 or n >= len(prompt_ids):
-            continue
-        if prompt_ids[:n] == encoded:
-            boundaries.append(n)
-
-    # Detect obsidian_read-note tool output messages and mark their token
-    # ranges as protected (exempt from PFlash compression).
-    protected_ranges = []
-    _protected_tools = {"obsidian_read-note"}
-    tool_call_names: dict[str, str] = {}
-    for i, msg in enumerate(messages):
-        if not isinstance(msg, dict):
-            continue
-        tool_name = None
-        if msg.get("role") == "assistant":
-            for tc in msg.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                tc_id = tc.get("id")
-                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-                fn_name = fn.get("name")
-                if tc_id and isinstance(fn_name, str):
-                    tool_call_names[tc_id] = fn_name
-        if msg.get("role") == "tool" and isinstance(msg.get("tool"), dict):
-            tool_name = msg["tool"].get("name")
-        if msg.get("type") == "tool" and isinstance(msg.get("tool"), str):
-            tool_name = msg["tool"]
-        if tool_name is None and msg.get("role") == "tool":
-            tc_id = msg.get("tool_call_id")
-            if isinstance(tc_id, str):
-                tool_name = tool_call_names.get(tc_id)
-        if tool_name not in _protected_tools:
-            continue
-        try:
-            prefix_msgs = messages[:i]
-            rendered_before = tokenizer.apply_chat_template(
-                prefix_msgs, tokenize=False, add_generation_prompt=False
-            )
-            start = len(tokenizer.encode(rendered_before, add_special_tokens=False))
-            prefix_msgs_after = messages[: i + 1]
-            rendered_after = tokenizer.apply_chat_template(
-                prefix_msgs_after, tokenize=False, add_generation_prompt=False
-            )
-            end = len(tokenizer.encode(rendered_after, add_special_tokens=False))
-        except Exception:
-            continue
-        if 0 <= start < end <= len(prompt_ids):
-            protected_ranges.append((start, end))
-
-    return boundaries, protected_ranges
-
-
 async def _proxy_dflash(requested_model, payload, active, user_hash, conversation_id):
     """Handle chat completions for the dflash backend.
 
@@ -1776,7 +1910,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         raise HTTPException(status_code=503, detail=f"Tokenizer unavailable: {e}")
 
     try:
-        prompt_ids = _prompt_ids_from_messages(
+        prompt_ids, prompt_blocks = _prompt_layout_from_messages(
             tokenizer,
             messages,
             add_generation_prompt=True,
@@ -1787,6 +1921,18 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         raise HTTPException(status_code=400, detail=f"Failed to render chat template: {e}")
 
     ctx_size = int(model_cfg.get("ctx-size", DEFAULT_CTX_SIZE))
+    max_raw_context = model_cfg.get("max-raw-context", model_cfg.get("max_raw_context"))
+    if max_raw_context is not None:
+        max_raw_context = int(max_raw_context)
+        if len(prompt_ids) > max_raw_context:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"raw prompt ({len(prompt_ids)} tokens) exceeds max raw context "
+                    f"{max_raw_context}"
+                ),
+            )
+
     if len(prompt_ids) + max_tokens > ctx_size:
         raise HTTPException(
             status_code=400,
@@ -1798,14 +1944,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
     prefix_cache = active.prefix_cache
     prefill_config = active.prefill_config
-    boundaries = None
-    protected_ranges = None
-
-    def _get_prefix_boundaries():
-        nonlocal boundaries, protected_ranges
-        if boundaries is None:
-            boundaries, protected_ranges = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
-        return boundaries, protected_ranges
+    prefix_boundaries = _prefix_cache_boundaries(prompt_blocks)
 
     stop_ids, stop_seqs = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
 
@@ -1821,19 +1960,21 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         async with active.dflash_lock():
             # Long-context compression
             effective_ids = prompt_ids
+            effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
             if prefill_config and prefill_config.enabled:
-                compress_boundaries = None
-                compress_protected = None
-                if prefill_config.drafter_path and len(prompt_ids) >= prefill_config.threshold:
-                    compress_boundaries, compress_protected = _get_prefix_boundaries()
                 try:
-                    effective_ids, _ = await maybe_compress(
-                        prompt_ids, daemon, prefill_config, boundaries=compress_boundaries,
-                        protected_ranges=compress_protected if compress_protected else None
+                    effective_ids, _, effective_blocks = await maybe_compress(
+                        prompt_ids,
+                        daemon,
+                        prefill_config,
+                        blocks=prompt_blocks,
                     )
                 except Exception as e:
                     logger.error(f"pflash compression failed: {e}")
                     effective_ids = prompt_ids
+                    effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
+
+            effective_boundaries = _prefix_cache_boundaries(effective_blocks)
 
             prefix_hit = None
             snap_slot = None
@@ -1873,8 +2014,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             if prefix_hit is None:
                 pc = prefix_cache
                 if pc and not pc.disabled:
-                    cache_boundaries, _ = _get_prefix_boundaries()
-                    prefix_hit = pc.lookup(effective_ids, boundaries=cache_boundaries)
+                    prefix_hit = pc.lookup(effective_ids, boundaries=effective_boundaries)
             # New conversation: reserve a session slot for an inline prompt snapshot.
             if conversation_id and sk and session_slot is None:
                 if swap and session_key is not None:
@@ -1894,8 +2034,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             else:
                 pc = prefix_cache
                 if pc and not pc.disabled:
-                    cache_boundaries, _ = _get_prefix_boundaries()
-                    prep = pc.prepare_inline_snap(effective_ids, cache_boundaries[0]) if cache_boundaries else None
+                    prep = pc.prepare_inline_snap(effective_ids, effective_boundaries[0]) if effective_boundaries else None
                     if prep:
                         snap_slot, snap_pos = prep
 

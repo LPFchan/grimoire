@@ -37,7 +37,8 @@ class PrefixCache:
         cap: Maximum number of snapshot slots (0-8). 0 disables caching.
         cache_dir: Directory for persistent metadata. Snapshots save/restore
                    via the daemon's SNAPSHOT/RESTORE commands.
-        kv_k_type: KV cache type (part of cache key hash).
+        kv_k_type: KV K cache type (part of cache key hash).
+        kv_v_type: KV V cache type (part of cache key hash).
         fa_window: Flash attention window (part of cache key hash).
     """
 
@@ -46,9 +47,11 @@ class PrefixCache:
         cap: int = 4,
         cache_dir: str = "/var/lib/grimoire/prefix_cache",
         kv_k_type: str = "q8_0",
+        kv_v_type: str = "q8_0",
         fa_window: int = 2048,
     ):
         self.kv_k_type = kv_k_type
+        self.kv_v_type = kv_v_type
         self.fa_window = fa_window
         self.cache_dir = Path(cache_dir)
 
@@ -79,6 +82,8 @@ class PrefixCache:
         h.update(struct.pack("<I", len(prefix_ids)))
         h.update(struct.pack(f"<{len(prefix_ids)}i", *prefix_ids))
         h.update(str(self.kv_k_type).encode())
+        h.update(b"\x00")
+        h.update(str(self.kv_v_type).encode())
         h.update(b"\x00")
         h.update(struct.pack("<I", self.fa_window or 0))
         return h.digest()[:16]

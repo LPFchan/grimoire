@@ -45,6 +45,7 @@ class DflashDaemon:
         prefill_threshold: int = 32000,
         prefill_keep_ratio: float = 0.05,
         kv_k_type: str = "q8_0",
+        kv_v_type: str = "q8_0",
         fa_window: int = 2048,
     ):
         self.target_path = target_path
@@ -55,6 +56,7 @@ class DflashDaemon:
         self.prefill_threshold = prefill_threshold
         self.prefill_keep_ratio = prefill_keep_ratio
         self.kv_k_type = kv_k_type
+        self.kv_v_type = kv_v_type
         self.fa_window = fa_window
 
         self.proc: Optional[subprocess.Popen] = None
@@ -97,6 +99,7 @@ class DflashDaemon:
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
         env["DFLASH27B_KV_K"] = self.kv_k_type
+        env["DFLASH27B_KV_V"] = self.kv_v_type
         env["DFLASH27B_FA_WINDOW"] = str(self.fa_window)
 
         logger.info(f"Starting dflash daemon on GPU {self.gpu_id}")

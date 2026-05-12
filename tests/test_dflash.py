@@ -380,8 +380,16 @@ def _expected_protected_tool_ranges(messages, boundaries=None, protected_tools=N
             continue
         if msg.get("role") != "tool":
             continue
-        tc_id = msg.get("tool_call_id")
-        if tool_call_names.get(tc_id) not in protected_names:
+        tool_name = None
+        if isinstance(msg.get("tool"), dict):
+            tool_name = msg["tool"].get("name")
+        elif isinstance(msg.get("tool"), str):
+            tool_name = msg.get("tool")
+        if tool_name is None:
+            tc_id = msg.get("tool_call_id")
+            if isinstance(tc_id, str):
+                tool_name = tool_call_names.get(tc_id)
+        if tool_name not in protected_names:
             continue
         if tokenizer is not None and prompt_ids is not None:
             rendered_before = tokenizer.apply_chat_template(
@@ -399,6 +407,45 @@ def _expected_protected_tool_ranges(messages, boundaries=None, protected_tools=N
             end = boundaries[i]
         expected.append((start, end))
     return expected
+
+
+def _synthetic_prompt_blocks(boundaries, prompt_len, protected_indexes=None, include_generation=True):
+    protected_indexes = set(protected_indexes or ())
+    blocks = []
+    cursor = 0
+    for i, end in enumerate(boundaries or []):
+        blocks.append(
+            entrypoint.PromptBlock(
+                block_id=f"message:{i}",
+                index=len(blocks),
+                start=cursor,
+                end=end,
+                role="message",
+                kind="message",
+                message_start=i,
+                message_end=i + 1,
+                protected=i in protected_indexes,
+                metadata={"message_index": i},
+            )
+        )
+        cursor = end
+
+    if include_generation and cursor < prompt_len:
+        blocks.append(
+            entrypoint.PromptBlock(
+                block_id="generation:0",
+                index=len(blocks),
+                start=cursor,
+                end=prompt_len,
+                role="assistant",
+                kind="generation_prompt",
+                message_start=len(boundaries or []),
+                message_end=len(boundaries or []),
+                protected=True,
+                metadata={"generation_prompt": True},
+            )
+        )
+    return blocks
 
 
 class DflashRegistryValidationTests(unittest.TestCase):
@@ -799,35 +846,39 @@ class DflashHelperTests(unittest.TestCase):
         self.assertNotIn(ord("E"), ids)
         self.assertIn(tuple(ord(c) for c in "END"), stop_seqs)
 
-    def test_prefix_boundaries_returns_one_per_message(self):
+    def test_prompt_layout_returns_one_block_per_message_plus_generation(self):
         msgs = [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "hi"},
         ]
-        prompt_text = self.tok.apply_chat_template(msgs, add_generation_prompt=True)
-        prompt_ids = self.tok.encode(prompt_text)
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        # One boundary per message; each must be a valid prefix length of prompt_ids.
-        self.assertEqual(len(boundaries), 2)
-        self.assertEqual(len(protected), 0)
+        prompt_ids, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
+        )
+        self.assertEqual(len(blocks), 3)
+        self.assertEqual(blocks[0].message_start, 0)
+        self.assertEqual(blocks[1].message_start, 1)
+        self.assertEqual(blocks[-1].kind, "generation_prompt")
         sys_prefix = self.tok.encode(self.tok.apply_chat_template(msgs[:1]))
-        self.assertEqual(boundaries[0], len(sys_prefix))
-        self.assertEqual(prompt_ids[:boundaries[0]], sys_prefix)
+        self.assertEqual(blocks[0].end, len(sys_prefix))
+        self.assertEqual(prompt_ids[:blocks[0].end], sys_prefix)
         full_no_gen = self.tok.encode(self.tok.apply_chat_template(msgs))
-        self.assertEqual(boundaries[1], len(full_no_gen))
-        self.assertEqual(prompt_ids[:boundaries[1]], full_no_gen)
+        self.assertEqual(blocks[1].end, len(full_no_gen))
+        self.assertEqual(prompt_ids[:blocks[1].end], full_no_gen)
 
-    def test_prefix_boundaries_user_only_returns_one_boundary(self):
+    def test_prompt_layout_user_only_returns_one_message_block(self):
         msgs = [{"role": "user", "content": "hi"}]
-        prompt_ids = self.tok.encode(self.tok.apply_chat_template(msgs, add_generation_prompt=True))
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        # The user-content boundary is recorded; the generation-prompt suffix is not.
-        self.assertEqual(len(boundaries), 1)
-        self.assertEqual(len(protected), 0)
+        prompt_ids, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
+        )
+        self.assertEqual(len(blocks), 2)
+        self.assertEqual(blocks[0].message_start, 0)
+        self.assertEqual(blocks[0].message_end, 1)
+        self.assertEqual(blocks[1].kind, "generation_prompt")
         user_prefix = self.tok.encode(self.tok.apply_chat_template(msgs))
-        self.assertEqual(boundaries[0], len(user_prefix))
+        self.assertEqual(blocks[0].end, len(user_prefix))
+        self.assertEqual(prompt_ids[:blocks[0].end], user_prefix)
 
-    def test_prefix_boundaries_walks_multi_turn_conversation(self):
+    def test_prompt_layout_walks_multi_turn_conversation(self):
         msgs = [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "first question"},
@@ -836,29 +887,21 @@ class DflashHelperTests(unittest.TestCase):
             {"role": "assistant", "content": "second answer"},
             {"role": "user", "content": "third question"},
         ]
-        prompt_ids = self.tok.encode(
-            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        prompt_ids, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
         )
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        # One boundary per message — none collapse to the full prompt because the
-        # generation-prompt suffix lives only in prompt_ids.
-        self.assertEqual(len(boundaries), len(msgs))
-        self.assertEqual(len(protected), 0)
-        # Boundaries are strictly ascending and each is a valid prefix.
-        self.assertEqual(boundaries, sorted(boundaries))
-        self.assertEqual(len(set(boundaries)), len(boundaries))
-        # Each boundary is a valid prefix length: prompt_ids[:n] equals the
-        # encoded prefix of messages[:i+1] for some i.
-        for i, n in enumerate(boundaries):
+        self.assertEqual(len(blocks), len(msgs) + 1)
+        ends = [block.end for block in blocks[:-1]]
+        self.assertEqual(ends, sorted(ends))
+        self.assertEqual(len(set(ends)), len(ends))
+        for i, n in enumerate(ends):
             expected = self.tok.encode(self.tok.apply_chat_template(msgs[: i + 1]))
             self.assertEqual(n, len(expected))
             self.assertEqual(prompt_ids[:n], expected)
-        # Specifically, boundaries[-2] is the start of the final user message,
-        # which is what maybe_compress relies on for tail protection.
         last_user_start = self.tok.encode(self.tok.apply_chat_template(msgs[:-1]))
-        self.assertEqual(boundaries[-2], len(last_user_start))
+        self.assertEqual(blocks[-2].start, len(last_user_start))
 
-    def test_prefix_boundaries_returns_protected_ranges_for_obsidian_read_note(self):
+    def test_prompt_layout_marks_obsidian_read_note_block_protected(self):
         msgs = [
             {"role": "system", "content": "you are helpful"},
             {"role": "user", "content": "read this note"},
@@ -871,21 +914,15 @@ class DflashHelperTests(unittest.TestCase):
             {"role": "assistant", "content": "Here's what the note says..."},
             {"role": "user", "content": "thanks"},
         ]
-        prompt_ids = self.tok.encode(
-            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        _, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
         )
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        self.assertEqual(len(boundaries), len(msgs))
-        # The obsidian_read-note tool output (index 3) should be in protected ranges.
-        self.assertEqual(len(protected), 1)
-        note_start, note_end = protected[0]
-        # The protected range should cover the tool message boundary span.
-        tool_start = boundaries[2]  # end of assistant message before tool
-        tool_end = boundaries[3]  # end of tool message
-        self.assertEqual(note_start, tool_start)
-        self.assertEqual(note_end, tool_end)
+        tool_block = next(block for block in blocks if block.kind == "tool")
+        self.assertTrue(tool_block.protected)
+        self.assertEqual(tool_block.message_start, 3)
+        self.assertEqual(tool_block.message_end, 4)
 
-    def test_prefix_boundaries_protects_multiple_obsidian_read_note_messages(self):
+    def test_prompt_layout_groups_adjacent_tool_messages(self):
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "read notes"},
@@ -902,18 +939,15 @@ class DflashHelperTests(unittest.TestCase):
             },
             {"role": "assistant", "content": "done"},
         ]
-        prompt_ids = self.tok.encode(
-            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        _, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
         )
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        self.assertEqual(len(boundaries), len(msgs))
-        # Two tool messages should produce two protected ranges.
-        self.assertEqual(len(protected), 2)
-        for ps, pe in protected:
-            self.assertLess(ps, pe)
-        self.assertLess(protected[0][1], protected[1][0])
+        tool_blocks = [block for block in blocks if block.kind == "tool"]
+        self.assertEqual(len(tool_blocks), 2)
+        self.assertTrue(all(block.protected for block in tool_blocks))
+        self.assertLess(tool_blocks[0].end, tool_blocks[1].start)
 
-    def test_prefix_boundaries_ignores_non_obsidian_tools(self):
+    def test_prompt_layout_ignores_non_obsidian_tools(self):
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "do something"},
@@ -924,15 +958,13 @@ class DflashHelperTests(unittest.TestCase):
             },
             {"role": "assistant", "content": "ok"},
         ]
-        prompt_ids = self.tok.encode(
-            self.tok.apply_chat_template(msgs, add_generation_prompt=True)
+        _, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
         )
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        self.assertEqual(len(boundaries), len(msgs))
-        # bash tool should not produce protected ranges.
-        self.assertEqual(len(protected), 0)
+        tool_block = next(block for block in blocks if block.kind == "tool")
+        self.assertFalse(tool_block.protected)
 
-    def test_prefix_boundaries_protects_obsidian_tool_output_via_tool_call_id(self):
+    def test_prompt_layout_protects_obsidian_tool_output_via_tool_call_id(self):
         msgs = [
             {"role": "system", "content": "sys"},
             {"role": "user", "content": "read note"},
@@ -951,10 +983,13 @@ class DflashHelperTests(unittest.TestCase):
                 "content": "protected note body",
             },
         ]
-        prompt_ids = self.tok.encode(self.tok.apply_chat_template(msgs, add_generation_prompt=True))
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
-        self.assertEqual(len(protected), 1)
-        self.assertEqual(protected[0], (boundaries[2], boundaries[3]))
+        _, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, msgs, add_generation_prompt=True, model_cfg={}, active=None
+        )
+        tool_block = next(block for block in blocks if block.kind == "tool")
+        self.assertTrue(tool_block.protected)
+        self.assertEqual(tool_block.message_start, 3)
+        self.assertEqual(tool_block.message_end, 4)
 
 
 class OpenCodeSessionFixtureTests(unittest.TestCase):
@@ -963,44 +998,38 @@ class OpenCodeSessionFixtureTests(unittest.TestCase):
     def setUp(self):
         self.tok = FakeTokenizer()
 
-    def test_real_session_obsidian_tool_outputs_become_protected_ranges(self):
+    def test_real_session_obsidian_tool_outputs_become_protected_blocks(self):
         messages = _load_opencode_session_messages(
             "opencode_ses_1eb7_Update_machine_config_with_Obsidian_resume.json"
         )
-        prompt_ids = self.tok.encode(
-            self.tok.apply_chat_template(messages, add_generation_prompt=True)
+        prompt_ids, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, messages, add_generation_prompt=True, model_cfg={}, active=None
         )
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(messages, self.tok, prompt_ids)
-
         self.assertGreaterEqual(len(messages), 6)
-        self.assertEqual(len(boundaries), len(messages))
+        protected = [(block.start, block.end) for block in blocks if block.protected and block.kind == "tool"]
+        boundaries = [block.end for block in blocks if block.kind != "generation_prompt"]
         self.assertTrue(protected)
-        self.assertEqual(
-            protected,
-            _expected_protected_tool_ranges(messages, boundaries),
-        )
+        self.assertEqual(protected, _expected_protected_tool_ranges(messages, boundaries, tokenizer=self.tok, prompt_ids=prompt_ids))
 
-    def test_real_session_without_obsidian_reads_has_no_protected_ranges(self):
+    def test_real_session_without_obsidian_reads_has_no_protected_blocks(self):
         messages = _load_opencode_session_messages(
             "opencode_ses_1e9c_Export_10_latest_opencode_conversations_to_JSON.json"
         )
-        prompt_ids = self.tok.encode(
-            self.tok.apply_chat_template(messages, add_generation_prompt=True)
+        _, blocks = entrypoint._prompt_layout_from_messages(
+            self.tok, messages, add_generation_prompt=True, model_cfg={}, active=None
         )
-        boundaries, protected = entrypoint._dflash_prefix_boundaries(messages, self.tok, prompt_ids)
-
-        self.assertEqual(len(boundaries), len(messages))
+        protected = [block for block in blocks if block.protected and block.kind == "tool"]
         self.assertEqual(protected, [])
 
 
 class MaybeCompressHeadTailTests(unittest.TestCase):
-    """maybe_compress must protect head + tail and only compress the middle slice."""
+    """maybe_compress must protect head + tail and only compress middle blocks."""
 
     def setUp(self):
         from grimoire.dflash.prefill import PrefillConfig
         self.PrefillConfig = PrefillConfig
 
-    def _run(self, prompt_ids, boundaries, keep_ratio=0.5, threshold=10, tail_budget=600):
+    def _run(self, prompt_ids, blocks, keep_ratio=0.5, threshold=10, tail_budget=600):
         """Drive maybe_compress synchronously with a stub daemon."""
         import asyncio
         from grimoire.dflash.prefill import maybe_compress
@@ -1008,10 +1037,10 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         class StubDaemon:
             def __init__(self, ratio):
                 self.ratio = ratio
-                self.compress_called_with = None
+                self.compress_calls = []
 
             def compress(self, ids, drafter_path, keep_ratio):
-                self.compress_called_with = list(ids)
+                self.compress_calls.append(list(ids))
                 keep = max(1, int(len(ids) * self.ratio))
                 # Return a fixed sentinel so the test can detect the compressed slice.
                 return [-7] * keep
@@ -1024,10 +1053,10 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
             drafter_path="/dummy",
             tail_budget=tail_budget,
         )
-        compressed, fired = asyncio.run(
-            maybe_compress(prompt_ids, daemon, cfg, boundaries=boundaries, protected_ranges=None)
+        compressed, fired, effective_blocks = asyncio.run(
+            maybe_compress(prompt_ids, daemon, cfg, blocks=blocks)
         )
-        return compressed, fired, daemon
+        return compressed, fired, daemon, effective_blocks
 
     def test_head_and_tail_are_preserved_byte_identical(self):
         # 3000-token prompt, 6 boundaries:
@@ -1045,30 +1074,30 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         # budget by msg 4's 500 tokens — intentional whole-turn protection).
         prompt_ids = list(range(3000))
         boundaries = [50, 200, 1500, 2000, 2500, 2800]
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
         expected_tail_start = 2000
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=1000, tail_budget=700
+        compressed, fired, daemon, effective_blocks = self._run(
+            prompt_ids, blocks, keep_ratio=0.1, threshold=1000, tail_budget=700
         )
         self.assertTrue(fired)
-        # Head untouched.
         self.assertEqual(compressed[:200], prompt_ids[:200])
-        # Tail untouched (slice from end since compressed length differs).
         tail_len = len(prompt_ids) - expected_tail_start
         self.assertEqual(compressed[-tail_len:], prompt_ids[expected_tail_start:])
-        # Daemon saw only the middle slice (head_end .. tail_start).
-        self.assertEqual(daemon.compress_called_with, prompt_ids[200:expected_tail_start])
+        self.assertEqual(daemon.compress_calls, [prompt_ids[200:1500], prompt_ids[1500:2000]])
+        self.assertEqual([block.index for block in effective_blocks if block.compressed], [2, 3])
 
     def test_all_turns_fit_in_tail_budget_no_compression(self):
         # 4 boundaries totalling 1500 tokens of conversation, tail_budget=2000:
         # the loop's else clause fires, compress_end == compress_start, no compress.
         prompt_ids = list(range(2500))
         boundaries = [500, 1000, 1500, 2000]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=2000
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
+        compressed, fired, daemon, _ = self._run(
+            prompt_ids, blocks, keep_ratio=0.1, threshold=100, tail_budget=2000
         )
         self.assertFalse(fired)
         self.assertEqual(compressed, prompt_ids)
-        self.assertIsNone(daemon.compress_called_with)
+        self.assertEqual(daemon.compress_calls, [])
 
     def test_single_huge_last_turn_overshoots_budget(self):
         # Last turn alone is 3000 tokens, tail_budget=500. The first iteration
@@ -1079,15 +1108,15 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         # and forms compress_start (head protection).
         prompt_ids = list(range(4500))
         boundaries = [50, 100, 600, 1100, 1400, 4400]  # last turn = 4400-1400 = 3000
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=500
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
+        compressed, fired, daemon, effective_blocks = self._run(
+            prompt_ids, blocks, keep_ratio=0.1, threshold=100, tail_budget=500
         )
         self.assertTrue(fired)
-        # Tail begins at boundaries[-2]=1400; everything from there onwards intact.
         tail_len = len(prompt_ids) - 1400
         self.assertEqual(compressed[-tail_len:], prompt_ids[1400:])
-        # Middle is [100:1400] (msgs 2..4 — msg 1 is part of the protected head).
-        self.assertEqual(daemon.compress_called_with, prompt_ids[100:1400])
+        self.assertEqual(daemon.compress_calls, [prompt_ids[100:600], prompt_ids[600:1100], prompt_ids[1100:1400]])
+        self.assertEqual([block.index for block in effective_blocks if block.compressed], [2, 3, 4])
 
     def test_tail_walk_accumulates_until_break(self):
         # 7 boundaries; sys (boundaries[0]) + first_user (boundaries[1]) form
@@ -1098,63 +1127,67 @@ class MaybeCompressHeadTailTests(unittest.TestCase):
         # 1024-min-middle short-circuit.
         prompt_ids = list(range(3000))
         boundaries = [50, 100, 1300, 1800, 2000, 2300, 2500]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=100, tail_budget=900
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
+        compressed, fired, daemon, effective_blocks = self._run(
+            prompt_ids, blocks, keep_ratio=0.1, threshold=100, tail_budget=900
         )
         self.assertTrue(fired)
-        # Tail starts at boundaries[2] = 1300 (last 4 post-head turns).
         tail_len = len(prompt_ids) - 1300
         self.assertEqual(compressed[-tail_len:], prompt_ids[1300:])
-        # Middle is [100:1300] (the post-head middle turn only).
-        self.assertEqual(daemon.compress_called_with, prompt_ids[100:1300])
+        self.assertEqual(daemon.compress_calls, [prompt_ids[100:1300]])
+        self.assertEqual([block.index for block in effective_blocks if block.compressed], [2])
 
     def test_skip_when_middle_too_small(self):
         # Middle < 1024 → no compression even if threshold is exceeded.
         prompt_ids = list(range(2000))
         boundaries = [100, 500, 800, 1500]  # middle = 800 - 100 = 700, < 1024
-        compressed, fired, _ = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=500
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
+        compressed, fired, _, _ = self._run(
+            prompt_ids, blocks, keep_ratio=0.1, threshold=500
         )
         self.assertFalse(fired)
         self.assertEqual(compressed, prompt_ids)
 
-    def test_single_boundary_protects_head_only(self):
+    def test_single_block_still_skips_due_to_head_protection(self):
         prompt_ids = list(range(3000))
         boundaries = [200]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries, keep_ratio=0.1, threshold=1000
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
+        compressed, fired, daemon, _ = self._run(
+            prompt_ids, blocks, keep_ratio=0.1, threshold=1000
         )
-        self.assertTrue(fired)
-        self.assertEqual(compressed[:200], prompt_ids[:200])
-        # No tail protection: everything after head_end is compressed.
-        self.assertEqual(daemon.compress_called_with, prompt_ids[200:])
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+        self.assertEqual(daemon.compress_calls, [])
 
-    def test_no_boundaries_compresses_whole_prompt(self):
+    def test_no_blocks_compresses_whole_prompt(self):
         prompt_ids = list(range(3000))
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=None, keep_ratio=0.1, threshold=1000
+        compressed, fired, daemon, effective_blocks = self._run(
+            prompt_ids, blocks=None, keep_ratio=0.1, threshold=1000
         )
         self.assertTrue(fired)
-        self.assertEqual(daemon.compress_called_with, prompt_ids)
+        self.assertEqual(daemon.compress_calls, [prompt_ids])
+        self.assertEqual(len(effective_blocks), 1)
+        self.assertTrue(effective_blocks[0].compressed)
 
     def test_below_threshold_short_circuits(self):
         prompt_ids = list(range(100))
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=[10, 50, 80], keep_ratio=0.1, threshold=1000
+        blocks = _synthetic_prompt_blocks([10, 50, 80], len(prompt_ids), include_generation=True)
+        compressed, fired, daemon, _ = self._run(
+            prompt_ids, blocks=blocks, keep_ratio=0.1, threshold=1000
         )
         self.assertFalse(fired)
         self.assertEqual(compressed, prompt_ids)
-        self.assertIsNone(daemon.compress_called_with)
+        self.assertEqual(daemon.compress_calls, [])
 
 
 class MaybeCompressProtectedRangesTests(unittest.TestCase):
-    """maybe_compress must respect protected_ranges and only compress gaps between them."""
+    """maybe_compress must respect protected blocks and preserve them byte-identical."""
 
     def setUp(self):
         from grimoire.dflash.prefill import PrefillConfig
         self.PrefillConfig = PrefillConfig
 
-    def _run(self, prompt_ids, boundaries, protected_ranges, keep_ratio=0.5, threshold=10, tail_budget=600):
+    def _run(self, prompt_ids, blocks, keep_ratio=0.5, threshold=10, tail_budget=600):
         import asyncio
         from grimoire.dflash.prefill import maybe_compress
 
@@ -1176,106 +1209,95 @@ class MaybeCompressProtectedRangesTests(unittest.TestCase):
             drafter_path="/dummy",
             tail_budget=tail_budget,
         )
-        compressed, fired = asyncio.run(
-            maybe_compress(
-                prompt_ids, daemon, cfg, boundaries=boundaries,
-                protected_ranges=protected_ranges if protected_ranges else None
-            )
+        compressed, fired, effective_blocks = asyncio.run(
+            maybe_compress(prompt_ids, daemon, cfg, blocks=blocks)
         )
-        return compressed, fired, daemon
+        return compressed, fired, daemon, effective_blocks
 
     def test_protected_range_in_middle_is_preserved(self):
         # Prompt: 5000 tokens
-        # Boundaries: [50, 200, 2500, 3000, 3500, 4500, 4800]
-        # tail_budget=300: i=6 turn=300 fits, i=5 turn=1000 → 1300>300 break
-        # → tail_start=boundaries[4]=3500
-        # Protected: [(2500, 3000)] — obsidian_read-note in middle
-        # Merged: [[0,200], [2500,3000], [3500,5000]]
-        # Gaps: [200:2500]=2300, [3000:3500]=500 → total=2800 >= 1024
-        # Compressed len: 5000 - 2800*0.9 = 2480 → threshold=2481
+        # Protect one middle block while leaving compressible blocks on both sides.
         prompt_ids = list(range(5000))
-        boundaries = [50, 200, 2500, 3000, 3500, 4500, 4800]
-        protected_ranges = [(2500, 3000)]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+        boundaries = [50, 200, 3000, 3500, 4200, 4500, 4800]
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), protected_indexes={3}, include_generation=True)
+        compressed, fired, daemon, effective_blocks = self._run(
+            prompt_ids, blocks=blocks,
             keep_ratio=0.1, threshold=2481, tail_budget=300
         )
         self.assertTrue(fired)
         self.assertEqual(compressed[:200], prompt_ids[:200])
-        tail_len = 5000 - 3500
-        self.assertEqual(compressed[-tail_len:], prompt_ids[3500:])
-        gap1_compressed_len = 230  # 2300 * 0.1
+        tail_len = 5000 - 4200
+        self.assertEqual(compressed[-tail_len:], prompt_ids[4200:])
+        gap1_compressed_len = 280
         protected_offset = 200 + gap1_compressed_len
         self.assertEqual(
             compressed[protected_offset:protected_offset + 500],
-            prompt_ids[2500:3000],
-            "protected range must be byte-identical in compressed output",
+            prompt_ids[3000:3500],
+            "protected block must be byte-identical in compressed output",
         )
         self.assertEqual(len(daemon.compress_calls), 2)
-        self.assertEqual(daemon.compress_calls[0], prompt_ids[200:2500])
-        self.assertEqual(daemon.compress_calls[1], prompt_ids[3000:3500])
+        self.assertEqual(daemon.compress_calls[0], prompt_ids[200:3000])
+        self.assertEqual(daemon.compress_calls[1], prompt_ids[3500:4200])
+        self.assertEqual([block.index for block in effective_blocks if block.compressed], [2, 4])
 
-    def test_protected_range_overlaps_head_is_merged(self):
-        # Prompt: 5000 tokens, same boundaries
-        # tail_budget=300: → tail_start=3500
-        # Protected: [(100, 1500)] — overlaps head [0:200] → merge to [0,1500]
-        # Merged: [[0,1500], [3500,5000]]
-        # Gap: [1500:3500]=2000 >= 1024
-        # Compressed len: 5000 - 2000*0.9 = 3200 → threshold=3201
+    def test_protected_head_block_skips_that_block(self):
         prompt_ids = list(range(5000))
         boundaries = [50, 200, 2500, 3000, 3500, 4500, 4800]
-        protected_ranges = [(100, 1500)]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), protected_indexes={2}, include_generation=True)
+        blocks[1] = entrypoint.PromptBlock(
+            block_id=blocks[1].block_id,
+            index=blocks[1].index,
+            start=blocks[1].start,
+            end=blocks[1].end,
+            role=blocks[1].role,
+            kind=blocks[1].kind,
+            message_start=blocks[1].message_start,
+            message_end=blocks[1].message_end,
+            protected=True,
+            metadata=blocks[1].metadata,
+        )
+        compressed, fired, daemon, _ = self._run(
+            prompt_ids, blocks=blocks,
             keep_ratio=0.1, threshold=3201, tail_budget=300
         )
-        self.assertTrue(fired)
-        self.assertEqual(compressed[:1500], prompt_ids[:1500])
-        tail_len = 5000 - 3500
-        self.assertEqual(compressed[-tail_len:], prompt_ids[3500:])
-        self.assertEqual(len(daemon.compress_calls), 1)
-        self.assertEqual(daemon.compress_calls[0], prompt_ids[1500:3500])
+        self.assertFalse(fired)
+        self.assertEqual(compressed, prompt_ids)
+        self.assertEqual(daemon.compress_calls, [])
 
-    def test_protected_range_overlaps_tail_is_merged(self):
-        # Prompt: 5000 tokens, same boundaries
-        # tail_budget=300: → tail_start=3500
-        # Protected: [(3000, 4000)] — overlaps tail [3500:5000] → merge to [3000,5000]
-        # Merged: [[0,200], [3000,5000]]
-        # Gap: [200:3000]=2800 >= 1024
-        # Compressed len: 5000 - 2800*0.9 = 2480 → threshold=2481
+    def test_protected_tail_block_is_left_uncompressed(self):
         prompt_ids = list(range(5000))
         boundaries = [50, 200, 2500, 3000, 3500, 4500, 4800]
-        protected_ranges = [(3000, 4000)]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), protected_indexes={4}, include_generation=True)
+        compressed, fired, daemon, effective_blocks = self._run(
+            prompt_ids, blocks=blocks,
             keep_ratio=0.1, threshold=2481, tail_budget=300
         )
         self.assertTrue(fired)
         self.assertEqual(compressed[:200], prompt_ids[:200])
         self.assertEqual(compressed[-2000:], prompt_ids[3000:])
-        self.assertEqual(len(daemon.compress_calls), 1)
-        self.assertEqual(daemon.compress_calls[0], prompt_ids[200:3000])
+        self.assertEqual(len(daemon.compress_calls), 2)
+        self.assertEqual(daemon.compress_calls[0], prompt_ids[200:2500])
+        self.assertEqual(daemon.compress_calls[1], prompt_ids[2500:3000])
+        self.assertFalse(effective_blocks[4].compressed)
 
-    def test_protected_range_consumes_all_compressible_skips(self):
+    def test_protected_middle_block_consumes_all_compressible_skips(self):
         prompt_ids = list(range(2000))
         boundaries = [50, 200, 1800]
-        # Protected range covers the entire middle. No compressible gap remains.
-        protected_ranges = [(200, 1800)]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), protected_indexes={1}, include_generation=True)
+        compressed, fired, daemon, _ = self._run(
+            prompt_ids, blocks=blocks,
             keep_ratio=0.1, threshold=500, tail_budget=200
         )
         self.assertFalse(fired)
         self.assertEqual(compressed, prompt_ids)
         self.assertEqual(daemon.compress_calls, [])
 
-    def test_small_gap_below_min_is_skipped(self):
+    def test_small_block_below_min_is_skipped(self):
         prompt_ids = list(range(2000))
         boundaries = [50, 200, 1800]
-        # Protected range leaves a 128-token gap below the 256-token minimum.
-        protected_ranges = [(200, 1872)]
-        compressed, fired, daemon = self._run(
-            prompt_ids, boundaries=boundaries, protected_ranges=protected_ranges,
+        blocks = _synthetic_prompt_blocks(boundaries, len(prompt_ids), include_generation=True)
+        compressed, fired, daemon, _ = self._run(
+            prompt_ids, blocks=blocks,
             keep_ratio=0.1, threshold=500, tail_budget=200
         )
         self.assertFalse(fired)
@@ -1681,7 +1703,7 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in conv["messages"]], ["assistant"])
         self.assertEqual(conv["messages"][0]["content"], "ok")
 
-    def test_real_session_passes_obsidian_protected_ranges_to_compression(self):
+    def test_real_session_passes_obsidian_protected_blocks_to_compression(self):
         active, _ = self._install_fake_active(
             [ord("o"), ord("k"), 0],
             cfg_overrides={"ctx-size": 200000, "predict": 64},
@@ -1697,10 +1719,9 @@ class DflashProxyIntegrationTests(unittest.TestCase):
 
         calls = {}
 
-        async def fake_maybe_compress(prompt_ids, daemon, config, boundaries=None, protected_ranges=None):
-            calls["boundaries"] = list(boundaries or [])
-            calls["protected_ranges"] = list(protected_ranges or [])
-            return prompt_ids, False
+        async def fake_maybe_compress(prompt_ids, daemon, config, blocks=None):
+            calls["blocks"] = list(blocks or [])
+            return prompt_ids, False, entrypoint.materialize_blocks(prompt_ids, blocks)
 
         with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
             response = self.client.post(
@@ -1710,13 +1731,11 @@ class DflashProxyIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("boundaries", calls)
-        self.assertIn("protected_ranges", calls)
-        self.assertTrue(calls["protected_ranges"])
-        self.assertEqual(
-            calls["protected_ranges"],
-            _expected_protected_tool_ranges(messages, calls["boundaries"]),
-        )
+        self.assertIn("blocks", calls)
+        protected = [(block.start, block.end) for block in calls["blocks"] if block.protected and block.kind == "tool"]
+        boundaries = [block.end for block in calls["blocks"] if block.kind != "generation_prompt"]
+        self.assertTrue(protected)
+        self.assertEqual(protected, _expected_protected_tool_ranges(messages, boundaries))
 
 
 class OpenCodeSessionReplayTests(unittest.TestCase):
