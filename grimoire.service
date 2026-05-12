@@ -8,6 +8,7 @@ Type=oneshot
 RemainAfterExit=yes
 User=yeowool
 WorkingDirectory=/home/yeowool/grimoire
+Environment="DOCKER_BUILDKIT=1"
 ExecStart=/usr/bin/docker compose up -d --build
 ExecStop=/usr/bin/docker compose down
 Restart=no
