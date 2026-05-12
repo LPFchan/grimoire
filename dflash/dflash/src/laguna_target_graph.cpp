@@ -642,9 +642,9 @@ bool laguna_step(
                      n_tok, kv_start);
         return false;
     }
-    if (kv_start + n_tok > w.max_ctx) {
+    if (kv_start + n_tok > cache.max_ctx) {
         std::fprintf(stderr, "laguna_step: kv overflow kv_start=%d n_tok=%d max_ctx=%d\n",
-                     kv_start, n_tok, w.max_ctx);
+                     kv_start, n_tok, cache.max_ctx);
         return false;
     }
     ggml_init_params ip{};
