@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -112,6 +113,11 @@ from grimoire.telemetry import telemetry_sampler, telemetry_store
 from grimoire.usage import usage_store
 
 logger = logging.getLogger(__name__)
+
+# Keep a single module identity under `python -m grimoire.entrypoint` so
+# extracted modules importing `grimoire.entrypoint` reuse the live gateway
+# state instead of creating a second module instance.
+sys.modules.setdefault("grimoire.entrypoint", sys.modules[__name__])
 
 
 def parse_args():

@@ -100,6 +100,32 @@ class DropInBlockerTests(unittest.TestCase):
         })
         self.assertEqual(headers, {"content-type": "application/json"})
 
+    def test_module_launch_keeps_single_manager_instance(self):
+        env = os.environ.copy()
+        pythonpath = str(ROOT / "src")
+        if env.get("PYTHONPATH"):
+            pythonpath = pythonpath + os.pathsep + env["PYTHONPATH"]
+        env["PYTHONPATH"] = pythonpath
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json, runpy; import uvicorn; "
+                "uvicorn.run = lambda *args, **kwargs: None; "
+                "mod = runpy.run_module('grimoire.entrypoint', run_name='__main__', alter_sys=True); "
+                "from grimoire.routes.models import _get_manager; "
+                "print(json.dumps({'same_manager': _get_manager() is mod['manager']}))",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertTrue(payload["same_manager"])
+
     def test_registry_reads_seed_but_saves_to_state_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             state_path = Path(tmp) / "state" / "models.json"
