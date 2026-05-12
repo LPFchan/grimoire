@@ -465,6 +465,7 @@ bool snapshot_target_cache(const TargetWeights & w,
     snap.cur_pos         = cache.cur_pos;
     snap.last_tok        = cache.last_tok;
     snap.kv_k_type       = cache.kv_k_type;
+    snap.kv_v_type       = cache.kv_v_type;
     snap.max_ctx         = cache.max_ctx;
     snap.target_feat_cap = cache.target_feat_cap;
 
@@ -474,6 +475,10 @@ bool snapshot_target_cache(const TargetWeights & w,
 bool restore_target_cache(const PrefixSnapshot & snap, TargetCache & cache) {
     if (snap.kv_k_type != cache.kv_k_type) {
         set_last_error("restore_target_cache: kv_k_type mismatch");
+        return false;
+    }
+    if (snap.kv_v_type != cache.kv_v_type) {
+        set_last_error("restore_target_cache: kv_v_type mismatch");
         return false;
     }
     if (snap.max_ctx != cache.max_ctx) {
@@ -525,6 +530,7 @@ void free_prefix_snapshot(PrefixSnapshot & snap) {
     snap.target_feat_snap = nullptr;
     snap.cur_pos         = 0;
     snap.kv_k_type       = GGML_TYPE_COUNT;
+    snap.kv_v_type       = GGML_TYPE_COUNT;
     snap.max_ctx         = 0;
     snap.target_feat_cap = 0;
     snap.is_thin         = false;
@@ -618,6 +624,7 @@ bool snapshot_target_cache_thin(const TargetWeights & w,
     snap.kv_end    = kv_end;
     snap.cur_pos   = kv_end;
     snap.kv_k_type = cache.kv_k_type;
+    snap.kv_v_type = cache.kv_v_type;
     snap.max_ctx   = cache.max_ctx;
     return true;
 }
@@ -643,8 +650,9 @@ bool restore_target_cache_chain(const PrefixSnapshot * thick,
             return false;
         }
         if (thin->kv_k_type != cache.kv_k_type ||
+            thin->kv_v_type != cache.kv_v_type ||
             thin->max_ctx   != cache.max_ctx) {
-            set_last_error("restore_chain: thin kv_k_type/max_ctx mismatch");
+            set_last_error("restore_chain: thin kv_k_type/kv_v_type/max_ctx mismatch");
             return false;
         }
         const int block_size = thin->kv_end - thin->kv_start;

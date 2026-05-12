@@ -2926,7 +2926,7 @@ if (starts_with(line, "compress ")) {
                 {
                     // Serialize to disk: header + raw tensor bytes.
                     // Header: magic(4) version(4) cur_pos(4) last_tok(4)
-                    //          max_ctx(4) kv_k_type(4) target_feat_cap(4)
+                    //          max_ctx(4) kv_k_type(4) kv_v_type(4) target_feat_cap(4)
                     //          is_thin(1) kv_start(4) kv_end(4)
                     //          n_full_attn(4) n_delta(4)
                     std::ofstream sf(snap_path, std::ios::binary);
@@ -2935,7 +2935,7 @@ if (starts_with(line, "compress ")) {
                         continue;
                     }
                     const char magic[4] = {'D', 'F', 'S', 'N'};
-                    const uint32_t version = 1;
+                    const uint32_t version = 2;
                     sf.write(magic, 4);
                     uint32_t v = version;
                     sf.write(reinterpret_cast<char *>(&v), 4);
@@ -2946,6 +2946,8 @@ if (starts_with(line, "compress ")) {
                     v = (uint32_t)ps.max_ctx;
                     sf.write(reinterpret_cast<char *>(&v), 4);
                     v = (uint32_t)ps.kv_k_type;
+                    sf.write(reinterpret_cast<char *>(&v), 4);
+                    v = (uint32_t)ps.kv_v_type;
                     sf.write(reinterpret_cast<char *>(&v), 4);
                     v = (uint32_t)ps.target_feat_cap;
                     sf.write(reinterpret_cast<char *>(&v), 4);
@@ -3030,7 +3032,7 @@ if (starts_with(line, "compress ")) {
                     continue;
                 }
                 uint32_t version = read_u32();
-                if (version != 1) {
+                if (version != 1 && version != 2) {
                     std::fprintf(stderr, "[snap] LOAD_SNAPSHOT unsupported version %u\n", version);
                     continue;
                 }
@@ -3038,6 +3040,10 @@ if (starts_with(line, "compress ")) {
                 int32_t last_tok_load  = (int32_t)read_u32();
                 int32_t max_ctx_load   = (int32_t)read_u32();
                 ggml_type kv_k_load    = (ggml_type)read_u32();
+                ggml_type kv_v_load    = GGML_TYPE_COUNT;
+                if (version >= 2) {
+                    kv_v_load = (ggml_type)read_u32();
+                }
                 int32_t feat_cap_load  = (int32_t)read_u32();
                 char is_thin_byte;
                 sf.read(&is_thin_byte, 1);
@@ -3138,6 +3144,13 @@ if (starts_with(line, "compress ")) {
                 ps.last_tok        = last_tok_load;
                 ps.max_ctx         = max_ctx_load;
                 ps.kv_k_type       = kv_k_load;
+                if (version >= 2) {
+                    ps.kv_v_type = kv_v_load;
+                } else if (!ps.attn_v_snap.empty() && ps.attn_v_snap[0] != nullptr) {
+                    ps.kv_v_type = ps.attn_v_snap[0]->type;
+                } else {
+                    ps.kv_v_type = kv_k_load;
+                }
                 ps.target_feat_cap = feat_cap_load;
                 ps.is_thin         = is_thin_load;
                 ps.kv_start        = kv_start_load;

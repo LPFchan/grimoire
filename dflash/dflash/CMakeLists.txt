@@ -214,6 +214,7 @@ target_link_libraries(dflash27b
         ggml
         ggml-cuda
         ggml-base
+        CUDA::cuda_driver
 )
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -260,7 +261,7 @@ if(DFLASH27B_TESTS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/spike_thin_copy.cpp")
         add_executable(spike_thin_copy test/spike_thin_copy.cpp)
         target_include_directories(spike_thin_copy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(spike_thin_copy PRIVATE ggml ggml-cuda)
+        target_link_libraries(spike_thin_copy PRIVATE ggml ggml-cuda CUDA::cuda_driver)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/smoke_draft_graph.cpp")
         add_executable(smoke_draft_graph test/smoke_draft_graph.cpp)

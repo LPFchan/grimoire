@@ -310,6 +310,7 @@ struct PrefixSnapshot {
     int       cur_pos         = 0;
     int       last_tok        = -1;                // post-prefill argmax (decode seed)
     ggml_type kv_k_type       = GGML_TYPE_COUNT;   // for hash-key validation
+    ggml_type kv_v_type       = GGML_TYPE_COUNT;   // for hash-key validation
     int       max_ctx         = 0;                 // for sanity check at restore
     int       target_feat_cap = 0;
 
