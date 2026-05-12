@@ -34,7 +34,12 @@ CPU_HWMON_LABELS = ("Tctl", "Tdie", "Package id 0", "Tccd1")
 FAN_HWMON_NAMES = ("nct6798", "nct6775", "nct6779", "it87", "w83627ehf")
 
 _RAPL_ENERGY_PATH = "/host-powercap/intel-rapl/intel-rapl:0/energy_uj"
-_RAPL_STATE = {"last_ts": None, "last_energy_uj": None}
+_RAPL_MAX_ENERGY_PATH = "/host-powercap/intel-rapl/intel-rapl:0/max_energy_range_uj"
+# Fallback for hardware that doesn't expose max_energy_range_uj. Matches the
+# value seen on common Intel package counters; off-by-this-much per wrap on
+# anything else, which happens about once per several weeks at steady draw.
+_RAPL_WRAP_FALLBACK_UJ = 65532610987
+_RAPL_STATE = {"last_ts": None, "last_energy_uj": None, "max_energy_uj": None}
 
 
 class TelemetryStore:
@@ -224,6 +229,12 @@ def _read_cpu_power():
             energy_uj = int(f.read().strip())
     except (OSError, ValueError):
         return None
+    if _RAPL_STATE["max_energy_uj"] is None:
+        try:
+            with open(_RAPL_MAX_ENERGY_PATH) as f:
+                _RAPL_STATE["max_energy_uj"] = int(f.read().strip())
+        except (OSError, ValueError):
+            _RAPL_STATE["max_energy_uj"] = _RAPL_WRAP_FALLBACK_UJ
     now = time.time()
     power = None
     if _RAPL_STATE["last_ts"] is not None and _RAPL_STATE["last_energy_uj"] is not None:
@@ -231,7 +242,7 @@ def _read_cpu_power():
         if dt > 0:
             delta_uj = energy_uj - _RAPL_STATE["last_energy_uj"]
             if delta_uj < 0:
-                delta_uj += 65532610987
+                delta_uj += _RAPL_STATE["max_energy_uj"]
             power = delta_uj / dt / 1e6
     _RAPL_STATE["last_ts"] = now
     _RAPL_STATE["last_energy_uj"] = energy_uj
