@@ -11,3 +11,4 @@ docker-compose.yml
 .venv/
 build/
 .sisyphus/
+opencode/node_modules/
