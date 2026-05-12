@@ -1418,6 +1418,8 @@ def _generic_prompt_blocks(messages, tokenizer, prompt_ids, add_generation_promp
     blocks = []
     prev = 0
     tool_call_names = {}
+    prev_rendered = ""
+    prev_encoded: list = []
     for index, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
@@ -1433,10 +1435,24 @@ def _generic_prompt_blocks(messages, tokenizer, prompt_ids, add_generation_promp
         rendered = tokenizer.apply_chat_template(
             messages[: index + 1], tokenize=False, add_generation_prompt=False
         )
-        encoded = tokenizer.encode(rendered, add_special_tokens=False)
+        # Chat templates generally produce stable append-only renderings, so
+        # tokenize just the new suffix and concatenate against the previously
+        # encoded prefix. Falls back to a full encode if the template wasn't
+        # append-stable (e.g., a message edited an earlier turn's framing).
+        encoded = None
+        if prev_rendered and rendered.startswith(prev_rendered):
+            suffix = rendered[len(prev_rendered):]
+            suffix_tokens = tokenizer.encode(suffix, add_special_tokens=False) if suffix else []
+            candidate = prev_encoded + suffix_tokens
+            if len(candidate) <= len(prompt_ids) and prompt_ids[:len(candidate)] == candidate:
+                encoded = candidate
+        if encoded is None:
+            encoded = tokenizer.encode(rendered, add_special_tokens=False)
         end = len(encoded)
         if end <= prev or end > len(prompt_ids) or prompt_ids[:end] != encoded:
             raise ValueError(f"Unable to build prompt block span for message {index}")
+        prev_rendered = rendered
+        prev_encoded = encoded
 
         tool_name = _tool_name_from_message(msg, tool_call_names)
         role = str(msg.get("role") or "unknown")
