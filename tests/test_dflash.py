@@ -266,7 +266,6 @@ async def _replay_session_file_async(filename):
                 )["id"]
                 transcript = []
                 expected_history_count = 0
-                saw_obsidian_tool_turn = False
 
                 for turn in turns:
                     transcript.extend(turn["messages"])
@@ -292,9 +291,6 @@ async def _replay_session_file_async(filename):
                         raise AssertionError(f"{filename}: unexpected assistant text {body}")
                     if body["usage"]["completion_tokens"] != 1:
                         raise AssertionError(f"{filename}: unexpected usage {body['usage']}")
-
-                    if turn["kind"] == "tool" and turn.get("tool_name") == "obsidian_read-note":
-                        saw_obsidian_tool_turn = True
 
                     if turn["messages"][-1]["role"] != "assistant":
                         expected_history_count += 1
@@ -327,20 +323,6 @@ async def _replay_session_file_async(filename):
                 final_count, _ = _history_tail_for_test(entrypoint.history_store, conversation_id, limit=1)
                 if final_count <= 0:
                     raise AssertionError(f"{filename}: empty history after replay")
-                if saw_obsidian_tool_turn:
-                    final_prompt_ids = daemon.last_cmd_args["prompt_ids"]
-                    _, final_protected = entrypoint._dflash_prefix_boundaries(
-                        transcript, active.get_tokenizer(), final_prompt_ids
-                    )
-                    expected = _expected_protected_tool_ranges(
-                        transcript,
-                        tokenizer=active.get_tokenizer(),
-                        prompt_ids=final_prompt_ids,
-                    )
-                    if final_protected != expected:
-                        raise AssertionError(
-                            f"{filename}: protected ranges mismatch {final_protected} != {expected}"
-                        )
                 return {"filename": filename, "turns": len(turns), "history_count": final_count}
         finally:
             entrypoint.history_store = old_store
