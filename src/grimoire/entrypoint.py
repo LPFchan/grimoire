@@ -1937,29 +1937,55 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         raise HTTPException(status_code=400, detail=f"Failed to render chat template: {e}")
 
     ctx_size = int(model_cfg.get("ctx-size", DEFAULT_CTX_SIZE))
-    max_raw_context = model_cfg.get("max-raw-context", model_cfg.get("max_raw_context"))
-    if max_raw_context is not None:
-        max_raw_context = int(max_raw_context)
-        if len(prompt_ids) > max_raw_context:
+    max_effective_context = model_cfg.get(
+        "max-effective-context",
+        model_cfg.get(
+            "max_effective_context",
+            model_cfg.get("max-raw-context", model_cfg.get("max_raw_context")),
+        ),
+    )
+
+    prefix_cache = active.prefix_cache
+    prefill_config = active.prefill_config
+    daemon = active.dflash_daemon
+
+    effective_ids = prompt_ids
+    effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
+    if daemon is not None and daemon.is_running() and prefill_config and prefill_config.enabled:
+        async with active.dflash_lock():
+            try:
+                effective_ids, _, effective_blocks = await maybe_compress(
+                    prompt_ids,
+                    daemon,
+                    prefill_config,
+                    blocks=prompt_blocks,
+                )
+            except Exception as e:
+                logger.error(f"pflash compression failed: {e}")
+                effective_ids = prompt_ids
+                effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
+
+    if max_effective_context is not None:
+        max_effective_context = int(max_effective_context)
+        if len(effective_ids) > max_effective_context:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"raw prompt ({len(prompt_ids)} tokens) exceeds max raw context "
-                    f"{max_raw_context}"
+                    f"effective prompt ({len(effective_ids)} tokens) exceeds max effective context "
+                    f"{max_effective_context}"
                 ),
             )
 
-    if len(prompt_ids) + max_tokens > ctx_size:
+    if len(effective_ids) + max_tokens > ctx_size:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"prompt ({len(prompt_ids)} tokens) + max_tokens ({max_tokens}) "
+                f"effective prompt ({len(effective_ids)} tokens) + max_tokens ({max_tokens}) "
                 f"exceeds context size {ctx_size}"
             ),
         )
 
-    prefix_cache = active.prefix_cache
-    prefill_config = active.prefill_config
+    effective_boundaries = _prefix_cache_boundaries(effective_blocks)
 
     stop_ids, stop_seqs = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
 
@@ -1967,30 +1993,11 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
     created = int(time.time())
 
     async def sse_stream():
-        daemon = active.dflash_daemon
         if daemon is None or not daemon.is_running():
             yield _sse_error_frames(completion_id, created, "dflash daemon not running")
             return
 
         async with active.dflash_lock():
-            # Long-context compression
-            effective_ids = prompt_ids
-            effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
-            if prefill_config and prefill_config.enabled:
-                try:
-                    effective_ids, _, effective_blocks = await maybe_compress(
-                        prompt_ids,
-                        daemon,
-                        prefill_config,
-                        blocks=prompt_blocks,
-                    )
-                except Exception as e:
-                    logger.error(f"pflash compression failed: {e}")
-                    effective_ids = prompt_ids
-                    effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
-
-            effective_boundaries = _prefix_cache_boundaries(effective_blocks)
-
             prefix_hit = None
             snap_slot = None
             snap_pos = None
@@ -2225,7 +2232,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
     async for chunk in stream:
         body.extend(chunk)
     text = _extract_assistant_text(bytes(body))
-    usage = _extract_usage(bytes(body)) or {"input_tokens": len(prompt_ids), "output_tokens": 0}
+    usage = _extract_usage(bytes(body)) or {"input_tokens": len(effective_ids), "output_tokens": 0}
     return JSONResponse({
         "id": completion_id,
         "object": "chat.completion",

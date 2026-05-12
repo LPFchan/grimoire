@@ -1586,6 +1586,67 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         # Daemon must not have been touched.
         self.assertIsNone(daemon.last_cmd_args)
 
+    def test_effective_context_limit_allows_post_pflash_prompt(self):
+        active, daemon = self._install_fake_active(
+            [ord("o"), ord("k"), 0],
+            cfg_overrides={"ctx-size": 10, "predict": 64, "max-effective-context": 4},
+        )
+        active.prefill_config = type(
+            "PrefillCfg",
+            (),
+            {"enabled": True, "threshold": 1, "keep_ratio": 0.5, "drafter_path": "/dummy", "tail_budget": 512},
+        )()
+
+        async def fake_maybe_compress(prompt_ids, daemon, config, blocks=None):
+            effective_ids = [1, 2, 3, 4]
+            return effective_ids, True, entrypoint.materialize_blocks(effective_ids)
+
+        with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "dflash-test",
+                    "messages": [{"role": "user", "content": "x" * 100}],
+                    "max_tokens": 1,
+                    "stream": False,
+                },
+                headers=self.auth,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(daemon.last_cmd_args["prompt_ids"], [1, 2, 3, 4])
+
+    def test_effective_context_overflow_returns_400_after_pflash(self):
+        active, daemon = self._install_fake_active(
+            [],
+            cfg_overrides={"ctx-size": 10, "predict": 64, "max-effective-context": 4},
+        )
+        active.prefill_config = type(
+            "PrefillCfg",
+            (),
+            {"enabled": True, "threshold": 1, "keep_ratio": 0.5, "drafter_path": "/dummy", "tail_budget": 512},
+        )()
+
+        async def fake_maybe_compress(prompt_ids, daemon, config, blocks=None):
+            effective_ids = [1, 2, 3, 4, 5]
+            return effective_ids, True, entrypoint.materialize_blocks(effective_ids)
+
+        with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
+            response = self.client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "dflash-test",
+                    "messages": [{"role": "user", "content": "x" * 100}],
+                    "max_tokens": 1,
+                    "stream": True,
+                },
+                headers=self.auth,
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("exceeds max effective context", response.json()["detail"])
+        self.assertIsNone(daemon.last_cmd_args)
+
     def test_error_path_yields_done_terminator(self):
         active, daemon = self._install_fake_active([])
         daemon._running = False  # Force the "daemon not running" branch.

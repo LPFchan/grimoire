@@ -56,7 +56,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
       "tokenizer": "tokenizers/qwen3.6-27B",
       "ctx-size": 262144,
-      "max-raw-context": 100000,
+      "max-effective-context": 100000,
       "budget": 22,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
@@ -86,7 +86,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 | `drafter` | Compression scorer GGUF (1.2 GB, parked except during compression) |
 | `tokenizer` | Local tokenizer dir |
 | `budget` | DDTree page pool (22 = 262K ctx) |
-| `max-raw-context` | Hard cap for raw prompt tokens before compression |
+| `max-effective-context` | Hard cap for prompt tokens after PFlash compression |
 | `prefix-cache-slots` | VRAM slots for prefix cache snapshots |
 | `session-kv-slots` | VRAM slots for per-session KV snapshots |
 | `prefill-threshold` | Token count to trigger PFlash compression |
@@ -128,7 +128,7 @@ Prompt split on `len(prompt_ids) >= prefill_threshold`:
 
 Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressible middle blocks are scored by the drafter (loads 1.2 GB, ~2s, parks).
 
-**Tuned values**: `max-raw-context=100000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`.
+**Tuned values**: `max-effective-context=100000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`.
 
 ### Session KV
 
