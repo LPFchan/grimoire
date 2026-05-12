@@ -10,8 +10,11 @@ import json
 import logging
 import os
 import shutil
+import threading
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +24,35 @@ MANIFEST_NAME = "swap-manifest.json"
 class SnapshotStore:
     """RAM-backed snapshot store with asynchronous disk mirroring."""
 
-    def __init__(self, ram_dir: str, disk_dir: str, ram_budget_gb: float = 20.0):
+    def __init__(
+        self,
+        ram_dir: str,
+        disk_dir: str,
+        ram_budget_gb: float = 20.0,
+        disk_budget_gb: float = 100.0,
+        disk_ttl_hours: float = 24.0,
+    ):
         self.ram_dir = Path(ram_dir)
         self.disk_dir = Path(disk_dir)
         self.ram_budget = max(0, int(float(ram_budget_gb) * 1024**3))
+        self.disk_budget = max(0, int(float(disk_budget_gb) * 1024**3))
+        self.disk_ttl = None
+        try:
+            ttl_hours = float(disk_ttl_hours)
+        except (TypeError, ValueError):
+            ttl_hours = 24.0
+        if ttl_hours > 0:
+            self.disk_ttl = timedelta(hours=ttl_hours)
         self.ram: OrderedDict[bytes, str] = OrderedDict()
         self.disk: OrderedDict[bytes, str] = OrderedDict()
         self._pending_mirrors: set[asyncio.Task] = set()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread_id: Optional[int] = None
 
         self.ram_dir.mkdir(parents=True, exist_ok=True)
         self.disk_dir.mkdir(parents=True, exist_ok=True)
         self._load_manifest()
+        self._cleanup_disk()
         logger.info(
             "snapshot store enabled: ram_dir=%s disk_dir=%s ram_budget=%s",
             self.ram_dir,
@@ -83,23 +104,56 @@ class SnapshotStore:
         except Exception as e:
             logger.error("snapshot manifest save failed: %s", e)
 
-    async def _mirror_async(self, src: Path, dst: Path, key: bytes) -> None:
+    def bind_loop(self, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+        """Remember the main asyncio loop for thread-safe mirror scheduling."""
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        self._loop = loop
+        self._loop_thread_id = threading.get_ident()
+
+    def _schedule_mirror(self, loop: asyncio.AbstractEventLoop, src: Path, dst: Path, key: bytes, target: str) -> None:
+        def _spawn() -> None:
+            task = loop.create_task(self._mirror_async(src, dst, key, target))
+            self._pending_mirrors.add(task)
+            task.add_done_callback(self._pending_mirrors.discard)
+
+        loop.call_soon_threadsafe(_spawn)
+
+    async def _mirror_async(self, src: Path, dst: Path, key: bytes, target: str) -> None:
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(shutil.copy2, src, dst)
-            self.disk[key] = str(dst)
-            self.disk.move_to_end(key)
-            self._save_manifest()
+            if target == "disk":
+                self.disk[key] = str(dst)
+                self.disk.move_to_end(key)
+                self._cleanup_disk()
+            else:
+                self.put_ram(key, dst, mirror_to_disk=False)
         except Exception as e:
             logger.warning("snapshot mirror failed for %s: %s", key.hex()[:8], e)
 
-    def _queue_mirror(self, src: Path, dst: Path, key: bytes) -> None:
+    def _queue_mirror(self, src: Path, dst: Path, key: bytes, target: str = "disk") -> None:
         try:
             loop = asyncio.get_running_loop()
+            self.bind_loop(loop)
         except RuntimeError:
-            # Startup/unit-test paths without a running loop can mirror lazily on demand.
+            loop = self._loop
+            if loop is None or not loop.is_running():
+                logger.warning(
+                    "snapshot mirror skipped: no running event loop (key=%s target=%s)",
+                    key.hex()[:8],
+                    target,
+                )
+                return
+
+        if loop is self._loop and self._loop_thread_id != threading.get_ident():
+            self._schedule_mirror(loop, src, dst, key, target)
             return
-        task = loop.create_task(self._mirror_async(src, dst, key))
+
+        task = loop.create_task(self._mirror_async(src, dst, key, target))
         self._pending_mirrors.add(task)
         task.add_done_callback(self._pending_mirrors.discard)
 
@@ -127,20 +181,77 @@ class SnapshotStore:
                 pass
             logger.info("snapshot store evicted RAM entry %s", lru_key.hex()[:8])
 
+    def _cleanup_disk(self) -> None:
+        now = datetime.now(timezone.utc)
+
+        for key, path in list(self.disk.items()):
+            p = Path(path)
+            if not p.exists():
+                self.disk.pop(key, None)
+                continue
+            if self.disk_ttl is not None:
+                try:
+                    mtime = datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc)
+                except OSError:
+                    self.disk.pop(key, None)
+                    continue
+                if now - mtime > self.disk_ttl:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    self.disk.pop(key, None)
+                    logger.info("snapshot store expired disk entry %s", key.hex()[:8])
+
+        if not self.disk_budget:
+            return
+
+        total = 0
+        sizes: dict[bytes, int] = {}
+        for key, path in list(self.disk.items()):
+            p = Path(path)
+            if not p.exists():
+                self.disk.pop(key, None)
+                continue
+            try:
+                size = p.stat().st_size
+            except OSError:
+                self.disk.pop(key, None)
+                continue
+            sizes[key] = size
+            total += size
+
+        while total > self.disk_budget and self.disk:
+            lru_key, lru_path = self.disk.popitem(last=False)
+            p = Path(lru_path)
+            total -= sizes.get(lru_key, 0)
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+            logger.info("snapshot store evicted disk entry %s", lru_key.hex()[:8])
+
+        self._save_manifest()
+
     def has(self, key: bytes) -> bool:
         return key in self.ram or key in self.disk
+
+    def put_ram(self, key: bytes, path: Path, mirror_to_disk: bool = True) -> Path:
+        """Register a RAM snapshot path and optionally mirror it to disk."""
+        path = Path(path)
+        self.ram[key] = str(path)
+        self.ram.move_to_end(key)
+        if mirror_to_disk:
+            self._queue_mirror(path, self.disk_path(key), key, target="disk")
+        self._evict_ram_if_over_budget()
+        return path
 
     def save(self, daemon, key: bytes, slot: int) -> Path:
         """Save a daemon snapshot slot to RAM, then mirror it to disk."""
         ram_path = self.ram_path(key)
-        disk_path = self.disk_path(key)
         ram_path.parent.mkdir(parents=True, exist_ok=True)
         daemon.save_snapshot(slot, str(ram_path))
-        self.ram[key] = str(ram_path)
-        self.ram.move_to_end(key)
-        self._queue_mirror(ram_path, disk_path, key)
-        self._evict_ram_if_over_budget()
-        return ram_path
+        return self.put_ram(key, ram_path, mirror_to_disk=True)
 
     def load(self, daemon, key: bytes, slot: int) -> bool:
         """Load a snapshot into the given transient daemon slot."""
@@ -153,14 +264,18 @@ class SnapshotStore:
             self.ram.pop(key, None)
 
         if key in self.disk:
+            self._cleanup_disk()
+
+        if key in self.disk:
             path = Path(self.disk[key])
             if not path.exists():
                 self.disk.pop(key, None)
                 self._save_manifest()
                 return False
+            self.disk.move_to_end(key)
             daemon.load_snapshot(slot, str(path))
             ram_path = self.ram_path(key)
-            self._queue_mirror(path, ram_path, key)
+            self._queue_mirror(path, ram_path, key, target="ram")
             return True
         return False
 
@@ -178,7 +293,7 @@ class SnapshotStore:
                 Path(disk_path).unlink(missing_ok=True)
             except OSError:
                 pass
-            self._save_manifest()
+        self._save_manifest()
 
     def clear(self) -> None:
         """Clear all snapshot state and files."""
@@ -190,6 +305,7 @@ class SnapshotStore:
             shutil.rmtree(self.disk_dir, ignore_errors=True)
         self.ram_dir.mkdir(parents=True, exist_ok=True)
         self.disk_dir.mkdir(parents=True, exist_ok=True)
+        self._save_manifest()
 
 
 DualSwap = SnapshotStore

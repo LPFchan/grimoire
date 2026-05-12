@@ -185,7 +185,6 @@ class ActiveModel:
         session_cap = max(0, int(self.cfg.get("session-kv-slots", 2)))
         self.session_kv = SessionKV(
             cap=session_cap,
-            prefix_cap=pc_cap,
         )
 
         self.snapshot_staging_slot = int(self.cfg.get("snapshot-staging-slot", 7))
@@ -196,6 +195,8 @@ class ActiveModel:
                 f"/var/lib/grimoire/snapshot_swap/{self.name}",
             ),
             ram_budget_gb=self.cfg.get("snapshot-ram-budget-gb", 20.0),
+            disk_budget_gb=self.cfg.get("snapshot-disk-budget-gb", 100.0),
+            disk_ttl_hours=self.cfg.get("snapshot-disk-ttl-hours", 24.0),
         )
 
         self.dflash_daemon = DflashDaemon(

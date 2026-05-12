@@ -7,6 +7,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -236,7 +237,7 @@ async def _replay_session_file_async(filename):
     }
     daemon = FakeDflashDaemon([3793, 248046])
     active = FakeActive("dflash-replay", cfg, daemon, tokenizer)
-    active.session_kv = SessionKV(cap=2, prefix_cap=2)
+    active.session_kv = SessionKV(cap=2)
     tmp_store = tempfile.TemporaryDirectory(dir=tmp_dir)
     active.snapshot_swap = SnapshotSwap(
         ram_dir=str(Path(tmp_store.name) / "ram"),
@@ -665,6 +666,7 @@ class FakeDflashDaemon:
         self.saved_snapshots = []
         self.loaded_snapshots = []
         self.snapshots = []
+        self.thin_snapshots = []
 
     def is_running(self):
         return self._running
@@ -699,6 +701,9 @@ class FakeDflashDaemon:
 
     def snapshot(self, slot):
         self.snapshots.append(slot)
+
+    def snapshot_thin(self, slot, kv_start, kv_end):
+        self.thin_snapshots.append((slot, kv_start, kv_end))
 
     def save_snapshot(self, slot, path):
         self.saved_snapshots.append((slot, path))
@@ -1364,18 +1369,18 @@ class SessionKVTests(unittest.TestCase):
     PROMPT = list(range(256))
 
     def test_get_session_returns_none_for_unknown_conv(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         self.assertIsNone(sk.get_session("nope", []))
 
     def test_update_returns_stable_snapshot_key(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         key_a = sk.update("a", 100, self.PROMPT)
         key_b = sk.update("a", 100, self.PROMPT)
         self.assertEqual(key_a, key_b)
         self.assertEqual(key_a, sk.swap_key("a"))
 
     def test_get_session_promotes_lru(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         sk.update("a", 10, self.PROMPT)
         sk.update("b", 20, self.PROMPT)
         sk.get_session("a", self.PROMPT)
@@ -1386,14 +1391,14 @@ class SessionKVTests(unittest.TestCase):
         self.assertIsNotNone(sk.get_session("a", self.PROMPT))
 
     def test_evict_is_idempotent(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         sk.update("a", 10, self.PROMPT)
         sk.evict("a")
         sk.evict("a")  # Must not raise.
         self.assertIsNone(sk.get_session("a", self.PROMPT))
 
     def test_clear_drops_all_state(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         sk.update("a", 10, self.PROMPT)
         sk.update("b", 20, self.PROMPT)
         sk.clear()
@@ -1401,11 +1406,11 @@ class SessionKVTests(unittest.TestCase):
         self.assertIsNone(sk.get_session("b", self.PROMPT))
 
     def test_cap_zero_disables_lru_eviction(self):
-        sk = SessionKV(cap=0, prefix_cap=2)
+        sk = SessionKV(cap=0)
         self.assertIsNone(sk.evict_lru_if_full("a"))
 
     def test_get_session_accepts_extended_prompt(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         cached = list(range(100))
         sk.update("a", 50, cached)
         extended = cached + list(range(100, 150))
@@ -1414,7 +1419,7 @@ class SessionKVTests(unittest.TestCase):
         self.assertEqual(prefix_len, 50)
 
     def test_get_session_evicts_on_hash_mismatch(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         original = list(range(100))
         sk.update("a", 50, original)
         edited = original[:10] + list(range(1000, 1040)) + original[50:]
@@ -1422,7 +1427,7 @@ class SessionKVTests(unittest.TestCase):
         self.assertIsNone(sk.get_session("a", original))
 
     def test_get_session_evicts_when_prompt_shorter_than_prefix(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
+        sk = SessionKV(cap=2)
         sk.update("a", 100, list(range(200)))
         self.assertIsNone(sk.get_session("a", list(range(50))))
 
@@ -1471,6 +1476,46 @@ class SnapshotSwapTests(unittest.TestCase):
 
             self.assertTrue(swap.load(daemon, key, 7))
             self.assertEqual(daemon.loaded[-1], (7, str(disk_path)))
+
+    def test_load_from_disk_queues_ram_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.Daemon()
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"a" * 16
+            disk_path = swap.disk_path(key)
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_text("disk snapshot\n")
+            swap.disk[key] = str(disk_path)
+
+            async def run():
+                self.assertTrue(swap.load(daemon, key, 7))
+                pending = tuple(swap._pending_mirrors)
+                if pending:
+                    await asyncio.gather(*pending)
+
+            asyncio.run(run())
+            self.assertIn(key, swap.ram)
+            self.assertTrue(Path(swap.ram[key]).exists())
+
+    def test_disk_ttl_evicts_expired_entries(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.Daemon()
+            swap = SnapshotSwap(
+                ram_dir=f"{td}/ram",
+                disk_dir=f"{td}/disk",
+                ram_budget_gb=1,
+                disk_ttl_hours=0.0001,
+            )
+            key = b"a" * 16
+            disk_path = swap.disk_path(key)
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_text("disk snapshot\n")
+            os.utime(disk_path, (time.time() - 10, time.time() - 10))
+            swap.disk[key] = str(disk_path)
+
+            swap._cleanup_disk()
+            self.assertNotIn(key, swap.disk)
+            self.assertFalse(disk_path.exists())
 
     def test_discard_removes_ram_and_disk_paths(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1697,7 +1742,7 @@ class DflashProxyIntegrationTests(unittest.TestCase):
 
     def test_session_kv_saves_compact_full_snapshot_and_restores_next_turn(self):
         active, daemon = self._install_fake_active([ord("x"), 0])
-        active.session_kv = SessionKV(cap=2, prefix_cap=2)
+        active.session_kv = SessionKV(cap=2)
         active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
         hist = self.client.post(
             "/history",
@@ -1786,6 +1831,79 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in conv["messages"]], ["assistant"])
         self.assertEqual(conv["messages"][0]["content"], "ok")
 
+    def test_prefix_cache_saves_boundary_snapshot_not_full_session_copy(self):
+        active, daemon = self._install_fake_active([ord("o"), ord("k"), 0])
+        active.session_kv = SessionKV(cap=2)
+        active.prefix_cache = PrefixCache(cap=2, cache_dir=tempfile.mkdtemp())
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        boundary = daemon.last_cmd_args["snap_pos"]
+        self.assertEqual(daemon.last_cmd_args["snap_slot"], active.snapshot_staging_slot)
+        self.assertGreater(boundary, 0)
+        self.assertEqual(len(daemon.saved_snapshots), 1)
+
+        prefix_key = active.prefix_cache.lookup(daemon.last_cmd_args["prompt_ids"], boundaries=[boundary])[0]
+        prefix_path = active.snapshot_swap.ram_path(prefix_key)
+        self.assertTrue(prefix_path.exists())
+        self.assertEqual(prefix_path.read_text(), f"slot={active.snapshot_staging_slot}\n")
+
+    def test_existing_session_updates_snapshot_even_when_no_tokens_emit(self):
+        active, daemon = self._install_fake_active([ord("x"), 0])
+        active.session_kv = SessionKV(cap=2)
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+        hist = self.client.post(
+            "/history",
+            json={"title": "session zero token", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        )
+        self.assertEqual(hist.status_code, 200)
+        conv_id = hist.json()["id"]
+
+        first = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(first.status_code, 200)
+
+        daemon._tokens = [0]
+        second = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_id,
+                "messages": [
+                    {"role": "user", "content": "ping"},
+                    {"role": "assistant", "content": "x"},
+                    {"role": "user", "content": "again"},
+                ],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(second.status_code, 200)
+
+        prompt_ids = daemon.last_cmd_args["prompt_ids"]
+        snapshot_key, prefix_len = active.session_kv.get_session(conv_id, prompt_ids)
+        self.assertEqual(snapshot_key, active.session_kv.swap_key(conv_id))
+        self.assertEqual(prefix_len, len(prompt_ids))
+
     def test_real_session_passes_obsidian_protected_blocks_to_compression(self):
         active, _ = self._install_fake_active(
             [ord("o"), ord("k"), 0],
@@ -1855,7 +1973,7 @@ class OpenCodeSessionReplayTests(unittest.TestCase):
             cfg.update(cfg_overrides)
         daemon = FakeDflashDaemon(tokens)
         active = FakeActive("dflash-replay", cfg, daemon, tokenizer)
-        active.session_kv = SessionKV(cap=2, prefix_cap=2)
+        active.session_kv = SessionKV(cap=2)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         active.snapshot_swap = SnapshotSwap(
