@@ -87,6 +87,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 | `tokenizer` | Local tokenizer dir |
 | `budget` | DDTree page pool (22 = 262K ctx) |
 | `max-effective-context` | Hard cap for prompt tokens after PFlash compression |
+| `max-raw-ceiling` | Hard cap for raw prompt tokens before compression; defaults to `ctx-size` |
 | `prefix-cache-slots` | VRAM slots for prefix cache snapshots |
 | `session-kv-slots` | VRAM slots for per-session KV snapshots |
 | `prefill-threshold` | Token count to trigger PFlash compression |

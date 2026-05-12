@@ -1944,6 +1944,20 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             model_cfg.get("max-raw-context", model_cfg.get("max_raw_context")),
         ),
     )
+    # Cheap raw-size reject before we take the daemon lock — a pathologically
+    # large prompt shouldn't tie up the drafter scoring uncompressible tokens.
+    max_raw_ceiling = int(model_cfg.get(
+        "max-raw-ceiling",
+        model_cfg.get("max_raw_ceiling", ctx_size),
+    ))
+    if max_raw_ceiling and len(prompt_ids) > max_raw_ceiling:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"raw prompt ({len(prompt_ids)} tokens) exceeds max raw ceiling "
+                f"{max_raw_ceiling}"
+            ),
+        )
 
     prefill_config = active.prefill_config
     daemon = active.dflash_daemon

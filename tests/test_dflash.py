@@ -1582,14 +1582,20 @@ class DflashProxyIntegrationTests(unittest.TestCase):
             headers=self.auth,
         )
         self.assertEqual(response.status_code, 400)
-        self.assertIn("exceeds context size", response.json()["detail"])
+        # max-raw-ceiling defaults to ctx-size, so it now fires before any daemon work.
+        self.assertIn("exceeds max raw ceiling", response.json()["detail"])
         # Daemon must not have been touched.
         self.assertIsNone(daemon.last_cmd_args)
 
     def test_effective_context_limit_allows_post_pflash_prompt(self):
         active, daemon = self._install_fake_active(
             [ord("o"), ord("k"), 0],
-            cfg_overrides={"ctx-size": 10, "predict": 64, "max-effective-context": 4},
+            cfg_overrides={
+                "ctx-size": 10,
+                "predict": 64,
+                "max-effective-context": 4,
+                "max-raw-ceiling": 4096,
+            },
         )
         active.prefill_config = type(
             "PrefillCfg",
@@ -1619,7 +1625,12 @@ class DflashProxyIntegrationTests(unittest.TestCase):
     def test_effective_context_overflow_returns_400_after_pflash(self):
         active, daemon = self._install_fake_active(
             [],
-            cfg_overrides={"ctx-size": 10, "predict": 64, "max-effective-context": 4},
+            cfg_overrides={
+                "ctx-size": 10,
+                "predict": 64,
+                "max-effective-context": 4,
+                "max-raw-ceiling": 4096,
+            },
         )
         active.prefill_config = type(
             "PrefillCfg",
