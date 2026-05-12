@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import shutil
 import os
 import time
 import uuid
@@ -43,7 +44,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
     for name in config.DFLASH_IGNORED_SAMPLING:
         if payload.get(name) is not None:
-            logger = __import__("logging").getLogger(__name__)
             logger.warning(
                 f"dflash: ignoring unsupported sampling param '{name}' on model {active.name}"
             )
@@ -51,7 +51,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
     try:
         tokenizer = active.get_tokenizer()
     except Exception as e:
-        logger = __import__("logging").getLogger(__name__)
         logger.error(f"Failed to load tokenizer for {active.name}: {e}")
         raise HTTPException(status_code=503, detail=f"Tokenizer unavailable: {e}")
 
@@ -119,7 +118,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     blocks=prompt_blocks,
                 )
             except Exception as e:
-                logger = __import__("logging").getLogger(__name__)
                 logger.error(f"pflash compression failed: {e}")
                 effective_ids = prompt_ids
                 effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
@@ -153,6 +151,12 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
         async def sse_stream():
             loaded_staging = False
+            had_session = False
+            pc = None
+            prepared_prefix = None
+            prefix_snapshot_key = None
+            prefix_snapshot_len = None
+            prefix_snapshot_confirmed = False
             try:
                 if daemon is None or not daemon.is_running():
                     yield _sse_error_frames(completion_id, created, "dflash daemon not running")
@@ -163,6 +167,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 pc = active.prefix_cache
                 store = getattr(active, "snapshot_swap", None)
                 staging_slot = getattr(active, "snapshot_staging_slot", 7)
+                if store is not None:
+                    store.bind_loop()
 
                 async def _load_into_staging(snapshot_key, prefix_len):
                     ok = await asyncio.to_thread(store.load, daemon, snapshot_key, staging_slot)
@@ -173,6 +179,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 if conversation_id and sk and store:
                     session_hit = sk.get_session(conversation_id, effective_ids)
                     if session_hit is not None:
+                        had_session = True
                         session_key, session_prefix_len = session_hit
                         try:
                             prefix_hit = await _load_into_staging(session_key, session_prefix_len)
@@ -191,13 +198,21 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                         except KeyError:
                             logger.warning("prefix snapshot missing from store; dropping cache entry")
 
+                restored_prefix_len = prefix_hit[1] if prefix_hit else 0
+                if pc and not pc.disabled and store and effective_boundaries:
+                    boundary = effective_boundaries[0]
+                    if boundary > restored_prefix_len:
+                        prepared_prefix = pc.prepare_inline_snap(effective_ids, boundary)
+                        if prepared_prefix is not None:
+                            prefix_snapshot_key, prefix_snapshot_len = prepared_prefix
+
                 cmd_path = await asyncio.to_thread(
                     daemon.send_generate_cmd,
                     effective_ids,
                     max_tokens,
                     prefix_hit[0] if prefix_hit else None,
-                    None,
-                    None,
+                    staging_slot if prepared_prefix is not None else None,
+                    prefix_snapshot_len,
                     temperature,
                     top_p,
                     top_k,
@@ -303,33 +318,38 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 tps = len(tokens_emitted) / elapsed
 
-                if tokens_emitted:
+                if tokens_emitted or had_session:
                     try:
+                        prefix_snapshot_written = False
+                        if prepared_prefix is not None:
+                            await asyncio.to_thread(store.save, daemon, prefix_snapshot_key, staging_slot)
+                            prefix_snapshot_written = True
+
                         await asyncio.to_thread(daemon.snapshot, staging_slot)
-                        session_path = None
                         if conversation_id and sk and store:
                             evicted_id = sk.evict_lru_if_full(conversation_id)
                             if evicted_id is not None:
                                 for key in sk.all_keys(evicted_id):
                                     await asyncio.to_thread(store.discard, key)
                             session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
-                            session_path = await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
-                        if pc and not pc.disabled and store and effective_boundaries:
-                            prepared = pc.prepare_inline_snap(effective_ids, effective_boundaries[0])
-                            if prepared is not None and session_path is not None:
-                                prefix_key, prefix_len = prepared
-                                evicted_prefix_key = pc.confirm_inline_snap(prefix_key, prefix_len, effective_ids)
-                                prefix_ram_path = store.ram_path(prefix_key)
-                                prefix_ram_path.parent.mkdir(parents=True, exist_ok=True)
-                                await asyncio.to_thread(__import__("shutil").copy2, session_path, prefix_ram_path)
-                                store.ram[prefix_key] = str(prefix_ram_path)
-                                store.ram.move_to_end(prefix_key)
-                                store._queue_mirror(prefix_ram_path, store.disk_path(prefix_key), prefix_key)
-                                store._evict_ram_if_over_budget()
+                            await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
+
+                        if prepared_prefix is not None:
+                            if prefix_snapshot_written and prefix_snapshot_key is not None and prefix_snapshot_len is not None:
+                                evicted_prefix_key = pc.confirm_inline_snap(
+                                    prefix_snapshot_key,
+                                    prefix_snapshot_len,
+                                    effective_ids,
+                                )
+                                prefix_snapshot_confirmed = True
                                 if evicted_prefix_key is not None:
                                     await asyncio.to_thread(store.discard, evicted_prefix_key)
+                            else:
+                                pc.abort_inline_snap(prefix_snapshot_key)
                     except Exception as e:
                         logger.warning(f"snapshot save failed: {e}")
+                        if pc and prepared_prefix is not None and prefix_snapshot_key is not None:
+                            pc.abort_inline_snap(prefix_snapshot_key)
                         if conversation_id and sk:
                             sk.evict(conversation_id)
 
@@ -346,6 +366,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 yield f"data: {json.dumps(final)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
+                if pc and prepared_prefix is not None and prefix_snapshot_key is not None and not prefix_snapshot_confirmed:
+                    pc.abort_inline_snap(prefix_snapshot_key)
                 if loaded_staging:
                     try:
                         await asyncio.to_thread(daemon.free_snapshot, staging_slot)
@@ -358,7 +380,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 async for chunk in sse_stream():
                     yield chunk
             except Exception as e:
-                logger = __import__("logging").getLogger(__name__)
                 logger.exception(f"dflash generation error: {e}")
                 yield _sse_error_frames(completion_id, created, str(e))
 
