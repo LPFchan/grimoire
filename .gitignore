@@ -8,3 +8,6 @@ build/
 *.so
 *.egg
 docker-compose.yml
+.venv/
+build/
+.sisyphus/

@@ -118,7 +118,7 @@ RUN --mount=type=cache,target=/root/.ccache \
     set -eux; \
     cd /app/dflash-hub/dflash; \
     rm -f .git && git init && git add -A && git -c user.name=build -c user.email=build commit -qm snapshot; \
-    git submodule update --init --recursive || true; \
+	git submodule update --init --recursive; \
     cmake -B /app/.cache/dflash-build/build -S . \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES=86 \
