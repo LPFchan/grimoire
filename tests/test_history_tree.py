@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from fastapi.testclient import TestClient
 
+import grimoire.config as config
 import grimoire.entrypoint as entrypoint
 from grimoire.history import HistoryStore
 
@@ -21,17 +22,17 @@ class HistoryTreeContractTests(unittest.TestCase):
         self.db_path = str(Path(self.tmp.name) / "tree.sqlite3")
         self._old_store = entrypoint.history_store
         entrypoint.history_store = HistoryStore(self.db_path)
-        self._old_api = entrypoint.API_KEY
-        self._old_admin = entrypoint.ADMIN_TOKEN
-        entrypoint.API_KEY = "test-key"
-        entrypoint.ADMIN_TOKEN = "test-key"
+        self._old_api = config.API_KEY
+        self._old_admin = config.ADMIN_TOKEN
+        config.API_KEY = "test-key"
+        config.ADMIN_TOKEN = "test-key"
         self.client = TestClient(entrypoint.app)
         self.auth = {"Authorization": "Bearer test-key"}
 
     def tearDown(self):
         entrypoint.history_store = self._old_store
-        entrypoint.API_KEY = self._old_api
-        entrypoint.ADMIN_TOKEN = self._old_admin
+        config.API_KEY = self._old_api
+        config.ADMIN_TOKEN = self._old_admin
         self.tmp.cleanup()
 
     def _create_conv(self, conv_id="c1", name="Demo", curr_node=None):

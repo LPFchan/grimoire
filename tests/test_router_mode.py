@@ -17,7 +17,9 @@ os.environ.setdefault("GRIMOIRE_REGISTRY_PATH", str(Path(tempfile.gettempdir()) 
 
 from fastapi.testclient import TestClient
 
+import grimoire.config as config
 import grimoire.entrypoint as entrypoint
+import grimoire.routes.models as models_routes
 
 
 class FakeActive:
@@ -33,17 +35,17 @@ class FakeActive:
 
 class RouterModeContractTests(unittest.TestCase):
     def setUp(self):
-        self._old_api = entrypoint.API_KEY
-        self._old_admin = entrypoint.ADMIN_TOKEN
-        entrypoint.API_KEY = "test-key"
-        entrypoint.ADMIN_TOKEN = "test-key"
+        self._old_api = config.API_KEY
+        self._old_admin = config.ADMIN_TOKEN
+        config.API_KEY = "test-key"
+        config.ADMIN_TOKEN = "test-key"
         entrypoint.manager.active.clear()
         self.client = TestClient(entrypoint.app)
         self.auth = {"Authorization": "Bearer test-key"}
 
     def tearDown(self):
-        entrypoint.API_KEY = self._old_api
-        entrypoint.ADMIN_TOKEN = self._old_admin
+        config.API_KEY = self._old_api
+        config.ADMIN_TOKEN = self._old_admin
         entrypoint.manager.active.clear()
 
     def test_props_root_returns_router_role(self):
@@ -107,7 +109,7 @@ class RouterModeContractTests(unittest.TestCase):
             called["name"] = model_name
             return {"status": "started", "model": model_name, "gpu": 0, "port": 8001}
 
-        with patch.object(entrypoint, "switch_model", fake_switch):
+        with patch.object(models_routes, "switch_model", fake_switch):
             response = self.client.post(
                 "/models/load",
                 json={"model": "gemma-4-31B"},
@@ -127,7 +129,7 @@ class RouterModeContractTests(unittest.TestCase):
             called["name"] = model_name
             return {"status": "stopped", "model": model_name}
 
-        with patch.object(entrypoint, "stop_model_endpoint", fake_stop):
+        with patch.object(models_routes, "stop_model_endpoint", fake_stop):
             response = self.client.post(
                 "/models/unload",
                 json={"model": "gemma-4-31B"},

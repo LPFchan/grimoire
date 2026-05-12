@@ -22,7 +22,9 @@ os.environ.setdefault("GRIMOIRE_REGISTRY_PATH", str(Path(tempfile.gettempdir()) 
 
 from fastapi.testclient import TestClient
 
+import grimoire.config as config
 import grimoire.entrypoint as entrypoint
+import grimoire.proxy.dflash as dflash_proxy
 from grimoire import registry as registry_mod
 from grimoire.dflash.daemon import DflashDaemon
 from grimoire.dflash.prefix_cache import PrefixCache
@@ -242,11 +244,11 @@ async def _replay_session_file_async(filename):
 
     with tempfile.TemporaryDirectory(dir=tmp_dir) as tmp:
         old_store = entrypoint.history_store
-        old_api = entrypoint.API_KEY
-        old_admin = entrypoint.ADMIN_TOKEN
+        old_api = config.API_KEY
+        old_admin = config.ADMIN_TOKEN
         entrypoint.history_store = HistoryStore(str(Path(tmp) / "replay-history.sqlite3"))
-        entrypoint.API_KEY = token
-        entrypoint.ADMIN_TOKEN = token
+        config.API_KEY = token
+        config.ADMIN_TOKEN = token
         entrypoint.manager.active.clear()
         try:
             with patch.object(entrypoint.manager, "start_model", fake_start_model), patch.object(
@@ -326,8 +328,8 @@ async def _replay_session_file_async(filename):
                 return {"filename": filename, "turns": len(turns), "history_count": final_count}
         finally:
             entrypoint.history_store = old_store
-            entrypoint.API_KEY = old_api
-            entrypoint.ADMIN_TOKEN = old_admin
+            config.API_KEY = old_api
+            config.ADMIN_TOKEN = old_admin
             entrypoint.manager.active.clear()
 
 
@@ -1513,17 +1515,17 @@ class DflashProxyIntegrationTests(unittest.TestCase):
     """End-to-end /v1/chat/completions through _proxy_dflash with a fake daemon."""
 
     def setUp(self):
-        self._old_api = entrypoint.API_KEY
-        self._old_admin = entrypoint.ADMIN_TOKEN
-        entrypoint.API_KEY = "test-key"
-        entrypoint.ADMIN_TOKEN = "test-key"
+        self._old_api = config.API_KEY
+        self._old_admin = config.ADMIN_TOKEN
+        config.API_KEY = "test-key"
+        config.ADMIN_TOKEN = "test-key"
         entrypoint.manager.active.clear()
         self.client = TestClient(entrypoint.app)
         self.auth = {"authorization": "Bearer test-key"}
 
     def tearDown(self):
-        entrypoint.API_KEY = self._old_api
-        entrypoint.ADMIN_TOKEN = self._old_admin
+        config.API_KEY = self._old_api
+        config.ADMIN_TOKEN = self._old_admin
         entrypoint.manager.active.clear()
 
     def _install_fake_active(self, tokens, cfg_overrides=None):
@@ -1605,9 +1607,9 @@ class DflashProxyIntegrationTests(unittest.TestCase):
 
         async def fake_maybe_compress(prompt_ids, daemon, config, blocks=None):
             effective_ids = [1, 2, 3, 4]
-            return effective_ids, True, entrypoint.materialize_blocks(effective_ids)
+            return effective_ids, True, dflash_proxy.materialize_blocks(effective_ids)
 
-        with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
+        with patch.object(dflash_proxy, "maybe_compress", fake_maybe_compress):
             response = self.client.post(
                 "/v1/chat/completions",
                 json={
@@ -1640,9 +1642,9 @@ class DflashProxyIntegrationTests(unittest.TestCase):
 
         async def fake_maybe_compress(prompt_ids, daemon, config, blocks=None):
             effective_ids = [1, 2, 3, 4, 5]
-            return effective_ids, True, entrypoint.materialize_blocks(effective_ids)
+            return effective_ids, True, dflash_proxy.materialize_blocks(effective_ids)
 
-        with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
+        with patch.object(dflash_proxy, "maybe_compress", fake_maybe_compress):
             response = self.client.post(
                 "/v1/chat/completions",
                 json={
@@ -1793,9 +1795,9 @@ class DflashProxyIntegrationTests(unittest.TestCase):
 
         async def fake_maybe_compress(prompt_ids, daemon, config, blocks=None):
             calls["blocks"] = list(blocks or [])
-            return prompt_ids, False, entrypoint.materialize_blocks(prompt_ids, blocks)
+            return prompt_ids, False, dflash_proxy.materialize_blocks(prompt_ids, blocks)
 
-        with patch.object(entrypoint, "maybe_compress", fake_maybe_compress):
+        with patch.object(dflash_proxy, "maybe_compress", fake_maybe_compress):
             response = self.client.post(
                 "/v1/chat/completions",
                 json={"model": "dflash-test", "messages": messages, "stream": False},
@@ -1818,17 +1820,17 @@ class OpenCodeSessionReplayTests(unittest.TestCase):
         self.db_path = str(Path(self.tmp.name) / "replay-history.sqlite3")
         self._old_store = entrypoint.history_store
         entrypoint.history_store = HistoryStore(self.db_path)
-        self._old_api = entrypoint.API_KEY
-        self._old_admin = entrypoint.ADMIN_TOKEN
-        entrypoint.API_KEY = "test-key"
-        entrypoint.ADMIN_TOKEN = "test-key"
+        self._old_api = config.API_KEY
+        self._old_admin = config.ADMIN_TOKEN
+        config.API_KEY = "test-key"
+        config.ADMIN_TOKEN = "test-key"
         entrypoint.manager.active.clear()
         self.user_hash = identity_hash("test-key")
 
     def tearDown(self):
         entrypoint.history_store = self._old_store
-        entrypoint.API_KEY = self._old_api
-        entrypoint.ADMIN_TOKEN = self._old_admin
+        config.API_KEY = self._old_api
+        config.ADMIN_TOKEN = self._old_admin
         entrypoint.manager.active.clear()
         self.tmp.cleanup()
 

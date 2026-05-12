@@ -18,7 +18,9 @@ os.environ.setdefault("GRIMOIRE_USAGE_PATH", str(Path(tempfile.gettempdir()) / "
 
 from fastapi import HTTPException
 
+import grimoire.config as config
 import grimoire.entrypoint as entrypoint
+import grimoire.model_manager as mm_module
 from grimoire.history import HistoryStore, identity_hash
 from grimoire.registry import ModelRegistry
 
@@ -42,40 +44,40 @@ class DropInBlockerTests(unittest.TestCase):
         }.issubset(aliases))
 
     def test_auth_fails_closed_without_api_key(self):
-        old_api_key = entrypoint.API_KEY
-        old_allow_anonymous = entrypoint.ALLOW_ANONYMOUS
+        old_api_key = config.API_KEY
+        old_allow_anonymous = config.ALLOW_ANONYMOUS
         try:
-            entrypoint.API_KEY = ""
-            entrypoint.ALLOW_ANONYMOUS = False
+            config.API_KEY = ""
+            config.ALLOW_ANONYMOUS = False
             with self.assertRaises(HTTPException) as cm:
                 entrypoint.require_api(FakeRequest())
             self.assertEqual(cm.exception.status_code, 503)
         finally:
-            entrypoint.API_KEY = old_api_key
-            entrypoint.ALLOW_ANONYMOUS = old_allow_anonymous
+            config.API_KEY = old_api_key
+            config.ALLOW_ANONYMOUS = old_allow_anonymous
 
     def test_anonymous_mode_requires_explicit_opt_in(self):
-        old_api_key = entrypoint.API_KEY
-        old_allow_anonymous = entrypoint.ALLOW_ANONYMOUS
+        old_api_key = config.API_KEY
+        old_allow_anonymous = config.ALLOW_ANONYMOUS
         try:
-            entrypoint.API_KEY = ""
-            entrypoint.ALLOW_ANONYMOUS = True
+            config.API_KEY = ""
+            config.ALLOW_ANONYMOUS = True
             token, user_hash = entrypoint.require_api(FakeRequest())
             self.assertEqual(token, "anonymous")
             self.assertEqual(user_hash, identity_hash("anonymous"))
         finally:
-            entrypoint.API_KEY = old_api_key
-            entrypoint.ALLOW_ANONYMOUS = old_allow_anonymous
+            config.API_KEY = old_api_key
+            config.ALLOW_ANONYMOUS = old_allow_anonymous
 
     def test_bearer_auth_uses_legacy_gateway_key(self):
-        old_api_key = entrypoint.API_KEY
+        old_api_key = config.API_KEY
         try:
-            entrypoint.API_KEY = "legacy-key"
+            config.API_KEY = "legacy-key"
             token, user_hash = entrypoint.require_api(FakeRequest(headers={"authorization": "Bearer legacy-key"}))
             self.assertEqual(token, "legacy-key")
             self.assertEqual(user_hash, identity_hash("legacy-key"))
         finally:
-            entrypoint.API_KEY = old_api_key
+            config.API_KEY = old_api_key
 
     def test_login_template_renders_literal_css_braces(self):
         html = entrypoint._render_login_html("")
@@ -128,9 +130,9 @@ class DropInBlockerTests(unittest.TestCase):
             def stop(self):
                 self.stopped = True
 
-        old_registry = entrypoint.registry
+        old_registry = mm_module.registry
         try:
-            entrypoint.registry = FakeRegistry()
+            mm_module.registry = FakeRegistry()
             manager = entrypoint.ModelManager(gpu_count=1)
             active = FakeActive()
             manager.active["canonical"] = active
@@ -139,7 +141,7 @@ class DropInBlockerTests(unittest.TestCase):
             self.assertTrue(active.stopped)
             self.assertNotIn("canonical", manager.active)
         finally:
-            entrypoint.registry = old_registry
+            mm_module.registry = old_registry
 
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:
