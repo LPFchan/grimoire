@@ -59,6 +59,15 @@ def build_cmd(cfg, port, ctx_size_override=None):
             sys.exit(1)
         cmd.extend(["--mmproj", mmproj_path])
 
+    for arg in cfg.get("extra-args", []) or []:
+        cmd.append(str(arg))
+
+    family = cfg.get("family")
+    if family:
+        fd = registry.get_family_defaults(family)
+        for arg in fd.get("extra-args", []) or []:
+            cmd.append(str(arg))
+
     return cmd
 
 

@@ -80,11 +80,14 @@ class ModelRegistry:
             data = {}
         models = data.get("models", {})
         fixed = data.get("fixed", {})
+        family_defaults = data.get("family_defaults", {})
         if not isinstance(models, dict):
             models = {}
         if not isinstance(fixed, dict):
             fixed = {}
-        return {**data, "models": models, "fixed": fixed}
+        if not isinstance(family_defaults, dict):
+            family_defaults = {}
+        return {**data, "models": models, "fixed": fixed, "family_defaults": family_defaults}
 
     def _load(self):
         path = self.path
@@ -149,6 +152,14 @@ class ModelRegistry:
         with self._lock:
             self._maybe_reload()
             return dict(self._data.get("fixed", {}))
+
+    def get_family_defaults(self, family):
+        with self._lock:
+            self._maybe_reload()
+            family_defaults = self._data.get("family_defaults", {})
+            if not isinstance(family_defaults, dict):
+                return {}
+            return copy.deepcopy(family_defaults.get(family, {}) or {})
 
     @staticmethod
     def normalize_model_id(model_id):

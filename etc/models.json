@@ -11,7 +11,6 @@
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
-      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
@@ -40,7 +39,6 @@
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
-      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
@@ -71,7 +69,6 @@
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
-      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
@@ -93,13 +90,23 @@
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
       "fa-window": 2048,
+      "snapshot-mode": "compact-full",
+      "snapshot-ram-dir": "/dev/shm/grimoire-snapshots",
+      "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/dflash-qwen-27B",
+      "snapshot-ram-budget-gb": 20,
+      "snapshot-staging-slot": 7,
       "prefix-cache-slots": 2,
-      "session-kv-slots": 2,
+      "session-kv-slots": 4,
       "prefill-threshold": 48000,
       "prefill-keep-ratio": 0.05,
       "prefill-tail-budget": 16000,
       "prefill-compression": "auto"
     }
   },
-  "fixed": {}
+  "fixed": {},
+  "family_defaults": {
+    "qwen": {
+      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"]
+    }
+  }
 }
