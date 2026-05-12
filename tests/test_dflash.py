@@ -237,6 +237,12 @@ async def _replay_session_file_async(filename):
     daemon = FakeDflashDaemon([3793, 248046])
     active = FakeActive("dflash-replay", cfg, daemon, tokenizer)
     active.session_kv = SessionKV(cap=2, prefix_cap=2)
+    tmp_store = tempfile.TemporaryDirectory(dir=tmp_dir)
+    active.snapshot_swap = SnapshotSwap(
+        ram_dir=str(Path(tmp_store.name) / "ram"),
+        disk_dir=str(Path(tmp_store.name) / "disk"),
+        ram_budget_gb=1,
+    )
     auth = {"authorization": f"Bearer {token}"}
 
     async def fake_start_model(model_name):
@@ -316,17 +322,18 @@ async def _replay_session_file_async(filename):
                         prompt_ids = daemon.last_cmd_args["prompt_ids"]
                         if not active.session_kv.has_session(conversation_id):
                             raise AssertionError(f"{filename}: missing session kv entry")
-                        slot, prefix_len = active.session_kv.get_session(conversation_id, prompt_ids)
-                        if slot is None or prefix_len != len(prompt_ids):
+                        snapshot_key, prefix_len = active.session_kv.get_session(conversation_id, prompt_ids)
+                        if snapshot_key is None or prefix_len != len(prompt_ids):
                             raise AssertionError(f"{filename}: bad session kv state")
-                        if daemon.last_cmd_args["snap_pos"] != len(prompt_ids):
-                            raise AssertionError(f"{filename}: bad snap_pos")
+                        if snapshot_key != active.session_kv.swap_key(conversation_id):
+                            raise AssertionError(f"{filename}: wrong session snapshot key")
 
                 final_count, _ = _history_tail_for_test(entrypoint.history_store, conversation_id, limit=1)
                 if final_count <= 0:
                     raise AssertionError(f"{filename}: empty history after replay")
                 return {"filename": filename, "turns": len(turns), "history_count": final_count}
         finally:
+            tmp_store.cleanup()
             entrypoint.history_store = old_store
             config.API_KEY = old_api
             config.ADMIN_TOKEN = old_admin
@@ -535,9 +542,9 @@ class PrefixCacheBoundaryTests(unittest.TestCase):
     def _commit(self, prompt, boundary):
         prep = self.cache.prepare_inline_snap(prompt, boundary)
         self.assertIsNotNone(prep)
-        slot, pos = prep
-        self.cache.confirm_inline_snap(slot, pos, prompt)
-        return slot
+        snapshot_key, pos = prep
+        self.cache.confirm_inline_snap(snapshot_key, pos, prompt)
+        return snapshot_key
 
     def test_full_prompt_hit(self):
         prompt = list(range(20))
@@ -568,8 +575,8 @@ class PrefixCacheBoundaryTests(unittest.TestCase):
         prompt = list(range(20))
         prep = self.cache.prepare_inline_snap(prompt, 20)
         self.assertIsNotNone(prep)
-        slot, _ = prep
-        self.cache.abort_inline_snap(slot)
+        snapshot_key, _ = prep
+        self.cache.abort_inline_snap(snapshot_key)
         self.assertIsNone(self.cache.lookup(prompt))
 
     def test_disabled_cache_is_inert(self):
@@ -655,6 +662,9 @@ class FakeDflashDaemon:
         self.last_cmd_args = None
         self._running = True
         self.freed_slots = []
+        self.saved_snapshots = []
+        self.loaded_snapshots = []
+        self.snapshots = []
 
     def is_running(self):
         return self._running
@@ -687,6 +697,17 @@ class FakeDflashDaemon:
     def free_snapshot(self, slot):
         self.freed_slots.append(slot)
 
+    def snapshot(self, slot):
+        self.snapshots.append(slot)
+
+    def save_snapshot(self, slot, path):
+        self.saved_snapshots.append((slot, path))
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(f"slot={slot}\n")
+
+    def load_snapshot(self, slot, path):
+        self.loaded_snapshots.append((slot, path))
+
 
 class FakeActive:
     """Lightweight ActiveModel substitute for the dflash proxy path."""
@@ -702,6 +723,7 @@ class FakeActive:
         self.prefill_config = None
         self.session_kv = None
         self.snapshot_swap = None
+        self.snapshot_staging_slot = 7
         self._tokenizer = tokenizer
         self._lock = None
 
@@ -766,10 +788,7 @@ class DflashDaemonProtocolTests(unittest.TestCase):
         try:
             sent = self.captured.getvalue().decode()
             self.assertTrue(sent.startswith(path + " 16"), sent)
-            self.assertIn("temp=0.7000", sent)
-            self.assertIn("top_p=0.9500", sent)
-            self.assertIn("top_k=50", sent)
-            self.assertIn("seed=42", sent)
+            self.assertIn("samp=0.7000,0.9500,50,1.0000,42", sent)
             self.assertTrue(sent.endswith("\n"))
             with open(path, "rb") as f:
                 prompt_bytes = f.read()
@@ -788,11 +807,42 @@ class DflashDaemonProtocolTests(unittest.TestCase):
             sent = self.captured.getvalue().decode()
             self.assertIn(f"RESTORE 3 {path} 8", sent)
             self.assertIn("snap=2:5", sent)
+            self.assertIn("samp=0.8000,0.9000,40,1.0000,0", sent)
         finally:
             try:
                 os.unlink(path)
             except OSError:
                 pass
+
+    def test_send_restore_chain_cmd_includes_slots_and_sampler(self):
+        path = self.daemon.send_restore_chain_cmd(
+            [1, 2, 3],
+            12,
+            thick_slot=7,
+            thin_slots=[6, 5],
+            temperature=0.4,
+            top_p=0.8,
+            top_k=20,
+            seed=99,
+        )
+        try:
+            sent = self.captured.getvalue().decode()
+            self.assertIn(f"RESTORE_CHAIN 7 6,5 {path} 12", sent)
+            self.assertIn("samp=0.4000,0.8000,20,1.0000,99", sent)
+            with open(path, "rb") as f:
+                prompt_bytes = f.read()
+            self.assertEqual(prompt_bytes, struct.pack("<iii", 1, 2, 3))
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_snapshot_thin_sends_protocol_command(self):
+        os.write(self.w_fd, struct.pack("<i", -1))
+        self.daemon.snapshot_thin(4, 10, 20)
+        sent = self.captured.getvalue().decode()
+        self.assertEqual(sent, "SNAPSHOT_THIN 4 10 20\n")
 
     def test_read_next_token_parses_int32_stream(self):
         os.write(self.w_fd, struct.pack("<i", 42))
@@ -1308,7 +1358,7 @@ class MaybeCompressProtectedRangesTests(unittest.TestCase):
 
 
 class SessionKVTests(unittest.TestCase):
-    """SessionKV maps conversation_id -> (slot, prefix_len, prefix_hash) for cross-turn KV reuse."""
+    """SessionKV maps conversation_id -> compact full snapshot metadata."""
 
     # Long enough to cover every prefix_len used by these tests.
     PROMPT = list(range(256))
@@ -1317,103 +1367,68 @@ class SessionKVTests(unittest.TestCase):
         sk = SessionKV(cap=2, prefix_cap=2)
         self.assertIsNone(sk.get_session("nope", []))
 
-    def test_reserve_slot_uses_offset_for_cold_cache(self):
+    def test_update_returns_stable_snapshot_key(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        # First reservation hands out the offset slot (= prefix_cap).
-        self.assertEqual(sk.reserve_slot(), 2)
-
-    def test_reserve_then_update_keeps_consecutive_slots_distinct(self):
-        sk = SessionKV(cap=2, prefix_cap=2)
-        slot_a = sk.reserve_slot()
-        sk.update("a", slot_a, 100, self.PROMPT)
-        slot_b = sk.reserve_slot()
-        sk.update("b", slot_b, 200, self.PROMPT)
-        self.assertNotEqual(slot_a, slot_b)
-        self.assertEqual({slot_a, slot_b}, {2, 3})
-
-    def test_reserve_after_eviction_avoids_mru_collision(self):
-        # Regression: reserve_slot used to compute idx=len(sessions) after
-        # popping the LRU, which gave the SAME slot as the surviving MRU
-        # session. Two conversations ended up mapped to one daemon slot and
-        # the survivor's snapshot was clobbered on the next snapshot.
-        sk = SessionKV(cap=2, prefix_cap=2)
-        slot_a = sk.reserve_slot()
-        sk.update("a", slot_a, 100, self.PROMPT)
-        slot_b = sk.reserve_slot()
-        sk.update("b", slot_b, 200, self.PROMPT)
-        # 'a' is LRU; reserving for 'c' must evict 'a' and reuse its slot.
-        slot_c = sk.reserve_slot()
-        self.assertEqual(slot_c, slot_a, "evicted slot should be reused")
-        self.assertNotEqual(slot_c, slot_b, "must not collide with the MRU survivor")
+        key_a = sk.update("a", 100, self.PROMPT)
+        key_b = sk.update("a", 100, self.PROMPT)
+        self.assertEqual(key_a, key_b)
+        self.assertEqual(key_a, sk.swap_key("a"))
 
     def test_get_session_promotes_lru(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 10, self.PROMPT)
-        sk.update("b", 3, 20, self.PROMPT)
-        # Touching 'a' promotes it; 'b' is now LRU and gets evicted on next reserve.
+        sk.update("a", 10, self.PROMPT)
+        sk.update("b", 20, self.PROMPT)
         sk.get_session("a", self.PROMPT)
-        slot_c = sk.reserve_slot()
-        sk.update("c", slot_c, 30, self.PROMPT)
+        evicted = sk.evict_lru_if_full("c")
+        self.assertEqual(evicted, "b")
+        sk.update("c", 30, self.PROMPT)
         self.assertIsNone(sk.get_session("b", self.PROMPT))
         self.assertIsNotNone(sk.get_session("a", self.PROMPT))
 
     def test_evict_is_idempotent(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 10, self.PROMPT)
+        sk.update("a", 10, self.PROMPT)
         sk.evict("a")
         sk.evict("a")  # Must not raise.
         self.assertIsNone(sk.get_session("a", self.PROMPT))
 
     def test_clear_drops_all_state(self):
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 10, self.PROMPT)
-        sk.update("b", 3, 20, self.PROMPT)
+        sk.update("a", 10, self.PROMPT)
+        sk.update("b", 20, self.PROMPT)
         sk.clear()
         self.assertIsNone(sk.get_session("a", self.PROMPT))
         self.assertIsNone(sk.get_session("b", self.PROMPT))
-        # After clear, reservations restart from offset.
-        self.assertEqual(sk.reserve_slot(), 2)
 
-    def test_cap_zero_disables_reservation(self):
+    def test_cap_zero_disables_lru_eviction(self):
         sk = SessionKV(cap=0, prefix_cap=2)
-        self.assertIsNone(sk.reserve_slot())
-
-    def test_reserve_slot_does_not_wrap_into_prefix_slots(self):
-        sk = SessionKV(cap=10, prefix_cap=7)
-        self.assertEqual(sk.reserve_slot(), 7)
-        sk.update("a", 7, 10, self.PROMPT)
-        self.assertEqual(sk.reserve_slot(), 7)
-        self.assertNotIn(0, {entry[0] for entry in sk.sessions.values()})
+        self.assertIsNone(sk.evict_lru_if_full("a"))
 
     def test_get_session_accepts_extended_prompt(self):
-        # Continuation: the next-turn prompt is the cached prefix plus a delta.
         sk = SessionKV(cap=2, prefix_cap=2)
         cached = list(range(100))
-        sk.update("a", 2, 50, cached)
+        sk.update("a", 50, cached)
         extended = cached + list(range(100, 150))
-        self.assertEqual(sk.get_session("a", extended), (2, 50))
+        snapshot_key, prefix_len = sk.get_session("a", extended)
+        self.assertEqual(snapshot_key, sk.swap_key("a"))
+        self.assertEqual(prefix_len, 50)
 
     def test_get_session_evicts_on_hash_mismatch(self):
-        # In-place edit: same conversation_id, but tokens within the cached
-        # prefix changed. Must NOT restore stale KV.
         sk = SessionKV(cap=2, prefix_cap=2)
         original = list(range(100))
-        sk.update("a", 2, 50, original)
+        sk.update("a", 50, original)
         edited = original[:10] + list(range(1000, 1040)) + original[50:]
         self.assertIsNone(sk.get_session("a", edited))
-        # The mismatch evicted the entry — even the original prompt now misses.
         self.assertIsNone(sk.get_session("a", original))
 
     def test_get_session_evicts_when_prompt_shorter_than_prefix(self):
-        # Truncation: caller retried with a shorter prompt than the cached
-        # prefix. The snapshot can't possibly match; evict.
         sk = SessionKV(cap=2, prefix_cap=2)
-        sk.update("a", 2, 100, list(range(200)))
+        sk.update("a", 100, list(range(200)))
         self.assertIsNone(sk.get_session("a", list(range(50))))
 
 
 class SnapshotSwapTests(unittest.TestCase):
-    """SnapshotSwap keeps disk-resident snapshots distinct and slot-scoped."""
+    """SnapshotSwap persists compact snapshots to RAM first, then disk."""
 
     class Daemon:
         def __init__(self):
@@ -1431,83 +1446,70 @@ class SnapshotSwapTests(unittest.TestCase):
         def free_snapshot(self, slot):
             self.freed.append(slot)
 
-    def test_reserve_uses_allowed_slot_range_and_swaps_by_key_path(self):
+    def test_save_writes_ram_copy_and_load_prefers_ram(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.Daemon()
-            swap = SnapshotSwap(td, max_vram_slots=1, slot_offset=2, slot_count=2)
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
             key_a = b"a" * 16
-            key_b = b"b" * 16
 
-            self.assertEqual(swap.reserve_slot(daemon, key_a), 2)
-            self.assertEqual(swap.reserve_slot(daemon, key_b), 2)
-            self.assertEqual(swap.get(key_a), (None, False))
-            self.assertEqual(swap.get(key_b), (2, True))
+            ram_path = swap.save(daemon, key_a, 2)
+            self.assertTrue(ram_path.exists())
+            self.assertEqual(daemon.saved[-1], (2, str(ram_path)))
 
-            a_path = swap.disk[key_a]
-            self.assertIn(key_a.hex()[:16], Path(a_path).name)
-            self.assertTrue(Path(a_path).exists())
-            self.assertTrue(all(slot == 2 for slot, _ in daemon.saved))
+            self.assertTrue(swap.load(daemon, key_a, 7))
+            self.assertEqual(daemon.loaded[-1], (7, str(ram_path)))
 
-            self.assertEqual(swap.reserve_slot(daemon, key_a), 2)
-            self.assertEqual(swap.get(key_a), (2, True))
-            self.assertEqual(swap.get(key_b), (None, False))
-            self.assertEqual(daemon.loaded[-1], (2, a_path))
-            self.assertNotEqual(a_path, swap.disk[key_b])
-
-    def test_reserve_existing_vram_key_is_idempotent(self):
+    def test_load_falls_back_to_disk_when_ram_copy_missing(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.Daemon()
-            swap = SnapshotSwap(td, max_vram_slots=1, slot_offset=2, slot_count=1)
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
             key = b"a" * 16
-            self.assertEqual(swap.reserve_slot(daemon, key), 2)
-            self.assertEqual(swap.reserve_slot(daemon, key), 2)
-            self.assertEqual(daemon.saved, [])
-            self.assertEqual(swap.get(key), (2, True))
+            disk_path = swap.disk_path(key)
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_text("disk snapshot\n")
+            swap.disk[key] = str(disk_path)
 
-    def test_discard_removes_vram_or_disk_without_saving(self):
+            self.assertTrue(swap.load(daemon, key, 7))
+            self.assertEqual(daemon.loaded[-1], (7, str(disk_path)))
+
+    def test_discard_removes_ram_and_disk_paths(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.Daemon()
-            swap = SnapshotSwap(td, max_vram_slots=1, slot_offset=2, slot_count=1)
-            key_a = b"a" * 16
-            key_b = b"b" * 16
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"a" * 16
+            ram_path = swap.save(daemon, key, 2)
+            disk_path = swap.disk_path(key)
+            disk_path.parent.mkdir(parents=True, exist_ok=True)
+            disk_path.write_text("disk snapshot\n")
+            swap.disk[key] = str(disk_path)
 
-            swap.reserve_slot(daemon, key_a)
-            swap.discard(daemon, key_a)
-            self.assertIsNone(swap.get(key_a))
-            self.assertEqual(daemon.freed, [2])
-
-            swap.reserve_slot(daemon, key_a)
-            swap.reserve_slot(daemon, key_b)
-            path = Path(swap.disk[key_a])
-            self.assertTrue(path.exists())
-            swap.discard(daemon, key_a)
-            self.assertIsNone(swap.get(key_a))
-            self.assertFalse(path.exists())
+            swap.discard(key)
+            self.assertFalse(ram_path.exists())
+            self.assertFalse(disk_path.exists())
 
 
 class PrefixCachePersistenceTests(unittest.TestCase):
-    def test_load_clamps_slots_to_current_cap(self):
+    def test_load_restores_snapshot_keys(self):
         with tempfile.TemporaryDirectory() as td:
             cache = PrefixCache(cap=4, cache_dir=td)
             key = cache.hash_prefix([1, 2, 3])
+            snap_key = cache.snapshot_key(key)
             Path(td, "index.json").write_text(json.dumps({
-                "entries": [{"key_hex": key.hex(), "slot": 3}],
-                "next_slot": 3,
+                "entries": [{"key_hex": key.hex(), "snapshot_key_hex": snap_key.hex()}],
             }))
 
             smaller = PrefixCache(cap=2, cache_dir=td)
             smaller.load()
-            self.assertEqual(list(smaller.entries.values()), [])
-            self.assertEqual(smaller.next_slot, 1)
+            self.assertEqual(list(smaller.entries.values()), [snap_key])
 
     def test_cleanup_clears_saved_index_on_disk(self):
         with tempfile.TemporaryDirectory() as td:
             cache = PrefixCache(cap=2, cache_dir=td)
             prompt = [1, 2, 3, 4]
-            slot, boundary = cache.prepare_inline_snap(prompt, 2)
-            cache.confirm_inline_snap(slot, boundary, prompt)
+            snapshot_key, boundary = cache.prepare_inline_snap(prompt, 2)
+            cache.confirm_inline_snap(snapshot_key, boundary, prompt)
             cache.save()
-            cache.cleanup(None)
+            cache.clear()
             self.assertFalse(Path(td, "index.json").exists())
 
 
@@ -1534,6 +1536,13 @@ class DflashProxyIntegrationTests(unittest.TestCase):
             cfg.update(cfg_overrides)
         daemon = FakeDflashDaemon(tokens)
         active = FakeActive("dflash-test", cfg, daemon, FakeTokenizer())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        active.snapshot_swap = SnapshotSwap(
+            ram_dir=str(Path(tmp.name) / "ram"),
+            disk_dir=str(Path(tmp.name) / "disk"),
+            ram_budget_gb=1,
+        )
 
         async def fake_start_model(model_name):
             return active
@@ -1686,9 +1695,10 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "ok")
         self.assertEqual(body["usage"]["completion_tokens"], 2)
 
-    def test_session_kv_uses_inline_prompt_snapshot_and_restores_next_turn(self):
+    def test_session_kv_saves_compact_full_snapshot_and_restores_next_turn(self):
         active, daemon = self._install_fake_active([ord("x"), 0])
         active.session_kv = SessionKV(cap=2, prefix_cap=2)
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
         hist = self.client.post(
             "/history",
             json={"title": "session test", "model": "dflash-test", "messages": []},
@@ -1709,12 +1719,11 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(first.status_code, 200)
         first_args = daemon.last_cmd_args
-        self.assertEqual(first_args["snap_slot"], 2)
-        self.assertEqual(first_args["snap_pos"], len(first_args["prompt_ids"]))
-        self.assertEqual(
-            active.session_kv.get_session(conv_id, first_args["prompt_ids"]),
-            (2, len(first_args["prompt_ids"])),
-        )
+        self.assertIsNone(first_args["snap_slot"])
+        session_key, prefix_len = active.session_kv.get_session(conv_id, first_args["prompt_ids"])
+        self.assertEqual(session_key, active.session_kv.swap_key(conv_id))
+        self.assertEqual(prefix_len, len(first_args["prompt_ids"]))
+        self.assertTrue(daemon.saved_snapshots)
 
         daemon._tokens = [ord("y"), 0]
         second = self.client.post(
@@ -1733,9 +1742,9 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(second.status_code, 200)
         second_args = daemon.last_cmd_args
-        self.assertEqual(second_args["prefix_cache_slot"], 2)
-        self.assertEqual(second_args["snap_slot"], 2)
-        self.assertEqual(second_args["snap_pos"], len(second_args["prompt_ids"]))
+        self.assertEqual(second_args["prefix_cache_slot"], active.snapshot_staging_slot)
+        self.assertIsNone(second_args["snap_slot"])
+        self.assertTrue(daemon.loaded_snapshots)
 
     def test_proxy_v1_short_circuits_dflash_to_501(self):
         self._install_fake_active([])
@@ -1847,6 +1856,13 @@ class OpenCodeSessionReplayTests(unittest.TestCase):
         daemon = FakeDflashDaemon(tokens)
         active = FakeActive("dflash-replay", cfg, daemon, tokenizer)
         active.session_kv = SessionKV(cap=2, prefix_cap=2)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        active.snapshot_swap = SnapshotSwap(
+            ram_dir=str(Path(tmp.name) / "ram"),
+            disk_dir=str(Path(tmp.name) / "disk"),
+            ram_budget_gb=1,
+        )
 
         async def fake_start_model(model_name):
             return active

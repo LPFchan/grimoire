@@ -204,6 +204,37 @@ class DflashDaemon:
             if tok == -1:
                 break
 
+    def _write_prompt_file(self, prompt_ids: list) -> str:
+        """Write prompt token ids to a temp file and return its path."""
+        fd, path = tempfile.mkstemp(suffix=".bin")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for t in prompt_ids:
+                    f.write(struct.pack("<i", int(t)))
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        return path
+
+    def _sampler_suffix(
+        self,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+        seed: Optional[int],
+    ) -> str:
+        """Build the daemon's shared `samp=` tail."""
+        if temperature is None and top_p is None and top_k is None and seed is None:
+            return ""
+        temp = 0.0 if temperature is None else float(temperature)
+        samp_top_p = 1.0 if top_p is None else float(top_p)
+        samp_top_k = 0 if top_k is None else int(top_k)
+        samp_seed = 0 if seed is None else int(seed)
+        return f" samp={temp:.4f},{samp_top_p:.4f},{samp_top_k},1.0000,{samp_seed}"
+
     def read_next_token(self) -> Optional[int]:
         """Read one int32 token from the stream pipe.
 
@@ -235,17 +266,7 @@ class DflashDaemon:
         The caller owns the returned path and must unlink it after the
         stream finishes (recommended: after read_next_token returns None).
         """
-        fd, path = tempfile.mkstemp(suffix=".bin")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                for t in prompt_ids:
-                    f.write(struct.pack("<i", int(t)))
-        except Exception:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-            raise
+        path = self._write_prompt_file(prompt_ids)
 
         if prefix_cache_slot is not None:
             cmd = f"RESTORE {prefix_cache_slot} {path} {n_gen}"
@@ -255,19 +276,58 @@ class DflashDaemon:
         if snap_slot is not None and snap_pos is not None:
             cmd += f" snap={snap_pos}:{snap_slot}"
 
-        samp_parts = []
-        if temperature is not None:
-            samp_parts.append(f"temp={temperature:.4f}")
-        if top_p is not None:
-            samp_parts.append(f"top_p={top_p:.4f}")
-        if top_k is not None:
-            samp_parts.append(f"top_k={top_k}")
-        if seed is not None:
-            samp_parts.append(f"seed={seed}")
-        if samp_parts:
-            cmd += " " + " ".join(samp_parts)
+        cmd += self._sampler_suffix(temperature, top_p, top_k, seed)
 
         self._send(cmd + "\n")
+        return path
+
+    def restore_chain(
+        self,
+        thick_slot: int,
+        thin_slots: list[int],
+        prompt_path: str,
+        n_gen: int,
+        temperature: Optional[float] = 0.8,
+        top_p: Optional[float] = 0.9,
+        top_k: Optional[int] = 40,
+        seed: Optional[int] = None,
+    ) -> None:
+        """Restore from a thick base plus zero or more thin layers."""
+        if thick_slot < -1 or thick_slot >= 8:
+            raise ValueError(f"Invalid thick snapshot slot: {thick_slot}")
+        thin_str = "-"
+        if thin_slots:
+            for slot in thin_slots:
+                if slot < 0 or slot >= 8:
+                    raise ValueError(f"Invalid thin snapshot slot: {slot}")
+            thin_str = ",".join(str(slot) for slot in thin_slots)
+        cmd = f"RESTORE_CHAIN {thick_slot} {thin_str} {prompt_path} {n_gen}"
+        cmd += self._sampler_suffix(temperature, top_p, top_k, seed)
+        self._send(cmd + "\n")
+
+    def send_restore_chain_cmd(
+        self,
+        prompt_ids: list,
+        n_gen: int,
+        thick_slot: int,
+        thin_slots: list[int],
+        temperature: Optional[float] = 0.8,
+        top_p: Optional[float] = 0.9,
+        top_k: Optional[int] = 40,
+        seed: Optional[int] = None,
+    ) -> str:
+        """Send a RESTORE_CHAIN command and return the temp prompt path."""
+        path = self._write_prompt_file(prompt_ids)
+        self.restore_chain(
+            thick_slot=thick_slot,
+            thin_slots=thin_slots,
+            prompt_path=path,
+            n_gen=n_gen,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            seed=seed,
+        )
         return path
 
     def generate(
@@ -418,8 +478,16 @@ class DflashDaemon:
             raise ValueError(f"Invalid snapshot slot: {slot}")
         self._send_expect_ack(f"SNAPSHOT {slot}\n")
 
+    def snapshot_thin(self, slot: int, kv_start: int, kv_end: int) -> None:
+        """Take a thin KV-only snapshot of range [kv_start, kv_end)."""
+        if slot < 0 or slot >= 8:
+            raise ValueError(f"Invalid snapshot slot: {slot}")
+        self._send_expect_ack(f"SNAPSHOT_THIN {slot} {kv_start} {kv_end}\n")
+
     def save_snapshot(self, slot: int, path: str) -> None:
-        """Serialize a snapshot slot to disk, freeing the VRAM.
+        """Serialize a snapshot slot to disk or tmpfs.
+
+        The daemon frees the snapshot slot after a successful save.
 
         Args:
             slot: Daemon slot ID (0-7)

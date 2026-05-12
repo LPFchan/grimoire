@@ -1,15 +1,4 @@
-"""Session-aware KV management for DFlash models.
-
-Maps conversation_id -> (slot, prefix_len, prefix_hash) so continuation turns
-only prefill the delta (new messages since last turn) instead of the full
-prompt. The hash is a truncated SHA-1 of the cached token prefix; on a
-returning conversation the caller validates that the current prompt still
-starts with that prefix before restoring. If content was edited/regenerated
-in place, the hash mismatch causes eviction and a full prefill fallback.
-
-After each generation, a snapshot is taken at len(effective_ids) so the next
-turn can RESTORE from it.
-"""
+"""Session-aware compact full snapshot metadata for DFlash models."""
 
 import hashlib
 import logging
@@ -19,11 +8,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Reserve the last N daemon slots for session KV (not prefix cache).
-# With cap=2 prefix slots and 2 session slots, slots 0-1 are prefix, 2-3 are
-# session. This avoids the prefix cache evicting an active session snapshot.
-SESSION_SLOT_OFFSET = 2
-DEFAULT_SESSION_CAP = 2
+DEFAULT_SESSION_CAP = 4
 
 
 def _prefix_hash(prompt_ids: list) -> bytes:
@@ -35,7 +20,7 @@ def _prefix_hash(prompt_ids: list) -> bytes:
 
 
 def _session_key(conversation_id: str) -> bytes:
-    """Compute a stable 16B key for swap bookkeeping."""
+    """Compute a stable 16B key for persisted session snapshots."""
     h = hashlib.sha1()
     h.update(b"session-kv\x00")
     h.update(str(conversation_id).encode("utf-8", errors="surrogatepass"))
@@ -43,90 +28,41 @@ def _session_key(conversation_id: str) -> bytes:
 
 
 class SessionKV:
-    """Manages per-conversation KV snapshot slots.
+    """Manage per-conversation compact full snapshot metadata."""
 
-    Tracks which slot each conversation owns, the prefix length
-    (position of the last snapshot), and a content hash of the cached token
-    prefix. On a returning conversation, the caller validates the hash
-    against the current prompt before restoring. Content edits, truncations,
-    or regenerations with the same conversation_id will cause a hash mismatch
-    and trigger a full prefill fallback instead of corrupting generation.
-
-    Args:
-        cap: Maximum concurrent session slots.
-        prefix_cap: Number of slots reserved for the prefix cache before
-            session slots start. Default SESSION_SLOT_OFFSET.
-    """
-
-    def __init__(self, cap: int = DEFAULT_SESSION_CAP, prefix_cap: int = SESSION_SLOT_OFFSET):
-        self.cap = cap
-        self.slot_offset = prefix_cap
-        self.physical_cap = max(0, min(8 - prefix_cap, cap))
-        # LRU: conversation_id -> (slot, prefix_len, prefix_hash)
-        self.sessions: OrderedDict[str, tuple] = OrderedDict()
-
-    def _slot_for_index(self, index: int) -> int:
-        """Return daemon slot ID for session index 0..cap-1."""
-        return self.slot_offset + index
+    def __init__(self, cap: int = DEFAULT_SESSION_CAP, prefix_cap: int = 0):
+        self.cap = max(0, int(cap))
+        self.prefix_cap = max(0, int(prefix_cap))
+        self.sessions: OrderedDict[str, tuple[bytes, int, bytes]] = OrderedDict()
 
     def swap_key(self, conversation_id: str) -> bytes:
-        """Return the stable swap key for a conversation."""
+        """Return the stable persisted snapshot key for a conversation."""
         return _session_key(conversation_id)
 
     def has_session(self, conversation_id: str) -> bool:
         """Return True if a conversation currently has session metadata."""
         return conversation_id in self.sessions
 
-    def get_session(self, conversation_id: str, prompt_ids: list) -> Optional[tuple]:
-        """Get cached slot for a conversation if the prompt prefix matches.
-
-        Returns (slot, prefix_len) if the conversation has an active snapshot
-        slot AND the current prompt starts with the same prefix that was
-        cached. Returns None on miss or hash mismatch (stale snapshot).
-
-        Args:
-            conversation_id: The conversation identifier.
-            prompt_ids: Current full prompt token IDs (used for hash validation).
-        """
+    def get_session(self, conversation_id: str, prompt_ids: list) -> Optional[tuple[bytes, int]]:
+        """Return (snapshot_key, prefix_len) if the prompt prefix matches."""
         if conversation_id not in self.sessions:
             return None
         self.sessions.move_to_end(conversation_id)
-        slot, prefix_len, prefix_hash = self.sessions[conversation_id]
-        # Validate: current prompt must start with the cached prefix.
+        snapshot_key, prefix_len, prefix_hash = self.sessions[conversation_id]
         if len(prompt_ids) < prefix_len:
-            logger.debug(f"session kv: prompt shorter than cached prefix ({len(prompt_ids)} < {prefix_len}), evicting")
-            self.sessions.pop(conversation_id)
+            logger.debug(
+                "session kv: prompt shorter than cached prefix (%s < %s), evicting",
+                len(prompt_ids),
+                prefix_len,
+            )
+            self.sessions.pop(conversation_id, None)
             return None
         current_hash = _prefix_hash(prompt_ids[:prefix_len])
         if current_hash != prefix_hash:
-            logger.debug(f"session kv: hash mismatch for {conversation_id[:8]}, evicting stale snapshot")
-            self.sessions.pop(conversation_id)
+            logger.debug("session kv: hash mismatch for %s, evicting stale snapshot", conversation_id[:8])
+            self.sessions.pop(conversation_id, None)
             return None
-        return (slot, prefix_len)
-
-    def reserve_slot(self) -> Optional[int]:
-        """Reserve a slot for a new session, evicting LRU if full.
-
-        Returns the slot ID, or None if cap is 0.
-        """
-        if self.physical_cap <= 0:
-            return None
-
-        if len(self.sessions) >= self.physical_cap:
-            old_id, _ = next(iter(self.sessions.items()))
-            self.sessions.pop(old_id)
-
-        # Pick the first slot in [offset, offset+cap) that isn't held by a
-        # surviving session. After an LRU eviction this returns the evicted
-        # slot; on a cold cache it returns the offset slot. Falling back to
-        # len(sessions) is unsafe: after eviction it can collide with the
-        # MRU survivor's slot.
-        used = {entry[0] for entry in self.sessions.values()}
-        for idx in range(self.physical_cap):
-            slot = self._slot_for_index(idx)
-            if slot not in used:
-                return slot
-        return None
+        return (snapshot_key, prefix_len)
 
     def evict_lru_if_full(self, conversation_id: str) -> Optional[str]:
         """Evict the LRU session if adding conversation_id would exceed cap."""
@@ -138,20 +74,22 @@ class SessionKV:
         self.sessions.pop(old_id)
         return old_id
 
-    def update(self, conversation_id: str, slot: int, prefix_len: int, prompt_ids: list) -> None:
-        """Record or update the snapshot position and content hash.
-
-        Args:
-            conversation_id: The conversation identifier.
-            slot: Daemon slot ID assigned to this session's snapshot.
-                With SSD swap enabled, multiple sessions may route to the same
-                physical slot value at different times.
-            prefix_len: Number of tokens captured in the snapshot.
-            prompt_ids: Full prompt token IDs (used to compute content hash).
-        """
+    def update(self, conversation_id: str, prefix_len: int, prompt_ids: list) -> bytes:
+        """Record or update the compact full snapshot for a conversation."""
+        snapshot_key = self.swap_key(conversation_id)
         prefix_hash = _prefix_hash(prompt_ids[:prefix_len])
-        self.sessions[conversation_id] = (slot, prefix_len, prefix_hash)
+        self.sessions[conversation_id] = (snapshot_key, int(prefix_len), prefix_hash)
         self.sessions.move_to_end(conversation_id)
+        while self.cap > 0 and len(self.sessions) > self.cap:
+            self.sessions.popitem(last=False)
+        return snapshot_key
+
+    def all_keys(self, conversation_id: str) -> list[bytes]:
+        """Return persisted snapshot keys for a conversation."""
+        entry = self.sessions.get(conversation_id)
+        if entry is None:
+            return []
+        return [entry[0]]
 
     def evict(self, conversation_id: str) -> None:
         """Remove a session (e.g., on new conversation or error)."""

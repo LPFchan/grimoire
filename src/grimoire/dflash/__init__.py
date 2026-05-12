@@ -2,9 +2,9 @@
 
 Wraps the DFlash daemon (test_dflash) and provides:
   - Daemon lifecycle (spawn, health, stop)
-  - Prefix cache (LRU KV snapshots with disk persistence)
-  - Session KV (per-conversation snapshot tracking)
-  - Snapshot swap (SSD-backed KV cache swap)
+  - Prefix cache (persisted compact full prefix snapshots)
+  - Session KV (per-conversation compact full snapshot tracking)
+  - Snapshot store (RAM-backed with async disk mirroring)
   - PFlash speculative prefill (long-context compression)
 """
 

@@ -6,6 +6,7 @@ import json
 import os
 import time
 import uuid
+import logging
 
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,6 +16,8 @@ from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
 from grimoire.prompt.generic import _prompt_layout_from_messages, _prefix_cache_boundaries
 from grimoire.proxy.sse import _sse_error_frames, _delta_sse, _final_sse
+
+logger = logging.getLogger(__name__)
 
 
 async def _proxy_dflash(requested_model, payload, active, user_hash, conversation_id):
@@ -149,81 +152,52 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         created = int(time.time())
 
         async def sse_stream():
+            loaded_staging = False
             try:
                 if daemon is None or not daemon.is_running():
                     yield _sse_error_frames(completion_id, created, "dflash daemon not running")
                     return
 
                 prefix_hit = None
-                snap_slot = None
-                snap_pos = None
-                session_slot = None
                 sk = active.session_kv
-                swap = getattr(active, "snapshot_swap", None)
-                session_key = sk.swap_key(conversation_id) if conversation_id and sk else None
-                had_session = False
-                # Session KV: check if this conversation has a cached snapshot.
-                # If hit, RESTORE from that slot — only prefill the new delta.
-                if conversation_id and sk:
-                    sess = sk.get_session(conversation_id, effective_ids)
-                    if sess is not None:
-                        had_session = True
-                        session_slot, session_prefix_len = sess
-                        if swap and session_key is not None:
-                            swap_hit = swap.get(session_key)
-                            if swap_hit is None:
-                                logger = __import__("logging").getLogger(__name__)
-                                logger.warning("session snapshot missing from swap index; evicting session")
-                                sk.evict(conversation_id)
-                                session_slot = None
-                                had_session = False
-                            elif swap_hit[1]:
-                                session_slot = swap_hit[0]
-                                prefix_hit = (session_slot, session_prefix_len)
-                            else:
-                                session_slot = await asyncio.to_thread(
-                                    swap.reserve_slot, daemon, session_key
-                                )
-                                prefix_hit = (session_slot, session_prefix_len)
-                        else:
-                            prefix_hit = (session_slot, session_prefix_len)
-                    elif swap and session_key is not None:
-                        await asyncio.to_thread(swap.discard, daemon, session_key)
-                # Prefix cache: fallback for new conversations or cache-miss sessions.
-                if prefix_hit is None:
-                    pc = active.prefix_cache
-                    if pc and not pc.disabled:
-                        prefix_hit = pc.lookup(effective_ids, boundaries=effective_boundaries)
-                # New conversation: reserve a session slot for an inline prompt snapshot.
-                if conversation_id and sk and session_slot is None:
-                    if swap and session_key is not None:
-                        evicted_id = sk.evict_lru_if_full(conversation_id)
-                        if evicted_id is not None:
-                            await asyncio.to_thread(
-                                swap.discard, daemon, sk.swap_key(evicted_id)
-                            )
-                        session_slot = await asyncio.to_thread(
-                            swap.reserve_slot, daemon, session_key
-                        )
-                    else:
-                        session_slot = sk.reserve_slot()
+                pc = active.prefix_cache
+                store = getattr(active, "snapshot_swap", None)
+                staging_slot = getattr(active, "snapshot_staging_slot", 7)
 
-                if session_slot is not None:
-                    snap_slot, snap_pos = session_slot, len(effective_ids)
-                else:
-                    pc = active.prefix_cache
-                    if pc and not pc.disabled:
-                        prep = pc.prepare_inline_snap(effective_ids, effective_boundaries[0]) if effective_boundaries else None
-                        if prep:
-                            snap_slot, snap_pos = prep
+                async def _load_into_staging(snapshot_key, prefix_len):
+                    ok = await asyncio.to_thread(store.load, daemon, snapshot_key, staging_slot)
+                    if not ok:
+                        raise KeyError(snapshot_key)
+                    return (staging_slot, prefix_len)
+
+                if conversation_id and sk and store:
+                    session_hit = sk.get_session(conversation_id, effective_ids)
+                    if session_hit is not None:
+                        session_key, session_prefix_len = session_hit
+                        try:
+                            prefix_hit = await _load_into_staging(session_key, session_prefix_len)
+                            loaded_staging = True
+                        except KeyError:
+                            logger.warning("session snapshot missing from store; evicting session")
+                            sk.evict(conversation_id)
+
+                if prefix_hit is None and pc and not pc.disabled and store:
+                    prefix_cached = pc.lookup(effective_ids, boundaries=effective_boundaries)
+                    if prefix_cached is not None:
+                        prefix_key, prefix_len = prefix_cached
+                        try:
+                            prefix_hit = await _load_into_staging(prefix_key, prefix_len)
+                            loaded_staging = True
+                        except KeyError:
+                            logger.warning("prefix snapshot missing from store; dropping cache entry")
 
                 cmd_path = await asyncio.to_thread(
                     daemon.send_generate_cmd,
                     effective_ids,
                     max_tokens,
                     prefix_hit[0] if prefix_hit else None,
-                    snap_slot,
-                    snap_pos,
+                    None,
+                    None,
                     temperature,
                     top_p,
                     top_k,
@@ -329,26 +303,35 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 tps = len(tokens_emitted) / elapsed
 
-                # Session snapshots are captured inline at len(effective_ids)
-                # during prefill, before decode advances cache.cur_pos.
-                if session_slot is not None:
-                    if tokens_emitted or had_session:
-                        try:
-                            sk.update(conversation_id, session_slot, len(effective_ids), effective_ids)
-                        except Exception as e:
-                            logger = __import__("logging").getLogger(__name__)
-                            logger.warning(f"session snapshot failed: {e}")
+                if tokens_emitted:
+                    try:
+                        await asyncio.to_thread(daemon.snapshot, staging_slot)
+                        session_path = None
+                        if conversation_id and sk and store:
+                            evicted_id = sk.evict_lru_if_full(conversation_id)
+                            if evicted_id is not None:
+                                for key in sk.all_keys(evicted_id):
+                                    await asyncio.to_thread(store.discard, key)
+                            session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
+                            session_path = await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
+                        if pc and not pc.disabled and store and effective_boundaries:
+                            prepared = pc.prepare_inline_snap(effective_ids, effective_boundaries[0])
+                            if prepared is not None and session_path is not None:
+                                prefix_key, prefix_len = prepared
+                                evicted_prefix_key = pc.confirm_inline_snap(prefix_key, prefix_len, effective_ids)
+                                prefix_ram_path = store.ram_path(prefix_key)
+                                prefix_ram_path.parent.mkdir(parents=True, exist_ok=True)
+                                await asyncio.to_thread(__import__("shutil").copy2, session_path, prefix_ram_path)
+                                store.ram[prefix_key] = str(prefix_ram_path)
+                                store.ram.move_to_end(prefix_key)
+                                store._queue_mirror(prefix_ram_path, store.disk_path(prefix_key), prefix_key)
+                                store._evict_ram_if_over_budget()
+                                if evicted_prefix_key is not None:
+                                    await asyncio.to_thread(store.discard, evicted_prefix_key)
+                    except Exception as e:
+                        logger.warning(f"snapshot save failed: {e}")
+                        if conversation_id and sk:
                             sk.evict(conversation_id)
-                            if swap and session_key is not None:
-                                await asyncio.to_thread(swap.discard, daemon, session_key)
-                    elif swap and session_key is not None:
-                        await asyncio.to_thread(swap.discard, daemon, session_key)
-
-                if snap_slot is not None and snap_pos is not None and snap_slot != session_slot:
-                    if tokens_emitted:
-                        pc.confirm_inline_snap(snap_slot, snap_pos, effective_ids)
-                    else:
-                        pc.abort_inline_snap(snap_slot)
 
                 final = _final_sse(
                     completion_id, created,
@@ -363,6 +346,11 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 yield f"data: {json.dumps(final)}\n\n".encode()
                 yield b"data: [DONE]\n\n"
             finally:
+                if loaded_staging:
+                    try:
+                        await asyncio.to_thread(daemon.free_snapshot, staging_slot)
+                    except Exception:
+                        pass
                 _release_once()
 
         async def safe_stream():

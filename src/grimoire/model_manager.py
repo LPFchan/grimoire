@@ -102,6 +102,12 @@ def build_cmd(cfg, port, alias=None):
     for arg in cfg.get("extra-args", []) or []:
         cmd.append(str(arg))
 
+    family = cfg.get("family")
+    if family:
+        fd = registry.get_family_defaults(family)
+        for arg in fd.get("extra-args", []) or []:
+            cmd.append(str(arg))
+
     return cmd
 
 
@@ -125,6 +131,7 @@ class ActiveModel:
         self.prefill_config: Optional[PrefillConfig] = None
         self.session_kv: Optional[SessionKV] = None
         self.snapshot_swap: Optional[SnapshotSwap] = None
+        self.snapshot_staging_slot: int = 7
         self._tokenizer = None
         self._qwen_prompt_block_cache = OrderedDict()
         # Serializes generate() calls against the single daemon stdin/stdout
@@ -181,13 +188,14 @@ class ActiveModel:
             prefix_cap=pc_cap,
         )
 
-        max_session_vram = max(0, 8 - pc_cap)
-        swap_cap = min(self.cfg.get("swap-max-vram", session_cap), session_cap, max_session_vram)
+        self.snapshot_staging_slot = int(self.cfg.get("snapshot-staging-slot", 7))
         self.snapshot_swap = SnapshotSwap(
-            swap_dir=f"/var/lib/grimoire/snapshot_swap/{self.name}",
-            max_vram_slots=swap_cap,
-            slot_offset=pc_cap,
-            slot_count=max_session_vram,
+            ram_dir=self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"),
+            disk_dir=self.cfg.get(
+                "snapshot-disk-dir",
+                f"/var/lib/grimoire/snapshot_swap/{self.name}",
+            ),
+            ram_budget_gb=self.cfg.get("snapshot-ram-budget-gb", 20.0),
         )
 
         self.dflash_daemon = DflashDaemon(
@@ -296,6 +304,8 @@ class ActiveModel:
         if self.prefix_cache:
             self.prefix_cache.save()
             self.prefix_cache.cleanup(self.dflash_daemon)
+        if self.session_kv:
+            self.session_kv.clear()
         if self.dflash_daemon:
             self.dflash_daemon.stop()
         self.process = None
