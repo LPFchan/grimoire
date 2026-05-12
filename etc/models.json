@@ -94,7 +94,7 @@
       "snapshot-ram-dir": "/dev/shm/grimoire-snapshots",
       "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/dflash-qwen-27B",
       "snapshot-ram-budget-gb": 20,
-      "snapshot-disk-budget-gb": 100,
+      "snapshot-disk-budget-gb": 30,
       "snapshot-disk-ttl-hours": 24,
       "snapshot-staging-slot": 7,
       "prefix-cache-slots": 2,
