@@ -146,6 +146,9 @@ class DropInBlockerTests(unittest.TestCase):
             def get_conversation(self, user_hash, conversation_id):
                 raise KeyError(conversation_id)
 
+            def conversation_exists(self, user_hash, conversation_id):
+                return False
+
             def create_conversation(self, *args, **kwargs):
                 raise AssertionError("invalid conversation IDs must not create orphan conversations")
 
