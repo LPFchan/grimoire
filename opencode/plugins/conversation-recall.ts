@@ -89,7 +89,7 @@ const formatPartRow = (row: RecallRow, includeToolOutput: boolean) => {
   return lines.join("\n")
 }
 
-const buildBaseSelect = () => `
+const buildBaseSelect = (includeToolOutput: boolean) => `
 select
   p.id as part_id,
   p.message_id,
@@ -102,7 +102,7 @@ select
   json_extract(p.data, '$.state.input.command') as tool_command,
   p.time_created,
   json_extract(p.data, '$.text') as text,
-  json_extract(p.data, '$.state.output') as tool_output
+  ${includeToolOutput ? "json_extract(p.data, '$.state.output')" : "null"} as tool_output
 from part p
 join message m on m.id = p.message_id
 join session s on s.id = p.session_id
@@ -138,15 +138,15 @@ const buildSearchQuery = (input: {
       : `(json_extract(p.data, '$.type') in (${textTypeFilter}) and instr(lower(${textExpr}), lower(${queryText})) > 0)`,
   ]
 
-  return `${buildBaseSelect()} where ${where.join(" and ")} order by p.time_created desc limit ${input.limit}`
+  return `${buildBaseSelect(input.includeToolOutput)} where ${where.join(" and ")} order by p.time_created desc limit ${input.limit}`
 }
 
-const buildPartQuery = (partID: string) =>
-  `${buildBaseSelect()} where p.id = ${sqlQuote(partID)} limit 1`
+const buildPartQuery = (partID: string, includeToolOutput: boolean) =>
+  `${buildBaseSelect(includeToolOutput)} where p.id = ${sqlQuote(partID)} limit 1`
 
-const buildMessageQuery = (messageID: string, includeReasoning: boolean) => {
+const buildMessageQuery = (messageID: string, includeReasoning: boolean, includeToolOutput: boolean) => {
   const types = includeReasoning ? `'text', 'reasoning', 'tool'` : `'text', 'tool'`
-  return `${buildBaseSelect()} where p.message_id = ${sqlQuote(messageID)} and json_extract(p.data, '$.type') in (${types}) order by p.time_created asc`
+  return `${buildBaseSelect(includeToolOutput)} where p.message_id = ${sqlQuote(messageID)} and json_extract(p.data, '$.type') in (${types}) order by p.time_created asc`
 }
 
 export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
@@ -294,7 +294,7 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
               },
             })
 
-            const [row] = await runQuery<RecallRow>(buildPartQuery(args.partID.trim()))
+            const [row] = await runQuery<RecallRow>(buildPartQuery(args.partID.trim(), includeToolOutput))
 
             if (!row) {
               return {
@@ -346,7 +346,7 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
             },
           })
 
-          const rows = await runQuery<RecallRow>(buildMessageQuery(args.messageID.trim(), includeReasoning))
+          const rows = await runQuery<RecallRow>(buildMessageQuery(args.messageID.trim(), includeReasoning, includeToolOutput))
 
           if (!rows.length) {
             return {
