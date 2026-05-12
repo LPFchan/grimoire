@@ -50,6 +50,24 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
         self.assertIn(DFLASH_AWARENESS_MARKER, result["messages"][0]["content"])
         self.assertIn("conversation_recall", result["messages"][0]["content"])
 
+    def test_appends_to_existing_system_text_parts_without_second_system(self):
+        payload = {
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "You are terse."}]},
+                {"role": "user", "content": "ping"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
+        }
+
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen-27B", dict(self.model_cfg))
+
+        self.assertEqual([message["role"] for message in result["messages"]], ["system", "user"])
+        self.assertIsInstance(result["messages"][0]["content"], list)
+        rendered = "".join(part.get("text", "") for part in result["messages"][0]["content"])
+        self.assertIn("You are terse.", rendered)
+        self.assertIn(DFLASH_AWARENESS_MARKER, rendered)
+        self.assertIn("conversation_recall", rendered)
+
     def test_skips_requests_without_conversation_recall(self):
         payload = {
             "messages": [{"role": "user", "content": "ping"}],
@@ -87,6 +105,25 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
         result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen-27B", dict(self.model_cfg))
 
         self.assertEqual(result["messages"][0]["content"].count(DFLASH_AWARENESS_MARKER), 1)
+
+    def test_does_not_duplicate_existing_runtime_note_in_text_parts(self):
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": f"Existing note\n\n{DFLASH_AWARENESS_MARKER} already here"},
+                    ],
+                },
+                {"role": "user", "content": "ping"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
+        }
+
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen-27B", dict(self.model_cfg))
+
+        rendered = "".join(part.get("text", "") for part in result["messages"][0]["content"])
+        self.assertEqual(rendered.count(DFLASH_AWARENESS_MARKER), 1)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,29 @@ def payload_tool_names(payload):
     return names
 
 
+def content_contains_text(content, text):
+    if isinstance(content, str):
+        return text in content
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str) and text in item["text"]:
+                return True
+    return False
+
+
+def append_text_to_content(content, text):
+    if isinstance(content, str):
+        return f"{content}\n\n{text}" if content else text
+    if content is None:
+        return text
+    if isinstance(content, list):
+        return [
+            *copy.deepcopy(content),
+            {"type": "text", "text": f"\n\n{text}" if content else text},
+        ]
+    return f"{content}\n\n{text}" if content else text
+
+
 class Plugin:
     """Base plugin hook interface."""
 
@@ -161,7 +184,7 @@ class DflashPflashAwarenessPlugin(Plugin):
         for message in messages:
             if not isinstance(message, dict) or message.get("role") != "system":
                 continue
-            if isinstance(message.get("content"), str) and DFLASH_AWARENESS_MARKER in message["content"]:
+            if content_contains_text(message.get("content"), DFLASH_AWARENESS_MARKER):
                 return payload
 
         threshold = model_cfg.get("prefill-threshold", model_cfg.get("prefill_threshold"))
@@ -184,10 +207,8 @@ class DflashPflashAwarenessPlugin(Plugin):
         )
 
         if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
-            existing = messages[0].get("content")
-            if isinstance(existing, str):
-                messages[0]["content"] = f"{existing}\n\n{context}" if existing else context
-                return payload
+            messages[0]["content"] = append_text_to_content(messages[0].get("content"), context)
+            return payload
 
         payload["messages"] = [{"role": "system", "content": context}, *messages]
         return payload
