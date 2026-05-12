@@ -2068,8 +2068,25 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
             decoded_prefix = ""
             tokens_emitted = []
+            # Sliding-window detokenize state: `read_offset` is the count of
+            # tokens whose decoded text has been emitted; `prefix_offset` is
+            # the earliest token still inside the decode window. Both reset
+            # to the current tail after every successful emit, so each
+            # decode is bounded to the most recent few tokens — overall O(n)
+            # over the response instead of O(n²) over `decode(full_list)`
+            # per token.
+            prefix_offset = 0
+            read_offset = 0
             stop_seq_lens = sorted({len(seq) for seq in stop_seqs}, reverse=True)
             t0 = time.monotonic()
+
+            def _decode(start, stop):
+                return tokenizer.decode(
+                    tokens_emitted[start:stop],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                )
+
             try:
                 index = 0
                 while True:
@@ -2087,23 +2104,58 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             del tokens_emitted[-seq_len:]
                             stop_hit = True
                             break
-                    # Incremental decode against the running prefix avoids
-                    # BPE/SentencePiece per-token artefacts.
-                    new_full = tokenizer.decode(
-                        tokens_emitted,
-                        skip_special_tokens=True,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    if len(new_full) > len(decoded_prefix):
-                        delta = new_full[len(decoded_prefix):]
-                        decoded_prefix = new_full
+
+                    if stop_hit:
+                        # The trim may have removed tokens we already emitted
+                        # bytes for; re-decode against the shortened buffer
+                        # and reconcile decoded_prefix so the final usage
+                        # text matches what's actually in tokens_emitted.
+                        read_offset = min(read_offset, len(tokens_emitted))
+                        prefix_offset = min(prefix_offset, read_offset)
+                        final_text = _decode(0, len(tokens_emitted))
+                        if len(final_text) > len(decoded_prefix):
+                            delta = final_text[len(decoded_prefix):]
+                            decoded_prefix = final_text
+                            frame = _delta_sse(completion_id, created, delta, index)
+                            index += 1
+                            yield f"data: {json.dumps(frame)}\n\n".encode()
+                        else:
+                            decoded_prefix = final_text
+                        read_offset = len(tokens_emitted)
+                        prefix_offset = read_offset
+                        break
+
+                    # Wait for a complete UTF-8 sequence before emitting:
+                    # multi-byte chars can straddle BPE/SentencePiece pieces,
+                    # so we keep accumulating while the window still ends in
+                    # the replacement char U+FFFD.
+                    prefix_text = _decode(prefix_offset, read_offset)
+                    new_text = _decode(prefix_offset, len(tokens_emitted))
+                    if not new_text.endswith("�") and len(new_text) > len(prefix_text):
+                        delta = new_text[len(prefix_text):]
+                        decoded_prefix += delta
+                        prefix_offset = read_offset
+                        read_offset = len(tokens_emitted)
                         frame = _delta_sse(completion_id, created, delta, index)
                         index += 1
                         yield f"data: {json.dumps(frame)}\n\n".encode()
-                    if stop_hit:
-                        break
+
                     if len(tokens_emitted) >= max_tokens:
                         break
+
+                # Flush any complete bytes still trapped in the sliding
+                # window (loop exited via EOS, max_tokens, or pipe close —
+                # not via the stop-hit branch, which already reconciled).
+                if read_offset < len(tokens_emitted):
+                    prefix_text = _decode(prefix_offset, read_offset)
+                    final_text = _decode(prefix_offset, len(tokens_emitted))
+                    if len(final_text) > len(prefix_text):
+                        delta = final_text[len(prefix_text):].rstrip("�")
+                        if delta:
+                            decoded_prefix += delta
+                            frame = _delta_sse(completion_id, created, delta, index)
+                            index += 1
+                            yield f"data: {json.dumps(frame)}\n\n".encode()
             finally:
                 try:
                     os.unlink(cmd_path)
