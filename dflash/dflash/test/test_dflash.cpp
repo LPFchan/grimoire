@@ -2873,16 +2873,19 @@ if (starts_with(line, "compress ")) {
                 if (std::sscanf(line.c_str() + 14, "%d %d %d", &slot, &kv_start, &kv_end) != 3
                     || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
                     std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
+                    stream_emit(-1);
                     continue;
                 }
                 if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
                                                  prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
                                  dflash27b_last_error());
+                    stream_emit(-1);
                     continue;
                 }
                 std::printf("[snap] thin slot=%d kv=%d,%d\n", slot, kv_start, kv_end);
                 std::fflush(stdout);
+                stream_emit(-1);
                 continue;
             }
             if (line.rfind("SNAPSHOT ", 0) == 0) {
@@ -2890,23 +2893,30 @@ if (starts_with(line, "compress ")) {
                 if (std::sscanf(line.c_str() + 9, "%d", &slot) != 1
                     || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
                     std::fprintf(stderr, "[snap] invalid slot %d\n", slot);
+                    stream_emit(-1);
                     continue;
                 }
                 if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
                     std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
+                    stream_emit(-1);
                     continue;
                 }
                 std::printf("[snap] slot=%d cur_pos=%d\n", slot, prefix_snapshots[slot].cur_pos);
                 std::fflush(stdout);
+                stream_emit(-1);
                 continue;
             }
             if (line.rfind("FREE_SNAPSHOT ", 0) == 0) {
                 int slot = -1;
                 if (std::sscanf(line.c_str() + 14, "%d", &slot) != 1
-                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) continue;
+                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
+                    stream_emit(-1);
+                    continue;
+                }
                 free_prefix_snapshot(prefix_snapshots[slot]);
                 std::printf("[snap] freed slot=%d\n", slot);
                 std::fflush(stdout);
+                stream_emit(-1);
                 continue;
             }
             // ── SSD swap: SAVE_SNAPSHOT / LOAD_SNAPSHOT ────────────────
@@ -2916,11 +2926,13 @@ if (starts_with(line, "compress ")) {
                 if (std::sscanf(line.c_str() + 14, "%d %1023s", &slot_local, snap_path) != 2
                     || slot_local < 0 || slot_local >= PREFIX_CACHE_SLOTS) {
                     std::fprintf(stderr, "[snap] SAVE_SNAPSHOT bad args\n");
+                    stream_emit(-1);
                     continue;
                 }
                 PrefixSnapshot & ps = prefix_snapshots[slot_local];
                 if (!ps.ctx) {
                     std::fprintf(stderr, "[snap] SAVE_SNAPSHOT slot %d empty\n", slot_local);
+                    stream_emit(-1);
                     continue;
                 }
                 {
@@ -2932,6 +2944,7 @@ if (starts_with(line, "compress ")) {
                     std::ofstream sf(snap_path, std::ios::binary);
                     if (!sf) {
                         std::fprintf(stderr, "[snap] SAVE_SNAPSHOT open %s failed\n", snap_path);
+                        stream_emit(-1);
                         continue;
                     }
                     const char magic[4] = {'D', 'F', 'S', 'N'};
@@ -2996,6 +3009,7 @@ if (starts_with(line, "compress ")) {
                     if (!ok) {
                         std::fprintf(stderr, "[snap] SAVE_SNAPSHOT write failed slot=%d\n", slot_local);
                         std::remove(snap_path);
+                        stream_emit(-1);
                         continue;
                     }
                 }
@@ -3003,6 +3017,7 @@ if (starts_with(line, "compress ")) {
                 free_prefix_snapshot(prefix_snapshots[slot_local]);
                 std::printf("[snap] saved slot=%d %s\n", slot_local, snap_path);
                 std::fflush(stdout);
+                stream_emit(-1);
                 continue;
             }
             if (line.rfind("LOAD_SNAPSHOT ", 0) == 0) {
@@ -3011,12 +3026,14 @@ if (starts_with(line, "compress ")) {
                 if (std::sscanf(line.c_str() + 14, "%d %1023s", &slot_local, snap_path) != 2
                     || slot_local < 0 || slot_local >= PREFIX_CACHE_SLOTS) {
                     std::fprintf(stderr, "[snap] LOAD_SNAPSHOT bad args\n");
+                    stream_emit(-1);
                     continue;
                 }
                 PrefixSnapshot & ps = prefix_snapshots[slot_local];
                 std::ifstream sf(snap_path, std::ios::binary);
                 if (!sf) {
                     std::fprintf(stderr, "[snap] LOAD_SNAPSHOT open %s failed\n", snap_path);
+                    stream_emit(-1);
                     continue;
                 }
                 auto read_u32 = [&sf]() -> uint32_t {
@@ -3029,11 +3046,13 @@ if (starts_with(line, "compress ")) {
                 sf.read(hdr, 4);
                 if (hdr[0] != 'D' || hdr[1] != 'F' || hdr[2] != 'S' || hdr[3] != 'N') {
                     std::fprintf(stderr, "[snap] LOAD_SNAPSHOT bad magic\n");
+                    stream_emit(-1);
                     continue;
                 }
                 uint32_t version = read_u32();
                 if (version != 1 && version != 2) {
                     std::fprintf(stderr, "[snap] LOAD_SNAPSHOT unsupported version %u\n", version);
+                    stream_emit(-1);
                     continue;
                 }
                 int32_t cur_pos_load   = (int32_t)read_u32();
@@ -3093,6 +3112,7 @@ if (starts_with(line, "compress ")) {
                     ps.ctx = ggml_init(ip);
                     if (!ps.ctx) {
                         std::fprintf(stderr, "[snap] LOAD_SNAPSHOT ggml_init\n");
+                        stream_emit(-1);
                         continue;
                     }
                     ps.attn_k_snap.assign(n_full_attn_load, nullptr);
@@ -3130,6 +3150,7 @@ if (starts_with(line, "compress ")) {
                     if (!ps.buf) {
                         std::fprintf(stderr, "[snap] LOAD_SNAPSHOT alloc failed\n");
                         free_prefix_snapshot(ps);
+                        stream_emit(-1);
                         continue;
                     }
 
@@ -3158,6 +3179,7 @@ if (starts_with(line, "compress ")) {
                 sf.close();
                 std::printf("[snap] loaded slot=%d %s\n", slot_local, snap_path);
                 std::fflush(stdout);
+                stream_emit(-1);
                 continue;
             }
             if (line == "LIST_SLOTS") {
@@ -3304,6 +3326,7 @@ if (starts_with(line, "compress ")) {
                 std::printf("[snap] restored slot=%d cur_pos=%d\n",
                             restore_slot_id, cache.cur_pos);
                 std::fflush(stdout);
+                free_prefix_snapshot(prefix_snapshots[restore_slot_id]);
             }
 
             // After cache is fresh, optionally apply chain restore.
@@ -3323,6 +3346,12 @@ if (starts_with(line, "compress ")) {
                 std::printf("[snap] chain restored thick=%d thins=%zu cur_pos=%d\n",
                             chain_thick_slot, thin_ptrs.size(), cache.cur_pos);
                 std::fflush(stdout);
+                if (chain_thick_slot >= 0) {
+                    free_prefix_snapshot(prefix_snapshots[chain_thick_slot]);
+                }
+                for (int id : chain_thin_ids) {
+                    free_prefix_snapshot(prefix_snapshots[id]);
+                }
             }
         }
 
