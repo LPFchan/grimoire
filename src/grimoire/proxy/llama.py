@@ -106,8 +106,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
-                    if conversation_id:
-                        _kv_save_key = f"pflash-{conversation_id}.kv"
+                    if payload.get("conversation_id"):
+                        _kv_save_key = f"pflash-{payload['conversation_id']}.kv"
         except Exception as e:
             _log = __import__('logging').getLogger(__name__)
             _log.warning(f"PFlash compression failed for {active.name}: {e}")
@@ -121,8 +121,9 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         )
 
         # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
-        if conversation_id:
-            kv_name = f"pflash-{conversation_id}.kv"
+        _kv_key_raw = payload.get("conversation_id")
+        if _kv_key_raw:
+            kv_name = f"pflash-{_kv_key_raw}.kv"
             slot_url = f"http://127.0.0.1:{active.port}/slots/0"
             try:
                 rr = await client.post(f"{slot_url}?action=restore",
@@ -182,7 +183,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             await upstream.aclose()
             await client.aclose()
             # KV prefix cache: save slot state after response completes
-            if _kv_save_key and conversation_id:
+            if _kv_save_key:
                 try:
                     async with httpx.AsyncClient(timeout=5) as sc:
                         slot_url = f"http://127.0.0.1:{active.port}/slots/0"
