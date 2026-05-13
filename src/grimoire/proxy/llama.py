@@ -55,6 +55,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     url = f"http://127.0.0.1:{active.port}/v1/chat/completions"
     headers = {}
 
+    _kv_save_key = None  # set inside if fired: block when compression fires
+
     # PFlash compression: if the model has a pflash daemon and the prompt
     # exceeds the threshold, compress before proxying to llama-server.
     daemon = getattr(active, 'pflash_daemon', None)
@@ -113,8 +115,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             _log.warning(f"PFlash compression failed for {active.name}: {e}")
 
     client = httpx.AsyncClient(timeout=None)
-    # KV prefix cache key — set when compression fires
-    _kv_save_key = None
     try:
         payload = await plugin_manager.before_backend_request(
             payload, active.name, model_cfg, backend_model_id, client, url, headers
