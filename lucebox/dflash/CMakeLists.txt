@@ -333,13 +333,13 @@ if(DFLASH27B_TESTS)
     # dflash_entrypoint / test_dflash: the production daemon binary.
     # Both point to the same source; dflash_entrypoint is the canonical name,
     # test_dflash exists for backward compatibility with scripts / Dockerfiles.
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/dflash_entrypoint.cpp")
-        add_executable(dflash_entrypoint test/dflash_entrypoint.cpp)
-        target_include_directories(dflash_entrypoint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(dflash_entrypoint PRIVATE dflash27b ggml ggml-cuda)
-        add_executable(test_dflash test/dflash_entrypoint.cpp)
-        target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-        target_link_libraries(test_dflash PRIVATE dflash27b ggml ggml-cuda)
+     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/dflash_entrypoint.cpp")
+         add_executable(dflash_entrypoint src/dflash_entrypoint.cpp)
+         target_include_directories(dflash_entrypoint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+         target_link_libraries(dflash_entrypoint PRIVATE dflash27b ggml ggml-cuda)
+         add_executable(test_dflash src/dflash_entrypoint.cpp)
+         target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+         target_link_libraries(test_dflash PRIVATE dflash27b ggml ggml-cuda)
         # Both use cudaMemcpyAsync / cudaMemcpy2DAsync for --fast-rollback.
         find_package(CUDAToolkit REQUIRED)
         target_link_libraries(dflash_entrypoint PRIVATE CUDA::cudart)
