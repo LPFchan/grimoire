@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +17,24 @@ DEFAULT_REGISTRY_PATH = "/var/lib/grimoire/models.json"
 DEFAULT_REGISTRY_SEED_PATH = "/etc/grimoire/models.json"
 REGISTRY_PATH = os.environ.get("GRIMOIRE_REGISTRY_PATH", DEFAULT_REGISTRY_PATH)
 REGISTRY_SEED_PATH = os.environ.get("GRIMOIRE_REGISTRY_SEED_PATH", DEFAULT_REGISTRY_SEED_PATH)
+
+BACKEND_LLAMA = "llama"
+BACKEND_DFLASH = "dflash"
+
+
+def _get_backend(cfg: dict) -> str:
+    """Get the backend type for a model config. Defaults to llama."""
+    return cfg.get("backend", BACKEND_LLAMA)
+
+
+def _resolve_path(cfg: dict, key: str) -> Optional[str]:
+    """Resolve a model config path (file, draft, drafter, mmproj)."""
+    path = cfg.get(key)
+    if not path:
+        return None
+    if os.path.isabs(path):
+        return path
+    return os.path.join(MODELS_DIR, path)
 
 
 class ModelRegistry:
@@ -176,6 +195,7 @@ class ModelRegistry:
             "family": cfg.get("family"),
             "capabilities": cfg.get("capabilities", ["completion"]),
             "cost": cfg.get("cost", {"input": 0, "output": 0}),
+            "backend": _get_backend(cfg),
             "pinned_gpu": self.get_fixed_gpu(model_name),
         }
 
@@ -250,12 +270,26 @@ class ModelRegistry:
         cfg = self.get(model_name)
         if not cfg:
             return False, f"Model '{model_name}' not found"
-        if not cfg.get("file"):
-            return False, "Missing 'file' field"
 
-        model_path = os.path.join(MODELS_DIR, cfg["file"])
-        if not os.path.exists(model_path):
-            return False, f"Model file not found at {model_path}"
+        backend = _get_backend(cfg)
+        if backend == BACKEND_LLAMA:
+            if not cfg.get("file"):
+                return False, "Missing 'file' field"
+            model_path = os.path.join(MODELS_DIR, cfg["file"])
+            if not os.path.exists(model_path):
+                return False, f"Model file not found at {model_path}"
+        elif backend == BACKEND_DFLASH:
+            target = _resolve_path(cfg, "target")
+            if not target or not os.path.exists(target):
+                return False, f"Target model not found at {target}"
+            draft = _resolve_path(cfg, "draft")
+            if not draft or not os.path.exists(draft):
+                return False, f"Draft model not found at {draft}"
+            drafter = _resolve_path(cfg, "drafter")
+            if drafter and not os.path.exists(drafter):
+                return False, f"Drafter model not found at {drafter}"
+        else:
+            return False, f"Unknown backend '{backend}'"
 
         fixed_gpu = self.get_fixed_gpu(model_name)
         if fixed_gpu is not None:

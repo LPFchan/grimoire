@@ -1,6 +1,6 @@
 # Grimoire
 
-Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving.
+Self-hosted AI inference infrastructure for multi-GPU llama.cpp + DFlash serving.
 
 ## Architecture
 
@@ -17,6 +17,7 @@ Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving.
                                     │      │      │
                          ┌──────────▼─┐ ┌──▼────┐ ┌▼────────────┐
                          │  GPU 0     │ │ GPU 1 │ │ GPU N       │
+                         │  llama     │ │ dflash│ │ llama       │
                          │  model A   │ │ model │ │ model Z     │
                          └────────────┘ └───────┘ └─────────────┘
 ```
@@ -24,6 +25,9 @@ Self-hosted AI inference infrastructure for multi-GPU llama.cpp serving.
 ## Features
 
 - **Multi-GPU** — Run multiple models simultaneously, one per GPU
+- **Dual backends** — llama.cpp (HTTP) + DFlash (stdin/stdout) managed by the same gateway
+- **DFlash speculative decoding** — DDTree + PFlash for ~3.4x faster decode on RTX 3090
+- **Prefix cache** — LRU KV snapshot cache with disk persistence for repeated prompts
 - **Dynamic GPU allocation** — Free GPU preferred, oldest non-pinned model evicted when all GPUs busy
 - **Canonical model switcher** — Built-in web UI and API for loading/switching models
 - **Server-side history** — Per-api-key conversation tree (branches, currNode pointer, fork chains) stored in SQLite, served to the bundled webui via the same `/history` API contract its DatabaseService used to hit IndexedDB
@@ -84,11 +88,21 @@ The mutable registry is stored at `/var/lib/grimoire/models.json` by default so 
 {
   "models": {
     "qwen-3.6-27B": {
+      "backend": "llama",
       "file": "gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf",
       "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
       "ctx-size": 262144,
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
+    },
+    "dflash-qwen-27B": {
+      "backend": "dflash",
+      "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
+      "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
+      "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
+      "ctx-size": 262144,
+      "budget": 22,
+      "prefix-cache-slots": 4
     }
   },
   "fixed": {
@@ -100,6 +114,7 @@ The mutable registry is stored at `/var/lib/grimoire/models.json` by default so 
 - `models` — model definitions (no GPU assignment)
 - `fixed` — model alias → GPU ID (pinned, never evicted)
 - Models not in `fixed` use dynamic LRU allocation
+- **Backends**: `backend: "llama"` (default, HTTP) or `backend: "dflash"` (stdin/stdout protocol)
 
 ## Ingest Safety
 
@@ -183,7 +198,16 @@ API key), so two users with different keys see disjoint history.
 ## Building
 
 ```bash
-docker build -t grimoire:latest .
+# Clone with submodules (required for DFlash build)
+git clone --recursive <grimoire-repo> ~/grimoire
+
+# Build (includes llama.cpp + DFlash compilation, ~90 min first build)
+cd ~/grimoire
+docker compose build
+
+# Update DFlash submodule later
+git submodule update --remote dflash
+docker compose build
 ```
 
 ## Running As A Service

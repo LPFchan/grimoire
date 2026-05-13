@@ -113,6 +113,25 @@
       "image-max-tokens": 1024,
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
+    },
+    "dflash-qwen-27B": {
+      "backend": "dflash",
+      "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
+      "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
+      "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
+      "family": "qwen",
+      "capabilities": ["completion"],
+      "cost": {"input": 0.33, "output": 3.25},
+      "ctx-size": 262144,
+      "predict": 16384,
+      "budget": 22,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "fa-window": 2048,
+      "prefix-cache-slots": 4,
+      "prefill-threshold": 32000,
+      "prefill-keep-ratio": 0.05,
+      "prefill-compression": "auto"
     }
   },
   "fixed": {}
