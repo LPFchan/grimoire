@@ -332,23 +332,16 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 tps = len(tokens_emitted) / elapsed
 
-                # Detect silent failures where no tokens were emitted.
-                if not tokens_emitted and max_tokens > 0:
-                    yield _sse_error_frames(
-                        completion_id, created,
-                        "DFlash generation failed: model produced zero tokens. "
-                        "This usually means the context size + budget combination "
-                        "exceeds available VRAM. Try reducing ctx-size or budget.",
-                    )
-                    return
+                # Save snapshot before the zero-token guard so existing sessions
+                # always persist even when no new tokens are generated (e.g. a
+                # stop-token-only follow-up turn).
+                try:
+                    prefix_snapshot_written = False
+                    if prepared_prefix is not None:
+                        await asyncio.to_thread(store.save, daemon, prefix_snapshot_key, staging_slot)
+                        prefix_snapshot_written = True
 
-                if tokens_emitted or had_session:
-                    try:
-                        prefix_snapshot_written = False
-                        if prepared_prefix is not None:
-                            await asyncio.to_thread(store.save, daemon, prefix_snapshot_key, staging_slot)
-                            prefix_snapshot_written = True
-
+                    if tokens_emitted or had_session:
                         await asyncio.to_thread(daemon.snapshot, staging_slot)
                         if conversation_id and sk and store:
                             evicted_id = sk.evict_lru_if_full(conversation_id)
@@ -370,12 +363,22 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                     await asyncio.to_thread(store.discard, evicted_prefix_key)
                             else:
                                 pc.abort_inline_snap(prefix_snapshot_key)
-                    except Exception as e:
-                        logger.warning(f"snapshot save failed: {e}")
-                        if pc and prepared_prefix is not None and prefix_snapshot_key is not None:
-                            pc.abort_inline_snap(prefix_snapshot_key)
-                        if conversation_id and sk:
-                            sk.evict(conversation_id)
+                except Exception as e:
+                    logger.warning(f"snapshot save failed: {e}")
+                    if pc and prepared_prefix is not None and prefix_snapshot_key is not None:
+                        pc.abort_inline_snap(prefix_snapshot_key)
+                    if conversation_id and sk:
+                        sk.evict(conversation_id)
+
+                # Detect silent failures where no tokens were emitted.
+                if not tokens_emitted and max_tokens > 0:
+                    yield _sse_error_frames(
+                        completion_id, created,
+                        "DFlash generation failed: model produced zero tokens. "
+                        "This usually means the context size + budget combination "
+                        "exceeds available VRAM. Try reducing ctx-size or budget.",
+                    )
+                    return
 
                 final = _final_sse(
                     completion_id, created,

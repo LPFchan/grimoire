@@ -19,6 +19,7 @@ from grimoire.registry import (
     registry,
     resolve_path,
     _looks_like_local_path,
+    _strip_hf_prefix,
     BACKEND_LLAMA,
     BACKEND_DFLASH,
 )
@@ -335,7 +336,7 @@ class ActiveModel:
                 "dflash models require an explicit tokenizer (HF repo id or local path)"
             )
         from transformers import AutoTokenizer
-        source = resolve_path(self.cfg, "tokenizer") if _looks_like_local_path(spec) else spec
+        source = _strip_hf_prefix(resolve_path(self.cfg, "tokenizer") if _looks_like_local_path(spec) else spec)
         trust_remote = bool(self.cfg.get("tokenizer-trust-remote-code", False))
         self._tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=trust_remote)
         return self._tokenizer

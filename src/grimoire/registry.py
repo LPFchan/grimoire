@@ -41,19 +41,35 @@ def resolve_path(cfg: dict, key: str) -> Optional[str]:
 
 
 def _looks_like_local_path(spec: str) -> bool:
-    """True if `spec` should be treated as a filesystem path rather than an HF id.
+    """True if *spec* should be treated as a filesystem path rather than an HF id.
 
-    Hugging Face repo ids look like `org/repo` (single `/`, no leading dot, not
-    absolute). Anything that's absolute, starts with `./` or `../`, or has more
-    than one path separator is treated as a local path.
+    An ``hf:`` prefix explicitly marks the spec as a Hugging Face repo id.
+    Without the prefix, any spec containing a path separator (``/``) or
+    starting with ``./``, ``../``, or ``/`` is treated as a local path.
+    Bare names without separators (e.g. ``gpt2``) are treated as HF ids.
     """
     if not isinstance(spec, str) or not spec:
+        return False
+    # Explicit ``hf:`` prefix overrides everything — definitely an HF repo id.
+    if spec.startswith("hf:"):
         return False
     if os.path.isabs(spec):
         return True
     if spec.startswith("./") or spec.startswith("../"):
         return True
-    return os.sep in spec
+    # Any spec with a path separator is treated as a local path.
+    # If a user wants to reference an HF repo id that happens to contain a
+    # ``/`` (e.g. ``Qwen/Qwen3.6-27B``), they must use the ``hf:`` prefix.
+    if os.sep in spec:
+        return True
+    # Bare name (no separators) — assume it's an HF repo id.
+    return False
+
+def _strip_hf_prefix(spec: str) -> str:
+    """Strip the ``hf:`` prefix from *spec* if present."""
+    if isinstance(spec, str) and spec.startswith("hf:"):
+        return spec[3:]
+    return spec
 
 
 class ModelRegistry:

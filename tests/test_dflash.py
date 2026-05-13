@@ -485,7 +485,7 @@ class DflashRegistryValidationTests(unittest.TestCase):
             "target": "target.gguf",
             "draft": "draft.safetensors",
             "drafter": "drafter.gguf",
-            "tokenizer": "Qwen/Qwen3.6-27B",
+            "tokenizer": "hf:Qwen/Qwen3.6-27B",
             "ctx-size": 1024,
         }
         cfg.update(overrides)
@@ -608,8 +608,8 @@ class LooksLikeLocalPathTests(unittest.TestCase):
         self._check("models/qwen/tokenizer", True)
 
     def test_hf_repo_id(self):
-        self._check("Qwen/Qwen3.6-27B", False)
-        self._check("google/gemma-4-31b-it", False)
+        self._check("hf:Qwen/Qwen3.6-27B", False)
+        self._check("hf:google/gemma-4-31b-it", False)
 
     def test_bare_name(self):
         self._check("gpt2", False)
