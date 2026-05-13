@@ -109,7 +109,7 @@ FROM ${CUDA_BASE} AS dflash-build
 
 WORKDIR /app
 
-COPY dflash/ /app/dflash-hub
+COPY lucebox/ /app/dflash-hub
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates cmake build-essential && rm -rf /var/lib/apt/lists/*
 

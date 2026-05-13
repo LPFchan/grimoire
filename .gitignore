@@ -14,3 +14,4 @@ build/
 opencode/node_modules/
 venv/
 
+.test-venv/
