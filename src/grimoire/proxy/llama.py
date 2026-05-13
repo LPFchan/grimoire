@@ -185,6 +185,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             await upstream.aclose()
             await client.aclose()
             # KV prefix cache: save slot state after response completes
+            log.warning(f"pflash kv: finally block, _kv_save_key={_kv_save_key}")
             if _kv_save_key:
                 try:
                     async with httpx.AsyncClient(timeout=5) as sc:
