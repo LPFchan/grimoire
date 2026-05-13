@@ -130,8 +130,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     json={"filename": kv_name}, timeout=5)
                 if rr.status_code == 200:
                     log.warning(f"pflash kv: restored {kv_name}")
-            except Exception:
-                pass  # non-fatal — full prefill if restore fails
+            except Exception as e:
+                log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
 
         upstream = await client.send(
             client.build_request(
@@ -191,8 +191,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             json={"filename": _kv_save_key})
                         if rr.status_code == 200:
                             log.warning(f"pflash kv: saved {_kv_save_key}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"pflash kv: save failed for {_kv_save_key}: {e}")
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")
