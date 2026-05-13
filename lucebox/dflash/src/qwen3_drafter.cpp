@@ -15,6 +15,7 @@
 
 #include "qwen3_drafter.h"
 #include "qwen3_0p6b_drafter.h"
+#include "qwen3_5_0p8b_drafter.h"
 #include "internal.h"
 
 #include "ggml.h"
@@ -55,25 +56,60 @@ bool load_drafter(const std::string & gguf_path, int /*gpu_layers*/,
         }
     }
 
-    if (!load_qwen3_0p6b_drafter(gguf_path, out.backend, out.weights)) {
-        // last_error already set by loader
+    // Peek at the GGUF architecture field to decide which drafter to load.
+    struct gguf_init_params params_no_alloc = { .no_alloc = true, .ctx = nullptr };
+    auto gctx = gguf_init_from_file(gguf_path.c_str(), params_no_alloc);
+    if (!gctx) {
+        set_last_error("load_drafter: failed to open GGUF for architecture check");
+        return false;
+    }
+    int arch_kid = gguf_find_key(gctx, "general.architecture");
+    std::string arch;
+    if (arch_kid >= 0) {
+        arch = gguf_get_val_str(gctx, arch_kid);
+    }
+    gguf_free(gctx);
+
+    bool ok = false;
+    if (arch == "qwen35") {
+        out.is_qwen35 = true;
+        ok = load_qwen35_0p8b_drafter(gguf_path, out.backend, out.qwen35_weights);
+    } else {
+        out.is_qwen35 = false;
+        ok = load_qwen3_0p6b_drafter(gguf_path, out.backend, out.weights);
+    }
+    if (!ok) {
         return false;
     }
 
     out.loaded = true;
-    std::fprintf(stderr,
-        "[drafter] loaded Qwen3-0.6B BF16: n_layer=%d n_head=%d n_kv=%d "
-        "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
-        out.weights.n_layer, out.weights.n_head, out.weights.n_head_kv,
-        out.weights.n_embd, out.weights.n_ff, out.weights.head_dim,
-        out.weights.n_vocab);
+    if (out.is_qwen35) {
+        std::fprintf(stderr,
+            "[drafter] loaded Qwen3.5-0.8B Q8_0: n_layer=%d n_head=%d n_kv=%d "
+            "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
+            out.qwen35_weights.n_layer, out.qwen35_weights.n_head,
+            out.qwen35_weights.n_head_kv, out.qwen35_weights.n_embd,
+            out.qwen35_weights.n_ff, out.qwen35_weights.head_dim,
+            out.qwen35_weights.n_vocab);
+    } else {
+        std::fprintf(stderr,
+            "[drafter] loaded Qwen3-0.6B BF16: n_layer=%d n_head=%d n_kv=%d "
+            "n_embd=%d n_ff=%d head_dim=%d vocab=%d\n",
+            out.weights.n_layer, out.weights.n_head, out.weights.n_head_kv,
+            out.weights.n_embd, out.weights.n_ff, out.weights.head_dim,
+            out.weights.n_vocab);
+    }
     std::fflush(stderr);
     return true;
 }
 
 void free_drafter(DrafterContext & ctx) {
     if (ctx.loaded) {
-        free_qwen3_0p6b_drafter(ctx.weights);
+        if (ctx.is_qwen35) {
+            free_qwen35_0p8b_drafter(ctx.qwen35_weights);
+        } else {
+            free_qwen3_0p6b_drafter(ctx.weights);
+        }
     }
     if (ctx.backend) {
         ggml_backend_free(ctx.backend);
@@ -102,8 +138,14 @@ std::vector<int32_t> drafter_score_and_compress(
     // ── 1. Custom forward + GPU tail-attention scoring ────────────────
     auto t0 = std::chrono::steady_clock::now();
     std::vector<float> running_max;
-    if (!forward_qwen3_0p6b_drafter(ctx.weights, ids, n_lookahead, running_max)) {
-        return {};
+    if (ctx.is_qwen35) {
+        if (!forward_qwen35_0p8b_drafter(ctx.qwen35_weights, ids, n_lookahead, running_max)) {
+            return {};
+        }
+    } else {
+        if (!forward_qwen3_0p6b_drafter(ctx.weights, ids, n_lookahead, running_max)) {
+            return {};
+        }
     }
     auto t1 = std::chrono::steady_clock::now();
     std::fprintf(stderr, "[drafter] forward+score in %.2fs S=%d\n",

@@ -13,7 +13,7 @@ from typing import Optional
 import httpx
 
 from grimoire import config
-from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
+from grimoire.dflash import DflashDaemon, PflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
 from grimoire.registry import (
     MODELS_DIR,
     registry,
@@ -128,6 +128,7 @@ class ActiveModel:
 
         # DFlash-specific state
         self.dflash_daemon: Optional[DflashDaemon] = None
+        self.pflash_daemon: Optional[PflashDaemon] = None
         self.prefix_cache: Optional[PrefixCache] = None
         self.prefill_config: Optional[PrefillConfig] = None
         self.session_kv: Optional[SessionKV] = None
@@ -152,12 +153,41 @@ class ActiveModel:
         cmd = build_cmd(self.cfg, self.port, alias=self.name)
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+        # Put turboquant ggml libraries first so llama-server doesn't
+        # accidentally load dflash's (older) ggml-cuda which lacks the
+        # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
+        turboquant_libs = "/opt/grimoire-llama-cpp/lib"
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = f"{turboquant_libs}:/opt/dflash:" + ":".join(
+            p for p in existing.split(":") if p and p != turboquant_libs and not p.startswith("/opt/dflash")
+        )
 
         logger.info(f"Starting {self.name} (llama) on GPU {self.gpu}, port {self.port}")
         logger.info(f"Command: {' '.join(cmd)}")
 
         self.process = subprocess.Popen(cmd, env=env, preexec_fn=_spawn_child_preexec)
         return self.process
+
+    def _start_pflash_daemon(self):
+        """Start the PFlash compression daemon on the same GPU."""
+        drafter_path = resolve_path(self.cfg, "drafter")
+        if not drafter_path:
+            logger.warning(f"pflash requested but no drafter configured for {self.name}")
+            return
+
+        # Pre-build PrefillConfig from model config
+        self.prefill_config = PrefillConfig(
+            enabled=True,
+            threshold=int(self.cfg.get("prefill-threshold", 48000)),
+            keep_ratio=float(self.cfg.get("prefill-keep-ratio", 0.05)),
+            drafter_path=drafter_path,
+            tail_budget=int(self.cfg.get("prefill-tail-budget", 16000)),
+        )
+
+        daemon = PflashDaemon(drafter_path=drafter_path, gpu_id=self.gpu)
+        daemon.start()
+        self.pflash_daemon = daemon
+        logger.info(f"Started pflash daemon for {self.name} on GPU {self.gpu}")
 
     def _start_dflash(self):
         """Start the dflash daemon process."""
@@ -281,6 +311,16 @@ class ActiveModel:
             self._stop_dflash()
         else:
             self._stop_llama()
+        self._stop_pflash_daemon()
+
+    def _stop_pflash_daemon(self):
+        if self.pflash_daemon:
+            try:
+                self.pflash_daemon.stop()
+            except Exception:
+                pass
+            self.pflash_daemon = None
+        self.prefill_config = None
 
     def _stop_llama(self):
         """Stop the llama-server process."""
@@ -438,6 +478,16 @@ class ModelManager:
             port = None if is_dflash else self._find_available_port(gpu)
             active = ActiveModel(model_name, cfg, port, gpu)
             self.active[model_name] = active
+
+            # Start pflash daemon BEFORE the backend to get contiguous VRAM
+            logger.warning(f"pflash: cfg.pflash={cfg.get('pflash')}, is_dflash={is_dflash}")
+            if cfg.get("pflash") and not is_dflash:
+                try:
+                    await asyncio.to_thread(active._start_pflash_daemon)
+                    logger.warning(f"pflash: daemon started for {model_name}")
+                except Exception as e:
+                    logger.warning(f"pflash: daemon failed for {model_name}: {e}")
+
             await asyncio.to_thread(active.start)
             try:
                 startup_timeout = cfg.get("startup-timeout", config.DEFAULT_STARTUP_TIMEOUT)

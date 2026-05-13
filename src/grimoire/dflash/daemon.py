@@ -93,13 +93,16 @@ class DflashDaemon:
             cmd.append(self.draft_path)
         cmd += [
             "--daemon",
-            "--fast-rollback",
             f"--max-ctx={self.max_ctx}",
             f"--stream-fd={stream_fd}",
         ]
         if self.pflash:
             cmd.append("--pflash")
         if self.dflash:
+            # Fast rollback caches a second KV copy for undoing failed
+            # speculative steps. Not needed in pflash-only mode where
+            # there's no draft speculation to roll back.
+            cmd.append("--fast-rollback")
             cmd += ["--ddtree", f"--ddtree-budget={self.budget}"]
 
         env = os.environ.copy()
@@ -513,6 +516,164 @@ class DflashDaemon:
         if slot < 0 or slot >= 8:
             raise ValueError(f"Invalid snapshot slot: {slot}")
         self._send_expect_ack(f"LOAD_SNAPSHOT {slot} {path}\n")
+
+
+class PflashDaemon:
+    """Manage a standalone pflash_daemon subprocess for compression-only.
+
+    The pflash_daemon binary loads only the Qwen3.5-0.8B drafter GGUF
+    (no target model). It accepts compress commands on stdin and emits
+    compressed token IDs via a stream fd.
+    """
+
+    PFLASH_BIN = "/opt/dflash/pflash_daemon"
+
+    def __init__(self, drafter_path: str, gpu_id: int = 0):
+        self.drafter_path = drafter_path
+        self.gpu_id = gpu_id
+        self._proc: Optional[subprocess.Popen] = None
+        self._pipe_r: Optional[int] = None  # read end of stream pipe
+        self._pipe_w: Optional[int] = None  # write end (closed after spawn)
+        self._temp_files: list[str] = []
+
+    def start(self) -> None:
+        """Spawn the pflash daemon. Creates a pipe for compressed token output."""
+        pr, pw = os.pipe()
+        self._pipe_r = pr
+
+        cmd = [
+            self.PFLASH_BIN,
+            self.drafter_path,
+            f"--stream-fd={pw}",
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+
+        logger.info(f"Starting pflash daemon on GPU {self.gpu_id}")
+        logger.info(f"Command: {' '.join(cmd)}")
+
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(pw,),
+            env=env,
+            preexec_fn=_spawn_preexec,
+        )
+        os.close(pw)
+
+        # Read stderr in a non-blocking way (check once per line)
+        stderr_lines: list[str] = []
+        import select
+
+        # Wait for ready line (with timeout)
+        ready = False
+        for _ in range(120):
+            # Drain available stderr first
+            if self._proc.stderr:
+                r, _, _ = select.select([self._proc.stderr], [], [], 0)
+                while r:
+                    line = self._proc.stderr.readline()
+                    if not line:
+                        break
+                    decoded = line.decode(errors="replace").strip()
+                    stderr_lines.append(decoded)
+                    r, _, _ = select.select([self._proc.stderr], [], [], 0)
+
+            # Check stdout for "ready"
+            line = self._proc.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode(errors="replace").strip()
+            logger.info(f"[pflash-daemon] {decoded}")
+            if "ready" in decoded:
+                ready = True
+                break
+
+        if not ready:
+            # Log any stderr output captured before failure
+            for err in stderr_lines:
+                if "error" in err.lower() or "fail" in err.lower() or "oom" in err.lower() \
+                   or "cudamalloc" in err.lower() or "out of memory" in err.lower():
+                    logger.error(f"[pflash-daemon] {err}")
+                else:
+                    logger.warning(f"[pflash-daemon] {err}")
+            # Also try to read any remaining stderr
+            remaining = ""
+            try:
+                remaining = self._proc.stderr.read().decode(errors="replace")
+            except Exception:
+                pass
+            if remaining:
+                logger.error(f"[pflash-daemon] stderr: {remaining.strip()}")
+            raise RuntimeError(f"pflash daemon failed to start (see logs for details)")
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def compress(self, prompt_ids: list[int], drafter_path: str = "",
+                 keep_ratio: float = 0.05) -> list[int]:
+        if not self.is_running():
+            raise RuntimeError("pflash daemon not running")
+        if self._pipe_r is None:
+            raise RuntimeError("pflash daemon pipe not initialized")
+
+        fd, path = tempfile.mkstemp(suffix=".bin")
+        self._temp_files.append(path)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                for t in prompt_ids:
+                    f.write(struct.pack("<i", int(t)))
+
+            keep_x1000 = int(round(keep_ratio * 1000))
+            self._proc.stdin.write(f"compress {path} {keep_x1000}\n".encode())
+            self._proc.stdin.flush()
+
+            tokens: list[int] = []
+            while True:
+                raw = os.read(self._pipe_r, 4)
+                if not raw or len(raw) < 4:
+                    break
+                tok = struct.unpack("<i", raw)[0]
+                if tok == -1:
+                    break
+                tokens.append(tok)
+            return tokens
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        if self._proc:
+            try:
+                self._proc.stdin.write(b"quit\n")
+                self._proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait()
+            self._proc = None
+        if self._pipe_r is not None:
+            try:
+                os.close(self._pipe_r)
+            except OSError:
+                pass
+            self._pipe_r = None
+        for path in self._temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._temp_files.clear()
+
+    def __del__(self):
+        self.stop()
 
 
 def _spawn_preexec():

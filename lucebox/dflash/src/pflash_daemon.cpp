@@ -2,12 +2,12 @@
 //
 // Loads the Qwen3-0.6B PFlash drafter once, then accepts stdin commands:
 //
-//   compress <keep_x1000> <lookahead> <chunk> <pool> <counted_ids.bin>
+//   compress <path> <keep_x1000>
 //   quit
 //
-// Input token file format is little-endian u32 count followed by count int32
-// token IDs in the drafter tokenizer. Compressed IDs are emitted as int32 LE
-// values to --stream-fd=<fd>, terminated by -1. Logs go to stdout/stderr.
+// Input token file format is raw int32 LE token IDs (no count prefix).
+// Compressed IDs are emitted as int32 LE values to --stream-fd=<fd>,
+// terminated by -1. Logs go to stdout/stderr.
 
 #include "dflash27b.h"
 #include "qwen3_drafter.h"
@@ -32,19 +32,15 @@
 
 using namespace dflash27b;
 
-static std::vector<int32_t> read_counted_i32_file(const std::string & path) {
-    std::ifstream f(path, std::ios::binary);
+static std::vector<int32_t> read_raw_i32_file(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return {};
-
-    uint32_t n = 0;
-    f.read(reinterpret_cast<char *>(&n), sizeof(n));
+    std::streamsize size = f.tellg();
+    if (size <= 0) return {};
+    f.seekg(0, std::ios::beg);
+    std::vector<int32_t> ids((size_t)size / sizeof(int32_t));
+    f.read(reinterpret_cast<char *>(ids.data()), size);
     if (!f) return {};
-
-    std::vector<int32_t> ids((size_t)n);
-    if (n > 0) {
-        f.read(reinterpret_cast<char *>(ids.data()), (std::streamsize)ids.size() * sizeof(int32_t));
-        if (!f) return {};
-    }
     return ids;
 }
 
@@ -89,7 +85,7 @@ int main(int argc, char ** argv) {
     auto t_load1 = std::chrono::steady_clock::now();
     std::printf("[pflash-daemon] ready load=%.3fs vocab=%d\n",
                 std::chrono::duration<double>(t_load1 - t_load0).count(),
-                ctx.weights.n_vocab);
+                ctx.is_qwen35 ? ctx.qwen35_weights.n_vocab : ctx.weights.n_vocab);
     std::fflush(stdout);
 
     std::string line;
@@ -108,25 +104,19 @@ int main(int argc, char ** argv) {
         }
 
         int keep_x1000 = 0;
-        int lookahead = 8;
-        int chunk = 32;
-        int pool = 13;
-        iss >> keep_x1000 >> lookahead >> chunk >> pool;
         std::string path;
-        std::getline(iss, path);
-        const size_t first_non_space = path.find_first_not_of(" \t");
-        if (first_non_space == std::string::npos) {
-            path.clear();
-        } else if (first_non_space > 0) {
-            path.erase(0, first_non_space);
-        }
+        iss >> path >> keep_x1000;
         if (path.empty() || keep_x1000 <= 0) {
-            std::fprintf(stderr, "[pflash-daemon] bad command, need: compress <keep_x1000> <lookahead> <chunk> <pool> <counted_ids.bin>\n");
+            std::fprintf(stderr, "[pflash-daemon] bad command, need: compress <path> <keep_x1000>\n");
             stream_emit(stream_fd, -1);
             continue;
         }
 
-        auto ids = read_counted_i32_file(path);
+        constexpr int lookahead = 8;
+        constexpr int chunk = 32;
+        constexpr int pool = 13;
+
+        auto ids = read_raw_i32_file(path);
         if (ids.empty()) {
             std::fprintf(stderr, "[pflash-daemon] empty input: %s\n", path.c_str());
             stream_emit(stream_fd, -1);
@@ -135,7 +125,7 @@ int main(int argc, char ** argv) {
 
         const float keep_ratio = (float)keep_x1000 / 1000.0f;
         std::printf("[pflash-daemon] compress start tokens=%zu keep=%.3f lookahead=%d chunk=%d pool=%d path=%s\n",
-                    ids.size(), keep_ratio, lookahead, chunk, pool, path.c_str());
+                    ids.size(), keep_ratio, (int)lookahead, (int)chunk, (int)pool, path.c_str());
         std::fflush(stdout);
 
         auto t0 = std::chrono::steady_clock::now();

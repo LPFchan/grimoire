@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "qwen3_0p6b_drafter.h"
+#include "qwen3_5_0p8b_drafter.h"
 
 struct ggml_backend;
 typedef struct ggml_backend * ggml_backend_t;
@@ -28,7 +29,9 @@ namespace dflash27b {
 struct DrafterContext {
     ggml_backend_t        backend = nullptr;   // owned (created in load_drafter)
     Qwen3DrafterWeights   weights;             // BF16 weights on the backend
-    bool                  loaded  = false;
+    Qwen35DrafterWeights  qwen35_weights;
+    bool                  loaded    = false;
+    bool                  is_qwen35 = false;
 };
 
 // Load the drafter GGUF (e.g. /opt/lucebox/models/drafter/Qwen3-0.6B-BF16.gguf).

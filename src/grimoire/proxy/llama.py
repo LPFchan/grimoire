@@ -1,5 +1,6 @@
 """Llama-server proxy path — chat completions and generic v1 forwarding."""
 
+import asyncio
 import copy
 import json
 
@@ -7,7 +8,9 @@ import httpx
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
+from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
+from grimoire.prompt.generic import _prompt_layout_from_messages
 from grimoire.registry import BACKEND_DFLASH
 
 
@@ -48,6 +51,29 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     payload["model"] = backend_model_id
     url = f"http://127.0.0.1:{active.port}/v1/chat/completions"
     headers = {}
+
+    # PFlash compression: if the model has a pflash daemon and the prompt
+    # exceeds the threshold, compress before proxying to llama-server.
+    daemon = getattr(active, 'pflash_daemon', None)
+    pcfg = getattr(active, 'prefill_config', None)
+    if daemon and daemon.is_running() and pcfg and pcfg.enabled:
+        try:
+            tokenizer = active.get_tokenizer()
+            messages = payload.get("messages", [])
+            prompt_ids, prompt_blocks = _prompt_layout_from_messages(
+                tokenizer, messages, add_generation_prompt=True,
+                model_cfg=model_cfg, active=active,
+            )
+            if len(prompt_ids) > pcfg.threshold:
+                compressed_ids, fired, blocks = await maybe_compress(
+                    prompt_ids, daemon, pcfg, blocks=prompt_blocks,
+                )
+                if fired:
+                    compressed_text = tokenizer.decode(compressed_ids)
+                    payload["messages"] = [{"role": "user", "content": compressed_text}]
+        except Exception as e:
+            logger = __import__('logging').getLogger(__name__)
+            logger.warning(f"PFlash compression failed for {active.name}: {e}")
 
     client = httpx.AsyncClient(timeout=None)
     try:

@@ -8,10 +8,10 @@ Wraps the DFlash daemon (test_dflash) and provides:
   - PFlash speculative prefill (long-context compression)
 """
 
-from .daemon import DflashDaemon
+from .daemon import DflashDaemon, PflashDaemon
 from .prefix_cache import PrefixCache
 from .prefill import PrefillConfig
 from .session_kv import SessionKV
 from .snapshot_swap import SnapshotSwap
 
-__all__ = ["DflashDaemon", "PrefixCache", "PrefillConfig", "SessionKV", "SnapshotSwap"]
+__all__ = ["DflashDaemon", "PflashDaemon", "PrefixCache", "PrefillConfig", "SessionKV", "SnapshotSwap"]

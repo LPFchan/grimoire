@@ -9,7 +9,7 @@ ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature-turboquant-kv-cache-b9079-69d8e4b
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=1
+ARG CACHE_BUST=3
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -42,6 +42,7 @@ WORKDIR /app
 
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
+ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
 ENV CCACHE_DIR=/root/.ccache \
@@ -56,6 +57,16 @@ RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/llama-cpp-src \
     --mount=type=cache,target=/app/.cache/llama-cpp-build \
     set -eux; \
+    # If CACHE_BUST changed, invalidate the built marker so cmake re-runs
+    cache_bust_file=/app/.cache/llama-cpp-build/.cache_bust; \
+    if [ -f "$cache_bust_file" ]; then \
+        old_bust=$(cat "$cache_bust_file"); \
+        if [ "$old_bust" != "$CACHE_BUST" ]; then \
+            echo "CACHE_BUST changed: $old_bust -> $CACHE_BUST, forcing rebuild"; \
+            rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
+        fi; \
+    fi; \
+    echo "$CACHE_BUST" > "$cache_bust_file"; \
     if [ ! -d /app/.cache/llama-cpp-src/repo/.git ]; then \
         rm -rf /app/.cache/llama-cpp-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /app/.cache/llama-cpp-src/repo; \
@@ -129,9 +140,10 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DDFLASH27B_FA_ALL_QUANTS=ON \
         -DDFLASH27B_ENABLE_BSA=ON; \
     cmake --build /app/.cache/dflash-build/build \
-        --target test_dflash --parallel "$(nproc)"; \
+        --target test_dflash --target pflash_daemon --parallel "$(nproc)"; \
     mkdir -p /opt/dflash; \
     cp /app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash; \
+    cp /app/.cache/dflash-build/build/pflash_daemon /opt/dflash/pflash_daemon; \
     # Copy dflash's own ggml shared libs so the binary resolves symbols
     # against its build-time llama.cpp, not the independently-built one.
     find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
