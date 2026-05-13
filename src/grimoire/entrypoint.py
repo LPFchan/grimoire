@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV
+from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
 from grimoire.dflash.prefill import maybe_compress
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
@@ -286,6 +286,7 @@ class ActiveModel:
         self.prefix_cache: Optional[PrefixCache] = None
         self.prefill_config: Optional[PrefillConfig] = None
         self.session_kv: Optional[SessionKV] = None
+        self.snapshot_swap: Optional[SnapshotSwap] = None
         self._tokenizer = None
         # Serializes generate() calls against the single daemon stdin/stdout
         # pair. Created lazily so the unit-test path that constructs an
@@ -338,6 +339,12 @@ class ActiveModel:
         self.session_kv = SessionKV(
             cap=session_cap,
             prefix_cap=pc_cap,
+        )
+
+        swap_cap = self.cfg.get("swap-max-vram", 4)
+        self.snapshot_swap = SnapshotSwap(
+            swap_dir=f"/var/lib/grimoire/snapshot_swap/{self.name}",
+            max_vram_slots=swap_cap,
         )
 
         self.dflash_daemon = DflashDaemon(
