@@ -110,6 +110,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     payload["messages"] = new_messages
                     if payload.get("conversation_id"):
                         _kv_save_key = f"pflash-{payload['conversation_id']}.kv"
+                        log.warning(f"pflash kv: will save as {_kv_save_key}")
         except Exception as e:
             _log = __import__('logging').getLogger(__name__)
             _log.warning(f"PFlash compression failed for {active.name}: {e}")
@@ -122,6 +123,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
         # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
         _kv_key_raw = payload.get("conversation_id")
+        log.warning(f"pflash kv: raw key = {_kv_key_raw}")
         if _kv_key_raw:
             kv_name = f"pflash-{_kv_key_raw}.kv"
             slot_url = f"http://127.0.0.1:{active.port}/slots/0"
