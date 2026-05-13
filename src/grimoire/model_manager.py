@@ -70,6 +70,7 @@ def build_cmd(cfg, port, alias=None):
         "--jinja",
         "--flash-attn", "on",
         "--metrics",
+        "--slot-save-path", "/dev/shm/grimoire-slots",
         "--predict", str(cfg.get("predict", config.DEFAULT_PREDICT)),
     ]
 

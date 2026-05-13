@@ -106,15 +106,32 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
+                    if conversation_id:
+                        _kv_save_key = f"pflash-{conversation_id}.kv"
         except Exception as e:
             _log = __import__('logging').getLogger(__name__)
             _log.warning(f"PFlash compression failed for {active.name}: {e}")
 
     client = httpx.AsyncClient(timeout=None)
+    # KV prefix cache key — set when compression fires
+    _kv_save_key = None
     try:
         payload = await plugin_manager.before_backend_request(
             payload, active.name, model_cfg, backend_model_id, client, url, headers
         )
+
+        # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
+        if conversation_id:
+            kv_name = f"pflash-{conversation_id}.kv"
+            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+            try:
+                rr = await client.post(f"{slot_url}?action=restore",
+                    json={"filename": kv_name}, timeout=5)
+                if rr.status_code == 200:
+                    log.warning(f"pflash kv: restored {kv_name}")
+            except Exception:
+                pass  # non-fatal — full prefill if restore fails
+
         upstream = await client.send(
             client.build_request(
                 "POST",
@@ -164,6 +181,17 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         finally:
             await upstream.aclose()
             await client.aclose()
+            # KV prefix cache: save slot state after response completes
+            if _kv_save_key and conversation_id:
+                try:
+                    async with httpx.AsyncClient(timeout=5) as sc:
+                        slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+                        rr = await sc.post(f"{slot_url}?action=save",
+                            json={"filename": _kv_save_key})
+                        if rr.status_code == 200:
+                            log.warning(f"pflash kv: saved {_kv_save_key}")
+                except Exception:
+                    pass
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")
