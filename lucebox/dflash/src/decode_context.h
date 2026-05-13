@@ -337,7 +337,6 @@ inline void stream_emit(DecodeCtx & ctx, int32_t tok) {
 }
 
 // ── Extracted decode functions ────────────────────────────────────
-bool handle_daemon_command(DecodeCtx & ctx, const std::string & line);
 bool run_dflash_decode(DecodeCtx & ctx, const std::vector<int32_t> & prompt, int n_gen, std::vector<int32_t> & out_all);
 bool run_target_only_decode(DecodeCtx & ctx, const std::vector<int32_t> & prompt, int n_gen, std::vector<int32_t> & out_all);
 

@@ -125,7 +125,6 @@ add_library(dflash27b STATIC
     src/laguna_target_graph.cpp
     src/laguna_daemon.cpp
     src/sampler.cpp
-    src/decode_cmds.cpp
     src/decode_graph.cpp
     src/decode_helpers.cpp
     src/decode_target_split.cpp
