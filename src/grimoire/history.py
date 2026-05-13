@@ -535,6 +535,14 @@ class HistoryStore:
         }
         with self._lock, self._connect() as conn:
             self._ensure_owner(conn, user_hash, conversation_id)
+            current = conn.execute(
+                "SELECT parent_id FROM messages WHERE id = ? AND conversation_id = ?",
+                (message_id, conversation_id),
+            ).fetchone()
+            if not current:
+                raise KeyError(f"Message '{message_id}' not in conversation '{conversation_id}'")
+            old_parent_id = current["parent_id"]
+            new_parent_id = updates.get("parent", old_parent_id)
             sets = []
             values = []
             for key, value in updates.items():
@@ -566,6 +574,11 @@ class HistoryStore:
                 f"UPDATE messages SET {', '.join(sets)} WHERE id = ? AND conversation_id = ?",
                 values,
             )
+            if new_parent_id != old_parent_id:
+                if old_parent_id:
+                    self._remove_child(conn, old_parent_id, message_id)
+                if new_parent_id:
+                    self._append_child(conn, new_parent_id, message_id)
             conn.execute(
                 "UPDATE conversations SET last_modified_ms = ?, updated_at = ? WHERE id = ?",
                 (now_ms(), utcnow(), conversation_id),
@@ -582,6 +595,11 @@ class HistoryStore:
             if not row:
                 raise KeyError(f"Message '{message_id}' not in conversation '{conversation_id}'")
             parent_id = row["parent_id"]
+            conv_row = conn.execute(
+                "SELECT curr_node_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            current_node = conv_row["curr_node_id"] if conv_row else None
             if cascade:
                 deleted = []
                 queue = [message_id]
@@ -601,16 +619,16 @@ class HistoryStore:
                 if parent_id:
                     self._remove_child(conn, parent_id, message_id)
                 conn.execute(
-                    "UPDATE conversations SET last_modified_ms = ?, updated_at = ? WHERE id = ?",
-                    (now_ms(), utcnow(), conversation_id),
+                    "UPDATE conversations SET curr_node_id = ?, last_modified_ms = ?, updated_at = ? WHERE id = ?",
+                    (None if current_node in deleted else current_node, now_ms(), utcnow(), conversation_id),
                 )
                 return deleted
             conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
             if parent_id:
                 self._remove_child(conn, parent_id, message_id)
             conn.execute(
-                "UPDATE conversations SET last_modified_ms = ?, updated_at = ? WHERE id = ?",
-                (now_ms(), utcnow(), conversation_id),
+                "UPDATE conversations SET curr_node_id = ?, last_modified_ms = ?, updated_at = ? WHERE id = ?",
+                (None if current_node == message_id else current_node, now_ms(), utcnow(), conversation_id),
             )
             return [message_id]
 

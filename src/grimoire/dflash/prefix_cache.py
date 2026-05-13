@@ -238,9 +238,9 @@ class PrefixCache:
             for entry in meta.get("entries", []):
                 key = bytes.fromhex(entry["key_hex"])
                 slot = entry["slot"]
-                if 0 <= slot < MAX_DAEMON_SLOTS:
+                if 0 <= slot < self.cap:
                     self.entries[key] = slot
-            self.next_slot = meta.get("next_slot", 0)
+            self.next_slot = meta.get("next_slot", 0) % max(self.cap, 1)
             logger.info(
                 f"prefix cache loaded: {len(self.entries)} entries from {meta_path}"
             )

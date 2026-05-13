@@ -60,6 +60,18 @@ class DflashDaemon:
         self.proc: Optional[subprocess.Popen] = None
         self.r_pipe: int = -1
 
+    def _read_pipe_int32(self) -> Optional[int]:
+        b = os.read(self.r_pipe, 4)
+        if not b or len(b) < 4:
+            return None
+        return struct.unpack("<i", b)[0]
+
+    def _send_expect_ack(self, cmd: str) -> None:
+        self._send(cmd)
+        ack = self._read_pipe_int32()
+        if ack != -1:
+            raise RuntimeError(f"dflash daemon command failed or desynced: {cmd.strip()}")
+
     def spawn(self, timeout: float = 600.0) -> None:
         """Spawn the dflash daemon and wait for it to load.
 
@@ -100,7 +112,11 @@ class DflashDaemon:
         os.close(w_pipe)
         self.r_pipe = r_pipe
 
-        self._wait_until_loaded(timeout=timeout, baseline_mib=baseline_vram)
+        try:
+            self._wait_until_loaded(timeout=timeout, baseline_mib=baseline_vram)
+        except Exception:
+            self.stop()
+            raise
 
     def _read_gpu_vram_mib(self) -> int:
         """Return MiB used on this daemon's GPU, or 0 if nvidia-smi fails."""
@@ -120,6 +136,14 @@ class DflashDaemon:
 
     def _wait_until_loaded(self, timeout: float, baseline_mib: int) -> None:
         """Wait for daemon to load by checking VRAM delta above baseline."""
+        if baseline_mib <= 0:
+            logger.warning("nvidia-smi unavailable; skipping VRAM-based dflash readiness check")
+            time.sleep(2)
+            if self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"dflash daemon exited before loading (code {self.proc.returncode})"
+                )
+            return
         boot = time.time()
         while time.time() - boot < timeout:
             time.sleep(1)
@@ -171,10 +195,10 @@ class DflashDaemon:
     def _drain_sentinel(self) -> None:
         """Read the token stream pipe until -1 sentinel (command ACK)."""
         while True:
-            b = os.read(self.r_pipe, 4)
-            if not b or len(b) < 4:
+            tok = self._read_pipe_int32()
+            if tok is None:
                 break
-            if struct.unpack("<i", b)[0] == -1:
+            if tok == -1:
                 break
 
     def read_next_token(self) -> Optional[int]:
@@ -184,10 +208,9 @@ class DflashDaemon:
         -1 sentinel or the pipe is closed. Callers iterating this from an
         asyncio context should wrap each call in `asyncio.to_thread`.
         """
-        b = os.read(self.r_pipe, 4)
-        if not b or len(b) < 4:
+        tok = self._read_pipe_int32()
+        if tok is None:
             return None
-        tok = struct.unpack("<i", b)[0]
         if tok == -1:
             return None
         return tok
@@ -341,7 +364,7 @@ class DflashDaemon:
         Returns:
             True if restore succeeded
         """
-        self._send(f"RESTORE_SLOT {slot}\n")
+        self._send_expect_ack(f"RESTORE_SLOT {slot}\n")
         return True
 
     def free_snapshot(self, slot: int) -> None:
@@ -350,7 +373,7 @@ class DflashDaemon:
         Args:
             slot: Daemon slot ID (0-7)
         """
-        self._send(f"FREE_SNAPSHOT {slot}\n")
+        self._send_expect_ack(f"FREE_SNAPSHOT {slot}\n")
 
     def park_draft(self) -> None:
         """Park draft model to free ~3.3 GB VRAM."""
@@ -390,7 +413,7 @@ class DflashDaemon:
         """
         if slot < 0 or slot >= 8:
             raise ValueError(f"Invalid snapshot slot: {slot}")
-        self._send(f"SNAPSHOT {slot}\n")
+        self._send_expect_ack(f"SNAPSHOT {slot}\n")
 
     def save_snapshot(self, slot: int, path: str) -> None:
         """Serialize a snapshot slot to disk, freeing the VRAM.
@@ -401,7 +424,7 @@ class DflashDaemon:
         """
         if slot < 0 or slot >= 8:
             raise ValueError(f"Invalid snapshot slot: {slot}")
-        self._send(f"SAVE_SNAPSHOT {slot} {path}\n")
+        self._send_expect_ack(f"SAVE_SNAPSHOT {slot} {path}\n")
 
     def load_snapshot(self, slot: int, path: str) -> None:
         """Load a snapshot from disk into a slot (allocates VRAM).
@@ -412,7 +435,7 @@ class DflashDaemon:
         """
         if slot < 0 or slot >= 8:
             raise ValueError(f"Invalid snapshot slot: {slot}")
-        self._send(f"LOAD_SNAPSHOT {slot} {path}\n")
+        self._send_expect_ack(f"LOAD_SNAPSHOT {slot} {path}\n")
 
 
 def _spawn_preexec():

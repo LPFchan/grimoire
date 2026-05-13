@@ -395,28 +395,36 @@ class DflashHelperTests(unittest.TestCase):
         self.tok = FakeTokenizer()
 
     def test_collect_stop_ids_includes_eos_and_chat_end(self):
-        ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
+        ids, stop_seqs = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
         self.assertIn(self.tok.eos_token_id, ids)
         self.assertIn(self.tok._SPECIAL["<|im_end|>"], ids)
+        self.assertEqual(stop_seqs, [])
 
     def test_collect_stop_ids_includes_request_stop_string(self):
-        ids = entrypoint._dflash_collect_stop_ids(self.tok, "STOP", {})
-        for c in "STOP":
-            self.assertIn(ord(c), ids)
+        ids, stop_seqs = entrypoint._dflash_collect_stop_ids(self.tok, "STOP", {})
+        self.assertNotIn(ord("S"), ids)
+        self.assertIn(tuple(ord(c) for c in "STOP"), stop_seqs)
 
     def test_collect_stop_ids_includes_request_stop_list(self):
-        ids = entrypoint._dflash_collect_stop_ids(self.tok, ["A", "B"], {})
+        ids, stop_seqs = entrypoint._dflash_collect_stop_ids(self.tok, ["A", "B"], {})
         self.assertIn(ord("A"), ids)
         self.assertIn(ord("B"), ids)
+        self.assertEqual(stop_seqs, [])
 
     def test_collect_stop_ids_includes_cfg_stop_strings(self):
-        ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {"stop-strings": ["Z"]})
+        ids, stop_seqs = entrypoint._dflash_collect_stop_ids(self.tok, None, {"stop-strings": ["Z"]})
         self.assertIn(ord("Z"), ids)
+        self.assertEqual(stop_seqs, [])
 
     def test_collect_stop_ids_skips_unknown_specials(self):
         # convert_tokens_to_ids returns -1 for unknown specials; those must NOT enter the set.
-        ids = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
+        ids, _ = entrypoint._dflash_collect_stop_ids(self.tok, None, {})
         self.assertNotIn(-1, ids)
+
+    def test_collect_stop_ids_keeps_multi_token_cfg_stop_as_sequence(self):
+        ids, stop_seqs = entrypoint._dflash_collect_stop_ids(self.tok, None, {"stop-strings": ["END"]})
+        self.assertNotIn(ord("E"), ids)
+        self.assertIn(tuple(ord(c) for c in "END"), stop_seqs)
 
     def test_prefix_boundaries_returns_one_per_message(self):
         msgs = [
@@ -550,6 +558,30 @@ class DflashHelperTests(unittest.TestCase):
         self.assertEqual(len(boundaries), len(msgs))
         # bash tool should not produce protected ranges.
         self.assertEqual(len(protected), 0)
+
+    def test_prefix_boundaries_protects_obsidian_tool_output_via_tool_call_id(self):
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "read note"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "obsidian_read-note", "arguments": {"filename": "x.md"}},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": "protected note body",
+            },
+        ]
+        prompt_ids = self.tok.encode(self.tok.apply_chat_template(msgs, add_generation_prompt=True))
+        boundaries, protected = entrypoint._dflash_prefix_boundaries(msgs, self.tok, prompt_ids)
+        self.assertEqual(len(protected), 1)
+        self.assertEqual(protected[0], (boundaries[2], boundaries[3]))
 
 
 class MaybeCompressHeadTailTests(unittest.TestCase):
@@ -1018,6 +1050,32 @@ class SnapshotSwapTests(unittest.TestCase):
             swap.discard(daemon, key_a)
             self.assertIsNone(swap.get(key_a))
             self.assertFalse(path.exists())
+
+
+class PrefixCachePersistenceTests(unittest.TestCase):
+    def test_load_clamps_slots_to_current_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = PrefixCache(cap=4, cache_dir=td)
+            key = cache.hash_prefix([1, 2, 3])
+            Path(td, "index.json").write_text(json.dumps({
+                "entries": [{"key_hex": key.hex(), "slot": 3}],
+                "next_slot": 3,
+            }))
+
+            smaller = PrefixCache(cap=2, cache_dir=td)
+            smaller.load()
+            self.assertEqual(list(smaller.entries.values()), [])
+            self.assertEqual(smaller.next_slot, 1)
+
+    def test_cleanup_clears_saved_index_on_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = PrefixCache(cap=2, cache_dir=td)
+            prompt = [1, 2, 3, 4]
+            slot, boundary = cache.prepare_inline_snap(prompt, 2)
+            cache.confirm_inline_snap(slot, boundary, prompt)
+            cache.save()
+            cache.cleanup(None)
+            self.assertFalse(Path(td, "index.json").exists())
 
 
 class DflashProxyIntegrationTests(unittest.TestCase):

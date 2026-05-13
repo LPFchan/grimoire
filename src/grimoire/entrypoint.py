@@ -580,7 +580,7 @@ class ModelManager:
             port = None if is_dflash else self._find_available_port(gpu)
             active = ActiveModel(model_name, cfg, port, gpu)
             self.active[model_name] = active
-            active.start()
+            await asyncio.to_thread(active.start)
             try:
                 startup_timeout = cfg.get("startup-timeout", DEFAULT_STARTUP_TIMEOUT)
                 try:
@@ -650,7 +650,7 @@ def detect_gpu_count():
                 return len(gpus)
     except Exception:
         pass
-    return 2
+    return 0
 
 
 manager = ModelManager(gpu_count=detect_gpu_count())
@@ -1381,9 +1381,10 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     record_history=upstream.status_code < 400,
                 )
             if non_streaming:
-                body = b""
+                body_parts = []
                 async for chunk in stream:
-                    body += chunk
+                    body_parts.append(chunk)
+                body = b"".join(body_parts)
                 try:
                     data = json.loads(body)
                     if "choices" in data:
@@ -1417,6 +1418,7 @@ DFLASH_IGNORED_SAMPLING = {
 def _dflash_collect_stop_ids(tokenizer, payload_stop, cfg):
     """Build the daemon's stop-id set from EOS, chat-template ends, and user stop."""
     stop_ids = set()
+    stop_seqs = []
     if tokenizer.eos_token_id is not None:
         stop_ids.add(tokenizer.eos_token_id)
 
@@ -1431,15 +1433,25 @@ def _dflash_collect_stop_ids(tokenizer, payload_stop, cfg):
 
     # Operator-supplied stop strings on the model config.
     for s in cfg.get("stop-strings", []) or []:
-        stop_ids.update(tokenizer.encode(s, add_special_tokens=False))
+        if not isinstance(s, str) or not s:
+            continue
+        ids = tokenizer.encode(s, add_special_tokens=False)
+        if len(ids) == 1:
+            stop_ids.add(ids[0])
+        elif ids:
+            stop_seqs.append(tuple(ids))
 
     # Request-level stop strings.
     raw_stops = [payload_stop] if isinstance(payload_stop, str) else (payload_stop or [])
     for s in raw_stops:
         if isinstance(s, str) and s:
-            stop_ids.update(tokenizer.encode(s, add_special_tokens=False))
+            ids = tokenizer.encode(s, add_special_tokens=False)
+            if len(ids) == 1:
+                stop_ids.add(ids[0])
+            elif ids:
+                stop_seqs.append(tuple(ids))
 
-    return stop_ids
+    return stop_ids, stop_seqs
 
 
 def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
@@ -1486,15 +1498,28 @@ def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
     # ranges as protected (exempt from PFlash compression).
     protected_ranges = []
     _protected_tools = {"obsidian_read-note"}
-    prev_boundary = 0
+    tool_call_names: dict[str, str] = {}
     for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         tool_name = None
+        if msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                fn_name = fn.get("name")
+                if tc_id and isinstance(fn_name, str):
+                    tool_call_names[tc_id] = fn_name
         if msg.get("role") == "tool" and isinstance(msg.get("tool"), dict):
             tool_name = msg["tool"].get("name")
         if msg.get("type") == "tool" and isinstance(msg.get("tool"), str):
             tool_name = msg["tool"]
+        if tool_name is None and msg.get("role") == "tool":
+            tc_id = msg.get("tool_call_id")
+            if isinstance(tc_id, str):
+                tool_name = tool_call_names.get(tc_id)
         if tool_name not in _protected_tools:
             continue
         try:
@@ -1512,7 +1537,6 @@ def _dflash_prefix_boundaries(messages, tokenizer, prompt_ids):
             continue
         if 0 <= start < end <= len(prompt_ids):
             protected_ranges.append((start, end))
-        prev_boundary = end
 
     return boundaries, protected_ranges
 
@@ -1565,7 +1589,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
             ),
         )
 
-    stop_ids = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
+    stop_ids, stop_seqs = _dflash_collect_stop_ids(tokenizer, payload.get("stop"), model_cfg)
     boundaries, protected_ranges = _dflash_prefix_boundaries(messages, tokenizer, prompt_ids)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -1667,6 +1691,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
             decoded_prefix = ""
             tokens_emitted = []
+            stop_seq_lens = sorted({len(seq) for seq in stop_seqs}, reverse=True)
             t0 = time.monotonic()
             try:
                 index = 0
@@ -1677,6 +1702,14 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     if tok in stop_ids:
                         break
                     tokens_emitted.append(tok)
+                    stop_hit = False
+                    for seq_len in stop_seq_lens:
+                        if len(tokens_emitted) < seq_len:
+                            continue
+                        if tuple(tokens_emitted[-seq_len:]) in stop_seqs:
+                            del tokens_emitted[-seq_len:]
+                            stop_hit = True
+                            break
                     # Incremental decode against the running prefix avoids
                     # BPE/SentencePiece per-token artefacts.
                     new_full = tokenizer.decode(
@@ -1690,6 +1723,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                         frame = _delta_sse(completion_id, created, delta, index)
                         index += 1
                         yield f"data: {json.dumps(frame)}\n\n".encode()
+                    if stop_hit:
+                        break
                     if len(tokens_emitted) >= max_tokens:
                         break
             finally:

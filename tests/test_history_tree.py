@@ -104,6 +104,22 @@ class HistoryTreeContractTests(unittest.TestCase):
         self.assertEqual(msg["toolCalls"], "[]")
         self.assertEqual(msg["model"], "qwen-3.6-27B")
 
+    def test_patch_message_reparents_tree_links(self):
+        self._create_conv()
+        self._add_message("c1", "m-root", parent_id=None, role="system", type="root", content="")
+        self._add_message("c1", "m-a", parent_id="m-root", role="user", content="a")
+        self._add_message("c1", "m-b", parent_id="m-root", role="user", content="b")
+        response = self.client.patch(
+            "/history/c1/messages/m-b",
+            json={"parent": "m-a"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        conv = self.client.get("/history/c1", headers=self.auth).json()
+        msgs_by_id = {m["id"]: m for m in conv["messages"]}
+        self.assertEqual(msgs_by_id["m-root"]["children"], ["m-a"])
+        self.assertEqual(msgs_by_id["m-a"]["children"], ["m-b"])
+
     def test_delete_message_unlinks_from_parent(self):
         self._create_conv()
         self._add_message("c1", "m-root", parent_id=None, role="system", type="root", content="")
@@ -117,6 +133,17 @@ class HistoryTreeContractTests(unittest.TestCase):
         self.assertNotIn("m-1", ids)
         root = next(m for m in conv["messages"] if m["id"] == "m-root")
         self.assertEqual(root["children"], ["m-2"])
+
+    def test_delete_current_node_clears_curr_node(self):
+        self._create_conv()
+        self._add_message("c1", "m-root", parent_id=None, role="system", type="root", content="")
+        self._add_message("c1", "m-1", parent_id="m-root", role="user", content="a")
+        conv = self.client.get("/history/c1", headers=self.auth).json()
+        self.assertEqual(conv["currNode"], "m-1")
+        response = self.client.delete("/history/c1/messages/m-1", headers=self.auth)
+        self.assertEqual(response.status_code, 200)
+        conv = self.client.get("/history/c1", headers=self.auth).json()
+        self.assertIsNone(conv["currNode"])
 
     def test_delete_message_cascade_removes_subtree(self):
         self._create_conv()
