@@ -75,9 +75,37 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 )
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
-                    compressed_text = tokenizer.decode(compressed_ids)
-                    log.warning(f"pflash debug: compressed_text len={len(compressed_text)}")
-                    payload["messages"] = [{"role": "user", "content": compressed_text}]
+                    # Reconstruct messages preserving roles and tool call metadata.
+                    # Group compressed block tokens by original message boundary,
+                    # decode each message's tokens once (avoids BPE boundary artifacts
+                    # from per-block decode), then emit messages in original order.
+                    msg_groups: dict[int, dict] = {}
+                    for block in blocks:
+                        if block.kind == "generation_prompt":
+                            continue
+                        key = block.message_start
+                        if key not in msg_groups:
+                            msg_groups[key] = {
+                                "role": block.role,
+                                "token_ids": [],
+                                "metadata": block.metadata or {},
+                            }
+                        msg_groups[key]["token_ids"].extend(
+                            compressed_ids[block.start:block.end]
+                        )
+                    new_messages = []
+                    for key in sorted(msg_groups):
+                        m = msg_groups[key]
+                        text = tokenizer.decode(m["token_ids"])
+                        entry: dict = {"role": m["role"], "content": text}
+                        # Propagate tool_call/reasoning metadata from block metadata
+                        for md_key in ("tool_calls", "reasoning_content", "tool_call_id",
+                                       "name", "tool_names", "message_indexes"):
+                            if md_key in m["metadata"]:
+                                entry[md_key] = m["metadata"][md_key]
+                        new_messages.append(entry)
+                    log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
+                    payload["messages"] = new_messages
         except Exception as e:
             _log = __import__('logging').getLogger(__name__)
             _log.warning(f"PFlash compression failed for {active.name}: {e}")
