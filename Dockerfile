@@ -253,7 +253,8 @@ COPY etc/models.json /etc/grimoire/models.json
 # Install Python dependencies
 COPY pyproject.toml README.md /app/
 COPY src/ /app/src/
-RUN python3.11 -m venv /opt/grimoire-venv \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3.11 -m venv /opt/grimoire-venv \
     && /opt/grimoire-venv/bin/pip install --upgrade pip \
     && /opt/grimoire-venv/bin/pip install .
 
