@@ -38,10 +38,12 @@ class DflashDaemon:
     def __init__(
         self,
         target_path: str,
-        draft_path: str,
+        draft_path: Optional[str] = None,
         max_ctx: int = 16384,
         budget: int = 22,
         gpu_id: int = 0,
+        pflash: bool = True,
+        dflash: bool = True,
         prefill_threshold: int = 32000,
         prefill_keep_ratio: float = 0.05,
         kv_k_type: str = "q8_0",
@@ -53,6 +55,8 @@ class DflashDaemon:
         self.max_ctx = max_ctx
         self.budget = budget
         self.gpu_id = gpu_id
+        self.pflash = pflash
+        self.dflash = dflash
         self.prefill_threshold = prefill_threshold
         self.prefill_keep_ratio = prefill_keep_ratio
         self.kv_k_type = kv_k_type
@@ -84,17 +88,19 @@ class DflashDaemon:
         r_pipe, w_pipe = os.pipe()
         stream_fd = w_pipe
 
-        cmd = [
-            DFLASH_BIN,
-            self.target_path,
-            self.draft_path,
+        cmd = [DFLASH_BIN, self.target_path]
+        if self.draft_path:
+            cmd.append(self.draft_path)
+        cmd += [
             "--daemon",
             "--fast-rollback",
-            "--ddtree",
-            f"--ddtree-budget={self.budget}",
             f"--max-ctx={self.max_ctx}",
             f"--stream-fd={stream_fd}",
         ]
+        if self.pflash:
+            cmd.append("--pflash")
+        if self.dflash:
+            cmd += ["--ddtree", f"--ddtree-budget={self.budget}"]
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)

@@ -175,8 +175,11 @@ class ActiveModel:
         )
         self.prefix_cache.load()
 
+        use_pflash = self.cfg.get("pflash", True)
+        use_dflash = self.cfg.get("dflash", True)
+
         self.prefill_config = PrefillConfig(
-            enabled=self.cfg.get("prefill-compression", "auto") != "never",
+            enabled=bool(use_pflash) and self.cfg.get("prefill-compression", "auto") != "never",
             threshold=self.cfg.get("prefill-threshold", 32000),
             keep_ratio=self.cfg.get("prefill-keep-ratio", 0.05),
             drafter_path=drafter_path,
@@ -202,10 +205,12 @@ class ActiveModel:
 
         self.dflash_daemon = DflashDaemon(
             target_path=target_path,
-            draft_path=draft_path,
+            draft_path=draft_path if use_dflash else None,
             max_ctx=self.cfg.get("ctx-size", 16384),
             budget=self.cfg.get("budget", 22),
             gpu_id=self.gpu,
+            pflash=bool(use_pflash),
+            dflash=bool(use_dflash),
             prefill_threshold=self.prefill_config.threshold,
             prefill_keep_ratio=self.prefill_config.keep_ratio,
             kv_k_type=self.cfg.get("cache-type-k", "q8_0"),
