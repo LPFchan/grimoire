@@ -4,14 +4,8 @@
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
       "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25
-      },
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.33, "output": 3.25},
       "ctx-size": 262144,
       "predict": 16384,
       "parallel": 1,
@@ -24,14 +18,8 @@
       "file": "gguf/gemma-4-31B-it-UD-Q4_K_XL.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
       "family": "gemma",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.14,
-        "output": 0.4
-      },
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.14, "output": 0.4},
       "ctx-size": 131072,
       "predict": 16384,
       "parallel": 1,
@@ -44,14 +32,8 @@
       "file": "gguf/Huihui-Qwen3.5-27B-abliterated.Q4_K_M.gguf",
       "mmproj": "gguf/Huihui-Qwen3.5-27B-abliterated.mmproj-Q8_0.gguf",
       "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.3,
-        "output": 2.4
-      },
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.3, "output": 2.4},
       "ctx-size": 262144,
       "predict": 16384,
       "parallel": 1,
@@ -64,25 +46,15 @@
       "file": "gguf/huihui-gemma-4-31b-it-abliterated-v2-q4_k_m.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
       "family": "gemma",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.14,
-        "output": 0.4
-      },
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.14, "output": 0.4},
       "ctx-size": 131072,
       "predict": 16384,
       "parallel": 1,
       "image-min-tokens": 280,
       "image-max-tokens": 280,
       "chat-template-file": "/templates/gemma-4-31B-it-chat_template.jinja",
-      "logit-bias": [
-        "3873-inf",
-        "547-inf",
-        "3041-inf"
-      ],
+      "logit-bias": ["3873-inf", "547-inf", "3041-inf"],
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
@@ -90,14 +62,8 @@
       "file": "gguf/Qwopus3.6-27B-v1-preview-Q4_K_M.gguf",
       "mmproj": "gguf/qwopus-mmproj.gguf",
       "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25
-      },
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.33, "output": 3.25},
       "ctx-size": 262144,
       "predict": 16384,
       "parallel": 1,
@@ -113,17 +79,10 @@
       "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
       "tokenizer": "tokenizers/qwen3.6-27B",
       "tokenizer-trust-remote-code": true,
-      "stop-strings": [
-        "<|im_end|>"
-      ],
+      "stop-strings": ["<|im_end|>"],
       "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25
-      },
+      "capabilities": ["completion"],
+      "cost": {"input": 0.33, "output": 3.25},
       "ctx-size": 60000,
       "max-effective-context": 60000,
       "predict": 16384,
@@ -145,46 +104,7 @@
       "prefill-tail-budget": 16000,
       "prefill-compression": "auto"
     },
-    "pflash-ggml-qwen3.6-27B": {
-      "backend": "dflash",
-      "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
-      "tokenizer": "tokenizers/qwen3.6-27B",
-      "tokenizer-trust-remote-code": true,
-      "stop-strings": [
-        "<|im_end|>"
-      ],
-      "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25
-      },
-      "ctx-size": 240000,
-      "max-effective-context": 240000,
-      "predict": 16384,
-      "dflash": false,
-      "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0",
-      "fa-window": 512,
-      "snapshot-mode": "compact-full",
-      "snapshot-ram-dir": "/dev/shm/grimoire-snapshots",
-      "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/pflash-ggml-qwen3.6-27B",
-      "snapshot-ram-budget-gb": 20,
-      "snapshot-disk-budget-gb": 30,
-      "snapshot-disk-ttl-hours": 24,
-      "snapshot-staging-slot": 7,
-      "prefix-cache-slots": 0,
-      "session-kv-slots": 4,
-      "prefill-threshold": 48000,
-      "prefill-keep-ratio": 0.05,
-      "prefill-tail-budget": 16000,
-      "prefill-compression": "auto",
-      "budget": 1
-    },
-    "pflash-llama-qwen3.6-27B": {
+    "pflash-qwen3.6-27B": {
       "pflash": true,
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
@@ -192,35 +112,49 @@
       "tokenizer": "tokenizers/qwen3.6-27B",
       "tokenizer-trust-remote-code": true,
       "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25
-      },
-      "ctx-size": 131072,
-      "max-effective-context": 131072,
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.33, "output": 3.25},
+      "ctx-size": 65000,
+      "max-effective-context": 65000,
       "predict": 16384,
       "parallel": 1,
       "image-min-tokens": 1024,
       "image-max-tokens": 1024,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "prefill-threshold": 48000,
-      "prefill-keep-ratio": 0.05,
+      "prefill-threshold": 36000,
+      "prefill-keep-ratio": 0.10,
       "prefill-tail-budget": 16000,
       "park-unpark": false
+    },
+    "pflash-park-qwen3.6-27B": {
+      "pflash": true,
+      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
+      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
+      "drafter": "gguf/Qwen3.5-0.8B-Q8_0.gguf",
+      "tokenizer": "tokenizers/qwen3.6-27B",
+      "tokenizer-trust-remote-code": true,
+      "family": "qwen",
+      "capabilities": ["completion", "multimodal"],
+      "cost": {"input": 0.33, "output": 3.25},
+      "ctx-size": 132000,
+      "max-effective-context": 132000,
+      "predict": 16384,
+      "parallel": 1,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "prefill-threshold": 36000,
+      "prefill-keep-ratio": 0.10,
+      "prefill-tail-budget": 16000,
+      "park-unpark": true
     }
   },
   "fixed": {},
   "family_defaults": {
     "qwen": {
-      "extra-args": [
-        "--chat-template-kwargs",
-        "{\"preserve_thinking\":true}"
-      ]
+      "extra-args": ["--chat-template-kwargs", "{\"preserve_thinking\":true}"]
     }
   }
 }

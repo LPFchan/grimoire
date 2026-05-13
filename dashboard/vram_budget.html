@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VRAM · Grimoire PFlash</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;padding:20px}
+.container{max-width:1100px;margin:auto}
+h1{font-size:1.4rem;color:#58a6ff;margin-bottom:2px}
+.subtitle{color:#8b949e;font-size:.85rem;margin-bottom:12px;line-height:1.4}
+.vram-bar-wrapper{background:#161b22;border-radius:8px;padding:14px;margin-bottom:12px;border:1px solid #30363d}
+.vram-bar{display:flex;height:44px;border-radius:6px;overflow:hidden;margin-bottom:6px;font-size:.68rem;font-weight:600}
+.vram-bar>div{display:flex;align-items:center;justify-content:center;white-space:nowrap;transition:width .2s;min-width:0;overflow:hidden}
+.vram-bar>div>span{padding:0 3px;text-shadow:0 1px 2px rgba(0,0,0,.6)}
+.vram-total{text-align:center;font-size:.82rem;color:#8b949e}
+.vram-total strong{color:#c9d1d9}
+.phase-tabs{display:flex;gap:0;margin-bottom:8px}
+.phase-tab{padding:4px 16px;border:1px solid #30363d;background:#161b22;color:#8b949e;cursor:pointer;font-size:.78rem;border-radius:4px 4px 0 0}
+.phase-tab.active{background:#1f6feb33;border-color:#1f6feb;color:#58a6ff}
+.seg-llama-w{background:#1f6feb}
+.seg-kv{background:#238636}
+.seg-compute{background:#9e6a03}
+.seg-rs{background:#8957e5}
+.seg-pfw{background:#6f42c1}
+.seg-pfkv{background:#d29922}
+.seg-pfbuf{background:#f0883e}
+.seg-ptrans{background:#f781bf}
+.seg-free{background:#21262d}
+.seg-overflow{background:#da3633}
+.legend{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.legend-item{display:flex;align-items:center;gap:3px;font-size:.75rem;color:#8b949e}
+.legend-dot{width:9px;height:9px;border-radius:2px;flex-shrink:0}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.control-group{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+.control-group h3{font-size:.82rem;color:#58a6ff;margin-bottom:8px}
+.slider-row{margin-bottom:6px}
+.slider-row label{display:flex;justify-content:space-between;font-size:.78rem;color:#8b949e}
+.slider-row label span.val{color:#c9d1d9;font-weight:600}
+input[type=range]{width:100%;margin:1px 0;accent-color:#58a6ff}
+.knob-desc{font-size:.68rem;color:#484f58}
+.toggle-row{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.toggle{position:relative;width:38px;height:20px;flex-shrink:0;cursor:pointer}
+.toggle input{opacity:0;width:0;height:0}
+.toggle .sl{position:absolute;inset:0;background:#21262d;border-radius:20px;transition:.2s;border:1px solid #30363d}
+.toggle .sl::before{content:'';position:absolute;width:14px;height:14px;left:2px;bottom:2px;background:#484f58;border-radius:50%;transition:.2s}
+.toggle input:checked+.sl{background:#1f6feb;border-color:#1f6feb}
+.toggle input:checked+.sl::before{transform:translateX(17px);background:#fff}
+.toggle-label{font-size:.78rem;color:#8b949e}
+.results{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px;margin-bottom:12px}
+.result-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px}
+.result-card .label{font-size:.68rem;color:#8b949e;text-transform:uppercase;letter-spacing:.4px}
+.result-card .value{font-size:1rem;font-weight:700;font-variant-numeric:tabular-nums}
+.result-card .value.ok{color:#3fb950}
+.result-card .value.fail{color:#f85149}
+.result-card .value.warn{color:#d29922}
+.warning-box{background:#3d1f00;border:1px solid #d29922;border-radius:6px;padding:8px;font-size:.82rem;margin-bottom:12px;display:none}
+.preset-row{display:flex;gap:6px;margin-bottom:12px}
+.preset-btn{background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:4px;padding:4px 10px;font-size:.72rem;cursor:pointer}
+.preset-btn:hover{background:#30363d;color:#c9d1d9}
+.preset-btn.active{background:#1f6feb33;border-color:#1f6feb;color:#58a6ff}
+.formula-box{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px;font-size:.75rem;font-family:'SF Mono',monospace;color:#8b949e;line-height:1.6;margin-bottom:12px;position:relative}
+.formula-box .eq{color:#58a6ff}
+.formula-box strong{color:#c9d1d9}
+.copy-btn{position:absolute;top:6px;right:8px;background:#21262d;border:1px solid #30363d;color:#8b949e;border-radius:3px;padding:2px 8px;font-size:.68rem;cursor:pointer}
+.copy-btn:hover{background:#30363d;color:#c9d1d9}
+@media(max-width:700px){.controls{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>VRAM · PFlash Pipeline</h1>
+<div class="subtitle">RTX 3090 24 GB · Qwen3.6-27B Q4_K_M · Qwen3.5-0.8B Q8_0 · dtype: hidden <b>F32</b> · Q <b>F16</b> · attn_out <b>Q8_0</b> · K/V <b>Q8_0</b> · FA chunked <b>4K</b> · transient <b>~80 MB</b></div>
+
+<div class="vram-bar-wrapper">
+  <div class="phase-tabs"><div class="phase-tab active" id="tabPrefill" onclick="sw('prefill')">Prefill</div><div class="phase-tab" id="tabDecode" onclick="sw('decode')">Decode</div></div>
+  <div class="vram-bar" id="vramBar"></div>
+  <div class="vram-total"><span id="peakTag">Peak</span>: <strong id="totalGb">0</strong> / <span id="totalLimit">24.0</span> GB · <span id="freeGb">0</span> GB free</div>
+  <div class="legend" id="legend"></div>
+</div>
+
+<div class="controls">
+  <div class="control-group">
+    <h3>Compression</h3>
+    <div class="slider-row"><label>Head budget <span class="val" id="hV">2 000</span></label><input type="range" id="hB" min="0" max="32000" value="2000" step="500"><div class="knob-desc">First blocks protected</div></div>
+    <div class="slider-row"><label>Tail budget <span class="val" id="tV">33 000</span></label><input type="range" id="tB" min="1000" max="48000" value="33000" step="500"><div class="knob-desc">Last tokens protected</div></div>
+    <div class="slider-row"><label>Keep ratio <span class="val" id="kV">10.0</span></label><input type="range" id="kB" min="1" max="80" value="10" step="0.5"><div class="knob-desc">% middle kept</div></div>
+    <div class="slider-row"><label>Ctx-size <span class="val" id="cV">65 000</span></label><input type="range" id="cB" min="4000" max="200000" value="65000" step="1000"><div class="knob-desc">KV capacity = C</div></div>
+  </div>
+  <div class="control-group">
+    <h3>Hardware</h3>
+    <div class="slider-row"><label>KV cache <span class="val" id="kVT">Q8_0</span></label><input type="range" id="kvT" min="0" max="3" value="2" step="1"><div class="knob-desc">0=TURBO4 1=Q4_0 2=Q8_0 3=F16</div></div>
+    <div class="slider-row"><label>PF K/V dtype <span class="val" id="pKV">Q8_0</span></label><input type="range" id="pKvT" min="0" max="2" value="0" step="1"><div class="knob-desc">0=Q8_0 1=F16 2=F32</div></div>
+    <div class="toggle-row"><label class="toggle"><input type="checkbox" id="parkT"><span class="sl"></span></label><span class="toggle-label">Park/unpark — <strong id="parkL">off</strong></span></div>
+    <div class="knob-desc" style="margin-bottom:6px">Llama freed during prefill, PFlash freed during decode</div>
+    <div class="slider-row"><label>GPU VRAM <span class="val" id="gV">24 100</span></label><input type="range" id="gB" min="8000" max="80000" value="24100" step="100"></div>
+  </div>
+</div>
+
+<div class="preset-row">
+  <button class="preset-btn" onclick="savePreset(1)">💾 Save 1</button>
+  <button class="preset-btn" onclick="loadPreset(1)">📂 Load 1</button>
+  <button class="preset-btn" onclick="savePreset(2)">💾 Save 2</button>
+  <button class="preset-btn" onclick="loadPreset(2)">📂 Load 2</button>
+  <button class="preset-btn" onclick="savePreset(3)">💾 Save 3</button>
+  <button class="preset-btn" onclick="loadPreset(3)">📂 Load 3</button>
+  <button class="preset-btn" onclick="showPresets()" title="which presets are stored">ℹ</button>
+</div>
+
+<div class="results" id="results"></div>
+<div class="warning-box" id="wb"></div>
+<div class="formula-box" id="formulaBox"><button class="copy-btn" onclick="copyFormula()">📋 Copy</button><span id="formulaText">Calculating...</span></div>
+</div>
+
+<script>
+const MW=15345.66,MP=888,CP=495,RS=150,PFW=800;
+const KT=['TURBO4','Q4_0','Q8_0','F16'],KVB=[.5,.5,1,2],KDT=['Q8_0','F16','F32'],KDB=[1,2,4];
+
+function fmt(n){return Number(n).toLocaleString(undefined,{maximumFractionDigits:0})}
+function f1(n){return(n/1024).toFixed(1)}
+function savePreset(n){
+  const s={h:+document.getElementById('hB').value,t:+document.getElementById('tB').value,k:+document.getElementById('kB').value,
+    c:+document.getElementById('cB').value,kt:+document.getElementById('kvT').value,pk:+document.getElementById('pKvT').value,
+    g:+document.getElementById('gB').value,prk:document.getElementById('parkT').checked};
+  localStorage.setItem('pf_preset_'+n,JSON.stringify(s));
+  const btn=event.target;btn.textContent='✅ Saved '+n;setTimeout(()=>btn.textContent='💾 Save '+n,1500);
+}
+function loadPreset(n){
+  const raw=localStorage.getItem('pf_preset_'+n);
+  if(!raw){alert('Preset '+n+' is empty');return}
+  const s=JSON.parse(raw);
+  document.getElementById('hB').value=s.h;document.getElementById('tB').value=s.t;
+  document.getElementById('kB').value=s.k;document.getElementById('cB').value=s.c;
+  document.getElementById('kvT').value=s.kt;document.getElementById('pKvT').value=s.pk;
+  document.getElementById('gB').value=s.g;document.getElementById('parkT').checked=s.prk;
+  const btn=event.target;btn.textContent='✅ Loaded '+n;setTimeout(()=>btn.textContent='📂 Load '+n,1500);
+  syncLabels();calc();
+}
+function showPresets(){
+  let msg='';
+  for(let i=1;i<=3;i++){
+    const raw=localStorage.getItem('pf_preset_'+i);
+    if(raw){const s=JSON.parse(raw);msg+=`Preset ${i}: h=${s.h} t=${s.t} k=${s.k}% ctx=${s.c} kv=${KT[s.kt]} pkv=${KDT[s.pk]} park=${s.prk} gpu=${s.g}\n`}
+    else msg+=`Preset ${i}: empty\n`;
+  }
+  alert(msg);
+}
+function syncLabels(){
+  const ids=['hB','tB','kB','cB','kvT','pKvT','gB'];
+  const labs=['hV','tV','kV','cV','kVT','pKV','gV'];
+  const fns=[v=>fmt(+v),v=>fmt(+v),v=>(v/2).toFixed(1),v=>fmt(+v),v=>KT[+v],v=>KDT[+v],v=>fmt(+v)];
+  ids.forEach((id,i)=>document.getElementById(labs[i]).textContent=fns[i](document.getElementById(id).value));
+}
+
+function calc(){
+  const hb=+document.getElementById('hB').value,tb=+document.getElementById('tB').value;
+  const kr=+document.getElementById('kB').value/100,ctx=+document.getElementById('cB').value;
+  const kt=+document.getElementById('kvT').value,pkd=+document.getElementById('pKvT').value;
+  const gpu=+document.getElementById('gB').value,pk=document.getElementById('parkT').checked;
+  const ke=KDB[pkd],kb=KVB[kt];
+  document.getElementById('parkL').textContent=document.getElementById('parkT').checked?'on':'off';
+
+  const prot=hb+tb,S=Math.round((ctx-prot)/kr)+prot,eff=prot+Math.max(0,S-prot)*kr;
+  const kvB=ctx*16*2*1024*kb/(1024*1024);
+  const lW=MW+MP;
+  const lB=lW+kvB+CP+RS;
+
+  const pKvB=S*6*2*256*2*ke;
+  const pBuf=(1024*4 + 256*8*2 + Math.ceil(256*8/32)*34 + 8*4)*S;
+  const pWS=(pKvB+pBuf)/(1024*1024);
+  // Transient peak during chunked flash-attention: Q chunk cont (4 KB/tok F16)
+  // + Q chunk cast F32 (8 KB/tok) = 12 KB/tok per chunk. With CHUNK_S=4096:
+  //   Q_cont = 256*4096*8*2 = 16 MB, Q_f32 = 256*4096*8*4 = 32 MB
+  // Peak per chunk ~48 MB for Q + FA_output (32 MB) = ~80 MB, < 0.1× full-S.
+  const pTrans = 80;  // MB fixed (CHUNK_S=4096 peak, not S-scaled)
+  const pT=PFW+pWS;
+
+  let peak,pDesc,segs;
+  if(pk){
+    const pre=kvB+RS+CP+PFW+pWS + (phase==='prefill'?pTrans:0);
+    const dec=lB;
+    peak=phase==='prefill'?pre:dec;
+    pDesc=phase==='prefill'?'Parked prefill (llama off, +transient FA)':'Parked decode (PF off)';
+    if(phase==='prefill')segs=[
+      {c:'seg-kv',l:'KV '+fmt(kvB)+' M',v:kvB},{c:'seg-rs',l:'RS '+fmt(RS)+' M',v:RS},
+      {c:'seg-compute',l:'Cmp '+fmt(CP)+' M',v:CP},{c:'seg-pfw',l:'PFw '+fmt(PFW)+' M',v:PFW},
+      {c:'seg-pfkv',l:'PFkv '+fmt(pKvB/1048576)+' M',v:Math.max(1,pKvB/1048576)},
+      {c:'seg-pfbuf',l:'PFbuf '+fmt(pBuf/1048576)+' M',v:Math.max(1,pBuf/1048576)},
+      {c:'seg-ptrans',l:'Trans '+fmt(pTrans)+' M',v:Math.max(1,pTrans)},
+    ];
+    else segs=[
+      {c:'seg-llama-w',l:'W '+fmt(lW)+' M',v:lW},{c:'seg-kv',l:'KV '+fmt(kvB)+' M',v:kvB},
+      {c:'seg-compute',l:'Cmp '+fmt(CP)+' M',v:CP},{c:'seg-rs',l:'RS '+fmt(RS)+' M',v:RS},
+    ];
+  }else{
+    peak=lB+pT+pTrans;pDesc='Co-resident (+transient FA)';
+    segs=[
+      {c:'seg-llama-w',l:'W '+fmt(lW)+' M',v:lW},{c:'seg-kv',l:'KV '+fmt(kvB)+' M',v:kvB},
+      {c:'seg-compute',l:'Cmp '+fmt(CP)+' M',v:CP},{c:'seg-rs',l:'RS '+fmt(RS)+' M',v:RS},
+      {c:'seg-pfw',l:'PFw '+fmt(PFW)+' M',v:PFW},
+      {c:'seg-pfkv',l:'PFkv '+fmt(pKvB/1048576)+' M',v:Math.max(1,pKvB/1048576)},
+      {c:'seg-pfbuf',l:'PFbuf '+fmt(pBuf/1048576)+' M',v:Math.max(1,pBuf/1048576)},
+      {c:'seg-ptrans',l:'Trans '+fmt(pTrans)+' M',v:Math.max(1,pTrans)},
+    ];
+  }
+  const fr=gpu-peak,ov=fr<0,ok=!ov&&fr>=64;
+  if(fr>0)segs.push({c:'seg-free',l:'Free '+fmt(fr)+' M',v:fr});
+  if(ov)segs.push({c:'seg-overflow',l:'OVER '+fmt(Math.abs(fr))+' M',v:Math.abs(fr)});
+
+  let bar='';
+  for(const s of segs){const p=s.v/gpu*100;if(p<.3)continue;bar+=`<div class="${s.c}" style="width:${p.toFixed(1)}%"><span>${s.l}</span></div>`}
+  document.getElementById('vramBar').innerHTML=bar;
+  document.getElementById('totalGb').textContent=f1(peak);
+  document.getElementById('totalLimit').textContent=f1(gpu);
+  document.getElementById('freeGb').textContent=(fr/1024).toFixed(2);
+
+  let leg='';
+  for(const l of[{c:'seg-llama-w',l:'Llama w'},{c:'seg-kv',l:'KV'},{c:'seg-compute',l:'Compute'},{c:'seg-rs',l:'RS'},
+      {c:'seg-pfw',l:'PF weights'},{c:'seg-pfkv',l:'PF K/V'},{c:'seg-pfbuf',l:'PF bufs'},{c:'seg-ptrans',l:'PF transient'},{c:'seg-free',l:'Free'},{c:'seg-overflow',l:'OVER'}])
+    if(segs.find(s=>s.c===l.c))leg+=`<div class="legend-item"><div class="legend-dot ${l.c}"></div>${l.l}</div>`;
+  document.getElementById('legend').innerHTML=leg;
+
+  const eOk=eff<=ctx*1.005;
+  document.getElementById('results').innerHTML=[
+    {l:'Raw S',v:fmt(S),c:S>0&&ok?'ok':ov?'fail':'warn',n:'sent to PF'},
+    {l:'Eff C',v:fmt(Math.round(eff)),c:eOk?'ok':'fail',n:'after compress'},
+    {l:'Ctx',v:fmt(ctx),c:eOk?'ok':'fail',n:'KV capacity'},
+    {l:'KV',v:fmt(kvB)+' MB',c:'ok',n:KT[kt]},
+    {l:'PF ws',v:fmt(pWS)+' MB',c:ok?'ok':'fail',n:'K/V='+KDT[pkd]+' bufs=Q8_0'},
+    {l:'Peak',v:f1(peak)+' GB',c:ok?fr>128?'ok':'warn':'fail',n:pDesc},
+    {l:'Free',v:(fr/1024).toFixed(2)+' GB',c:ok&&fr>128?'ok':'fail',n:ov?'OVER':' '},
+    {l:'Ratio',v:'1:'+(S/Math.max(1,eff)).toFixed(1),c:'ok',n:fmt(S)+'→'+fmt(Math.round(eff))},
+  ].map(c=>`<div class="result-card"><div class="label">${c.l}</div><div class="value ${c.c}">${c.v}</div><div class="knob-desc">${c.n}</div></div>`).join('');
+
+  const wb=document.getElementById('wb');
+  if(ov){wb.style.display='block';wb.textContent='⚠ OVER '+fmt(Math.abs(fr))+' MB. Reduce ctx/ratio or enable park.'}
+  else if(fr<64){wb.style.display='block';wb.textContent='⚠ '+fmt(fr)+' MB free. Tight.'}
+  else if(!eOk){wb.style.display='block';wb.textContent='⚠ Effective exceeds ctx.'}
+  else wb.style.display='none';
+
+  const pH=1024*4*S,pQ=256*8*2*S,pA=Math.ceil(256*8/32)*34*S,pM=8*4*S;
+  const formula=
+`S = (${fmt(ctx)} − ${fmt(prot)}) / ${kr} + ${fmt(prot)} = ${fmt(S)}
+C = ${fmt(prot)} + (${fmt(S)} − ${fmt(prot)}) × ${kr} = ${fmt(Math.round(eff))}
+KV = ${fmt(ctx)} × 16L×2×1024×${kb}B = ${fmt(kvB)} MB
+PF hidden F32 = ${fmt(pH/1048576)} MB (1024×4×${fmt(S)})
+PF Q F16 = ${fmt(pQ/1048576)} MB (256×8×2×${fmt(S)})
+PF attn Q8_0 = ${fmt(pA/1048576)} MB (ceil(2048/32)×34×${fmt(S)})
+PF K/V ${KDT[pkd]} = ${fmt(pKvB/1048576)} MB (6L×2×256×2×${ke}B×${fmt(S)})
+PF total = ${fmt(pH/1048576)} + ${fmt(pQ/1048576)} + ${fmt(pA/1048576)} + 0 + ${fmt(pKvB/1048576)} = ${fmt(pWS)} MB
+PF transient FA (chunked 4K) = ~80 MB (peak per chunk)
+Mode: ${phase} park=${pk?'yes':'no'}
+Peak = ${fmt(peak)} MB / ${fmt(gpu)} MB (${f1(peak)} / ${f1(gpu)} GB) ${ov?'⚠ OVERFLOW '+fmt(Math.abs(fr))+' MB':fr<128?'⚠ TIGHT':''}`;
+  document.getElementById('formulaText').textContent=formula;
+}
+
+function copyFormula(){
+  const text=document.getElementById('formulaText').textContent;
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text);
+  }else{
+    const ta=document.createElement('textarea');
+    ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy')}catch(e){}
+    document.body.removeChild(ta);
+  }
+  const btn=document.querySelector('.copy-btn');
+  btn.textContent='✅ Copied';setTimeout(()=>btn.textContent='📋 Copy',1500);
+}
+
+let phase='prefill';
+function sw(p){phase=p;document.getElementById('tabPrefill').className='phase-tab'+(p==='prefill'?' active':'');
+document.getElementById('tabDecode').className='phase-tab'+(p==='decode'?' active':'');calc();}
+
+['hB','tB','kB','cB','kvT','pKvT','parkT','gB'].forEach(id=>{
+  const e=document.getElementById(id);
+  e.addEventListener('input',()=>{
+    const m={hB:'hV',tB:'tV',kB:'kV',cB:'cV',kvT:'kVT',pKvT:'pKV',gB:'gV'};
+    const f={hB:v=>fmt(+v),tB:v=>fmt(+v),kB:v=>(v/2).toFixed(1),cB:v=>fmt(+v),kvT:v=>KT[+v],pKvT:v=>KDT[+v],gB:v=>fmt(+v)};
+    if(m[id])document.getElementById(m[id]).textContent=f[id](e.value);
+    calc();
+  });
+});
+calc();
+</script>
+</body>
+</html>

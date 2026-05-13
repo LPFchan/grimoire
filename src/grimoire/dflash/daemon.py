@@ -563,25 +563,30 @@ class PflashDaemon:
         )
         os.close(pw)
 
-        # Read stderr in a non-blocking way (check once per line)
-        stderr_lines: list[str] = []
+        # Persistent stderr drain thread — without it the daemon blocks
+        # on a full stderr pipe buffer during compress().
         import select
+        import threading as _threading
+        self._stderr_stop = _threading.Event()
+        self._stderr_lines: list[str] = []
 
-        # Wait for ready line (with timeout)
-        ready = False
-        for _ in range(120):
-            # Drain available stderr first
-            if self._proc.stderr:
-                r, _, _ = select.select([self._proc.stderr], [], [], 0)
-                while r:
+        def _drain_stderr():
+            while not self._stderr_stop.is_set():
+                r, _, _ = select.select([self._proc.stderr], [], [], 0.5)
+                if r:
                     line = self._proc.stderr.readline()
                     if not line:
                         break
                     decoded = line.decode(errors="replace").strip()
-                    stderr_lines.append(decoded)
-                    r, _, _ = select.select([self._proc.stderr], [], [], 0)
+                    self._stderr_lines.append(decoded)
+                    logger.warning(f"[pflash-daemon] {decoded}")
 
-            # Check stdout for "ready"
+        self._stderr_thread = _threading.Thread(target=_drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+        # Wait for ready line (with timeout)
+        ready = False
+        for _ in range(120):
             line = self._proc.stdout.readline()
             if not line:
                 break
@@ -593,20 +598,12 @@ class PflashDaemon:
 
         if not ready:
             # Log any stderr output captured before failure
-            for err in stderr_lines:
+            for err in self._stderr_lines:
                 if "error" in err.lower() or "fail" in err.lower() or "oom" in err.lower() \
                    or "cudamalloc" in err.lower() or "out of memory" in err.lower():
                     logger.error(f"[pflash-daemon] {err}")
                 else:
                     logger.warning(f"[pflash-daemon] {err}")
-            # Also try to read any remaining stderr
-            remaining = ""
-            try:
-                remaining = self._proc.stderr.read().decode(errors="replace")
-            except Exception:
-                pass
-            if remaining:
-                logger.error(f"[pflash-daemon] stderr: {remaining.strip()}")
             raise RuntimeError(f"pflash daemon failed to start (see logs for details)")
 
     def is_running(self) -> bool:
@@ -665,6 +662,10 @@ class PflashDaemon:
             except OSError:
                 pass
             self._pipe_r = None
+        if hasattr(self, '_stderr_stop') and self._stderr_stop is not None:
+            self._stderr_stop.set()
+        if hasattr(self, '_stderr_thread') and self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2)
         for path in self._temp_files:
             try:
                 os.unlink(path)

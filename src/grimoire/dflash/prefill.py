@@ -226,6 +226,8 @@ async def maybe_compress(
     t0 = time.monotonic()
     loop = asyncio.get_running_loop()
 
+    MAX_BLOCK = 14000  # keep under daemon MAX_S=16384
+
     compressed = []
     effective_blocks = []
     cursor = 0
@@ -234,14 +236,20 @@ async def maybe_compress(
         compressed_ids = raw_ids
         compressed_block = False
         if index in compressible_indexes:
-            compressed_ids = await loop.run_in_executor(
-                None,
-                lambda g=raw_ids: daemon.compress(
-                    g,
-                    drafter_path=config.drafter_path,
-                    keep_ratio=config.keep_ratio,
-                ),
-            )
+            # Chunk large blocks so daemon doesn't OOM
+            chunks = [raw_ids[i:i+MAX_BLOCK] for i in range(0, len(raw_ids), MAX_BLOCK)]
+            chunked = []
+            for ch in chunks:
+                c = await loop.run_in_executor(
+                    None,
+                    lambda g=ch: daemon.compress(
+                        g,
+                        drafter_path=config.drafter_path,
+                        keep_ratio=config.keep_ratio,
+                    ),
+                )
+                chunked.extend(c)
+            compressed_ids = chunked
             compressed_block = True
         compressed.extend(compressed_ids)
         effective_blocks.append(

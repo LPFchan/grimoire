@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import logging
 
 import httpx
 from fastapi.responses import StreamingResponse
@@ -12,6 +13,8 @@ from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
 from grimoire.prompt.generic import _prompt_layout_from_messages
 from grimoire.registry import BACKEND_DFLASH
+
+logger = logging.getLogger(__name__)
 
 
 def _backend_request_headers(headers):
@@ -56,6 +59,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     # exceeds the threshold, compress before proxying to llama-server.
     daemon = getattr(active, 'pflash_daemon', None)
     pcfg = getattr(active, 'prefill_config', None)
+    log = logging.getLogger(__name__)
+    log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
     if daemon and daemon.is_running() and pcfg and pcfg.enabled:
         try:
             tokenizer = active.get_tokenizer()
@@ -68,12 +73,14 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 compressed_ids, fired, blocks = await maybe_compress(
                     prompt_ids, daemon, pcfg, blocks=prompt_blocks,
                 )
+                log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
                     compressed_text = tokenizer.decode(compressed_ids)
+                    log.warning(f"pflash debug: compressed_text len={len(compressed_text)}")
                     payload["messages"] = [{"role": "user", "content": compressed_text}]
         except Exception as e:
-            logger = __import__('logging').getLogger(__name__)
-            logger.warning(f"PFlash compression failed for {active.name}: {e}")
+            _log = __import__('logging').getLogger(__name__)
+            _log.warning(f"PFlash compression failed for {active.name}: {e}")
 
     client = httpx.AsyncClient(timeout=None)
     try:

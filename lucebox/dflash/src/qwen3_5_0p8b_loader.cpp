@@ -28,7 +28,7 @@
 //     attn_norm.weight               [hidden]                  F32
 //     attn_qkv.weight                [hidden, key_dim*2+value_dim] Q8_0
 //     attn_gate.weight               [hidden, value_dim]       Q8_0 (z proj)
-//     ssm_conv1d.weight              [ssm_inner, conv_kernel]  F32
+//     ssm_conv1d.weight              [conv_channels, conv_kernel]  F32  (transposed from GGUF)
 //     ssm_alpha.weight               [hidden, n_v_heads]       F32
 //     ssm_beta.weight                [hidden, n_v_heads]       F32
 //     ssm_a                          [dt_rank]                 F32
@@ -194,6 +194,7 @@ bool load_qwen35_0p8b_drafter(const std::string & path,
     const int fai          = out.full_attn_interval;
     const int key_dim      = n_head * head_dim;
     const int value_dim    = ssm_inner;
+    const int conv_channels = ssm_inner + 2 * out.ssm_group_count * out.ssm_state_size;
     const int n_v_heads    = dt_rank;  // ssm_dt_rank = number of value heads
     const int head_v_dim   = ssm_inner / dt_rank;  // per-head value dimension
 
@@ -238,7 +239,10 @@ bool load_qwen35_0p8b_drafter(const std::string & path,
         } else {
             L.wqkv      = ggml_new_tensor_2d(out.ctx, GGML_TYPE_Q8_0, n_embd, key_dim * 2 + value_dim);
             L.wqkv_gate = ggml_new_tensor_2d(out.ctx, GGML_TYPE_Q8_0, n_embd, value_dim);
-            L.ssm_conv1d = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, ssm_inner, conv_kernel);
+            L.ssm_conv1d = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, conv_kernel, key_dim * 2 + value_dim);
+            // GGUF stores ssm_conv1d as [kernel=4, conv_channels] which matches
+            // ggml's ne[0]=kernel, ne[1]=channels. d_inner in ggml_ssm_conv
+            // assertion sx->ne[1] == d_inner checks against c->ne[1].
             L.ssm_alpha  = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_v_heads);
             L.ssm_beta   = ggml_new_tensor_2d(out.ctx, GGML_TYPE_F32, n_embd, n_v_heads);
             L.ssm_a      = ggml_new_tensor_1d(out.ctx, GGML_TYPE_F32, dt_rank);
