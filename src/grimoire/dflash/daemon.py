@@ -402,6 +402,28 @@ class DflashDaemon:
             raise ValueError(f"Invalid snapshot slot: {slot}")
         self._send(f"SNAPSHOT {slot} {pos}\n")
 
+    def save_snapshot(self, slot: int, path: str) -> None:
+        """Serialize a snapshot slot to disk, freeing the VRAM.
+
+        Args:
+            slot: Daemon slot ID (0-7)
+            path: Absolute disk path to write (e.g., /var/lib/grimoire/swap/slot-0.dfsn)
+        """
+        if slot < 0 or slot >= 8:
+            raise ValueError(f"Invalid snapshot slot: {slot}")
+        self._send(f"SAVE_SNAPSHOT {slot} {path}\n")
+
+    def load_snapshot(self, slot: int, path: str) -> None:
+        """Load a snapshot from disk into a slot (allocates VRAM).
+
+        Args:
+            slot: Daemon slot ID (0-7)
+            path: Absolute disk path to read (e.g., /var/lib/grimoire/swap/slot-0.dfsn)
+        """
+        if slot < 0 or slot >= 8:
+            raise ValueError(f"Invalid snapshot slot: {slot}")
+        self._send(f"LOAD_SNAPSHOT {slot} {path}\n")
+
 
 def _spawn_preexec():
     """Pre-exec function for daemon subprocess.
