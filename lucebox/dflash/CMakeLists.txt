@@ -236,8 +236,8 @@ endif()
 
 # PFlash phase-split harness
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/pflash_daemon.cpp")
-    add_executable(pflash_daemon test/pflash_daemon.cpp)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/pflash_daemon.cpp")
+    add_executable(pflash_daemon src/pflash_daemon.cpp)
     target_include_directories(pflash_daemon PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(pflash_daemon PRIVATE dflash27b ggml ggml-cuda)
 endif()
