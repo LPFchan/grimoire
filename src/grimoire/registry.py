@@ -328,12 +328,16 @@ class ModelRegistry:
             target = resolve_path(cfg, "target")
             if not target or not os.path.exists(target):
                 return False, f"Target model not found at {target}"
-            draft = resolve_path(cfg, "draft")
-            if not draft or not os.path.exists(draft):
-                return False, f"Draft model not found at {draft}"
-            drafter = resolve_path(cfg, "drafter")
-            if drafter and not os.path.exists(drafter):
-                return False, f"Drafter model not found at {drafter}"
+            use_dflash = cfg.get("dflash", True)
+            if use_dflash:
+                draft = resolve_path(cfg, "draft")
+                if not draft or not os.path.exists(draft):
+                    return False, f"Draft model not found at {draft}"
+            use_pflash = cfg.get("pflash", True)
+            if use_pflash:
+                drafter = resolve_path(cfg, "drafter")
+                if drafter and not os.path.exists(drafter):
+                    return False, f"Drafter model not found at {drafter}"
             tokenizer = cfg.get("tokenizer")
             if not tokenizer:
                 return False, (
