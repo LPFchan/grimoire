@@ -125,6 +125,13 @@ add_library(dflash27b STATIC
     src/laguna_target_graph.cpp
     src/laguna_daemon.cpp
     src/sampler.cpp
+    src/decode_cmds.cpp
+    src/decode_graph.cpp
+    src/decode_helpers.cpp
+    src/decode_target_split.cpp
+    src/decode_target.cpp
+    src/decode_dflash.cpp
+    src/decode_snapshot.cpp
 )
 # FlashPrefill custom CUDA kernels need BF16 WMMA (sm_80+). On Turing (sm_75)
 # the drafter uses ggml's flash_attn_ext instead. Guard added after SM check.
@@ -323,18 +330,24 @@ if(DFLASH27B_TESTS)
         target_include_directories(test_generate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_generate PRIVATE dflash27b ggml ggml-cuda)
     endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash.cpp")
-        add_executable(test_dflash test/test_dflash.cpp)
+    # dflash_entrypoint / test_dflash: the production daemon binary.
+    # Both point to the same source; dflash_entrypoint is the canonical name,
+    # test_dflash exists for backward compatibility with scripts / Dockerfiles.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/dflash_entrypoint.cpp")
+        add_executable(dflash_entrypoint test/dflash_entrypoint.cpp)
+        target_include_directories(dflash_entrypoint PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_link_libraries(dflash_entrypoint PRIVATE dflash27b ggml ggml-cuda)
+        add_executable(test_dflash test/dflash_entrypoint.cpp)
         target_include_directories(test_dflash PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         target_link_libraries(test_dflash PRIVATE dflash27b ggml ggml-cuda)
-        # test_dflash uses cudaMemcpyAsync / cudaMemcpy2DAsync directly for the
-        # --fast-rollback path (per-step SSM intermediate state commit). Needs
-        # the CUDA runtime on its own link line.
+        # Both use cudaMemcpyAsync / cudaMemcpy2DAsync for --fast-rollback.
         find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(dflash_entrypoint PRIVATE CUDA::cudart)
         target_link_libraries(test_dflash PRIVATE CUDA::cudart)
         # OpenMP for parallel CPU top-K extraction in the ddtree path.
         find_package(OpenMP)
         if(OpenMP_CXX_FOUND)
+            target_link_libraries(dflash_entrypoint PRIVATE OpenMP::OpenMP_CXX)
             target_link_libraries(test_dflash PRIVATE OpenMP::OpenMP_CXX)
         endif()
     endif()

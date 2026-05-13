@@ -28,6 +28,8 @@
 #include "sampler.h"        // shared CPU sampler chain (SamplerCfg /
                             // sample_logits / parse_sampler_token) used by
                             // both arches; behaviour stays identical.
+#include "decode_context.h"
+#include "decode_snapshot.h"
 
 #include "ggml.h"
 #include "gguf.h"  // gguf_init_from_file / gguf_find_key for arch detect
@@ -96,29 +98,7 @@ using namespace dflash27b;
 
 // ─── Small utilities ──────────────────────────────────────────────
 
-static std::vector<int32_t> read_int32_file(const std::string & path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) return {};
-    auto sz = (size_t)f.tellg();
-    f.seekg(0);
-    std::vector<int32_t> out(sz / sizeof(int32_t));
-    f.read((char *)out.data(), sz);
-    return out;
-}
-
-static bool write_int32_file(const std::string & path, const std::vector<int32_t> & v) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f) return false;
-    f.write((const char *)v.data(), v.size() * sizeof(int32_t));
-    return (bool)f;
-}
-
-static int argmax_f32(const float * x, int n) {
-    int best = 0;
-    float bv = x[0];
-    for (int i = 1; i < n; i++) if (x[i] > bv) { bv = x[i]; best = i; }
-    return best;
-}
+// Moved to src/decode_helpers.cpp
 
 // CPU sampler chain (SamplerCfg / sample_logits / parse_sampler_token) lives
 // in src/sampler.{h,cpp} and is shared with src/laguna_daemon.cpp. Behaviour
@@ -127,1878 +107,33 @@ static int argmax_f32(const float * x, int n) {
 // keep the accept rate intact; sample_logits only runs at committed-token
 // sites when ` samp=` was on the request line.
 
-// ggml_flash_attn_ext expects kv_len aligned to KQ_MASK_PAD (32) on the
-// f16/Q* paths, and to FATTN_KQ_STRIDE (256) on the TurboQuant FA paths.
-// The global `g_kq_stride_pad` below is set at init time and applied by
-// both build_causal_mask and build_tree_mask so the mask dim matches the
-// K/V view length used in build_attn_block.
+// Global variables g_kq_stride_pad, g_max_ctx_override, g_fa_window,
+// g_draft_swa_window, g_draft_ctx_max are defined in src/decode_helpers.cpp
+// and declared extern in decode_context.h (which is included above).
+// Static/constexpr items below have internal linkage so they can coexist
+// with the library copies.
 static constexpr int KQ_MASK_PAD = 32;
-static int g_kq_stride_pad = KQ_MASK_PAD;   // overridden to 256 when TBQ KV is active
-static int g_max_ctx_override = 0;           // overridden by --max-ctx=N (default 4096)
-static int g_fa_window       = 2048;         // overridden by DFLASH27B_FA_WINDOW=N
-static int g_draft_swa_window = 0;           // draft SWA window (0 = disabled); --draft-swa=N
-static int g_draft_ctx_max   = 4096;        // draft context cap; --draft-ctx-max=N
 static int align_up(int x, int a) { return ((x + a - 1) / a) * a; }
-
-// F16 encoding for the two values we use: 0 and -inf.
-// 0 in F16 is 0x0000. -inf is 0xFC00.
 static constexpr uint16_t F16_ZERO = 0x0000;
 static constexpr uint16_t F16_NEG_INF = 0xFC00;
 
-static void build_causal_mask(std::vector<uint16_t> & out,
-                              int kv_len, int n_tokens, int kv_start,
-                              int win_start = 0) {
-    const int kv_pad = align_up(kv_len, g_kq_stride_pad);
-    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-    out.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
-    const int abs_end = win_start + kv_len;
-    for (int q = 0; q < n_tokens; q++) {
-        const int abs_q = kv_start + q;
-        const int min_k = std::max(0, win_start);
-        const int max_k = abs_q;
-        for (int k = min_k; k <= max_k && k < abs_end; k++) {
-            out[(size_t)q * kv_pad + (k - win_start)] = F16_ZERO;
-        }
-    }
-}
-
-// ─── DDTree support (ported from liranringel/ddtree/ddtree.py) ────────
-
-// Per-position top-K softmax extraction. Computes log-probabilities (needed
-// so that cross-depth prefix comparisons in the best-first heap are valid)
-// via a single pass over the vocab that also maintains top-K in a heap and
-// computes logsumexp online. Runs on CPU since draft logits are already on
-// host after ggml_backend_tensor_get.
-//
-// Input:  logits [n_positions × vocab] f32
-// Output: out_log_probs [n_positions × K] f32, out_token_ids [n_positions × K] i32
-//         both sorted by log-probability DESCENDING (rank 0 = argmax).
-static void extract_draft_topk(const float * logits,
-                               int n_positions, int vocab, int K,
-                               float * out_log_probs,
-                               int32_t * out_token_ids,
-                               float temperature = 1.0f) {
-    struct Entry { float logit; int32_t id; };
-    auto cmp_greater = [](const Entry & a, const Entry & b) {
-        return a.logit > b.logit;
-    };
-
-    // Temperature scaling: dividing logits by T<1 sharpens the softmax,
-    // widening the gap between top-1 and lower ranks. This compensates for
-    // Q4_K_M quantization that flattens the draft's softmax — without it,
-    // pure best-first picks shallow bushy trees instead of going deep.
-    const float inv_t = 1.0f / std::max(1e-3f, temperature);
-
-    // Parallelize across positions — each i is independent.
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n_positions; i++) {
-        const float * li = logits + (size_t)i * vocab;
-        std::vector<Entry> heap;
-        heap.reserve(K);
-
-        // Online log-sum-exp with running max. Single pass over the vocab,
-        // simultaneously maintaining top-K.
-        float running_max     = -INFINITY;
-        float running_sum_exp = 0.0f;
-        for (int j = 0; j < vocab; j++) {
-            const float l = li[j] * inv_t;
-
-            // Online logsumexp
-            if (l > running_max) {
-                // rescale previous sum to the new max
-                if (running_max > -INFINITY) {
-                    running_sum_exp = running_sum_exp * std::exp(running_max - l);
-                }
-                running_sum_exp += 1.0f;
-                running_max = l;
-            } else {
-                running_sum_exp += std::exp(l - running_max);
-            }
-
-            // Top-K maintenance
-            if ((int)heap.size() < K) {
-                heap.push_back({l, (int32_t)j});
-                std::push_heap(heap.begin(), heap.end(), cmp_greater);
-            } else if (l > heap.front().logit) {
-                std::pop_heap(heap.begin(), heap.end(), cmp_greater);
-                heap.back() = {l, (int32_t)j};
-                std::push_heap(heap.begin(), heap.end(), cmp_greater);
-            }
-        }
-        const float log_z = running_max + std::log(running_sum_exp);
-
-        // Sort the K entries descending (largest logit first) and emit.
-        // sort_heap with cmp_greater on a min-heap already produces descending
-        // order (cppreference: "sort_heap leaves the range sorted in the same
-        // order as sort would with the same comparator" — greater→descending).
-        std::sort_heap(heap.begin(), heap.end(), cmp_greater);
-        for (int k = 0; k < K; k++) {
-            out_log_probs[(size_t)i * K + k] = heap[k].logit - log_z;
-            out_token_ids[(size_t)i * K + k] = heap[k].id;
-        }
-    }
-}
-
-// A flat DFS-ordered tree built from the draft's top-K softmax distributions.
-// Slot 0 is the tree root (the bonus token from the previous spec round);
-// slots 1..n_nodes are the DFS-ordered tree nodes. `parents[i]` gives each
-// node's parent index in the same flat array (parents[0] = -1). `depth[i]`
-// is the absolute depth within the block-diffusion prediction window, with
-// the root at depth 0 and its children at depth 1. `child_maps[i]` maps a
-// token_id to the child's flat index, used for the tree walk post-verify.
-// `visibility[i][j]` (ancestor-only mask) is true iff j is an ancestor of i
-// in the tree (including j == i); used to build the attention mask.
-struct DDTree {
-    int                         n_nodes = 0;          // excludes root
-    std::vector<int32_t>        token_ids;            // size n_nodes
-    std::vector<int>            depths;               // size n_nodes (1..L)
-    std::vector<int>            parents;              // size n_nodes + 1
-    std::vector<std::unordered_map<int32_t, int>> child_maps;  // size n_nodes + 1
-    std::vector<uint8_t>        visibility;           // (1 + n_nodes)^2 row-major
-};
-
-// Port of build_ddtree_tree() from ddtree.py. Runs a best-first heap over
-// prefixes of the per-position top-K distributions, pops until `budget`
-// nodes are accumulated. Populates the flat DFS-ordered tree structure.
-//
-// top_log_probs: [L × K]  the drafter's per-position top-K log-probabilities
-// top_token_ids: [L × K]  matching token ids, rank 0 = argmax per position
-// L:             max tree depth (e.g. q_len - 1 for a block diffusion block)
-// K:             top-K per position (same as used in extract_draft_topk)
-// budget:        maximum number of non-root tree nodes
-static DDTree build_ddtree(const float * top_log_probs,
-                           const int32_t * top_token_ids,
-                           int L, int K, int budget,
-                           bool chain_seed = true) {
-    DDTree tree;
-    if (budget <= 0 || L <= 0) {
-        tree.parents.push_back(-1);
-        tree.child_maps.emplace_back();
-        tree.visibility.assign(1, 1);
-        return tree;
-    }
-
-    // Heap entry:
-    //   neg_logw, ranks (encoded as a small vector), parent_index, depth, rank, logw
-    // We sort by neg_logw ASCENDING, which is equivalent to logw DESCENDING.
-    struct HeapEntry {
-        float                neg_logw;
-        std::vector<int>     ranks;        // rank tuple used only to prevent duplicate state; not strictly needed
-        int                  parent_index; // index in the flat tree of this candidate's parent
-        int                  depth;        // 1..L
-        int                  rank;         // rank within top-K at depth-1 (0-indexed)
-        float                logw;         // actual log-prob sum so far
-    };
-    struct HeapCmp {
-        bool operator()(const HeapEntry & a, const HeapEntry & b) const {
-            // std::priority_queue is a max-heap; we want SMALLEST neg_logw at the top
-            // so that we pop the highest-probability prefix first.
-            return a.neg_logw > b.neg_logw;
-        }
-    };
-    std::priority_queue<HeapEntry, std::vector<HeapEntry>, HeapCmp> heap;
-
-    tree.token_ids.reserve(budget);
-    tree.depths.reserve(budget);
-    tree.parents.reserve(budget + 1);
-    tree.parents.push_back(-1);                 // root
-    tree.child_maps.emplace_back();             // root's children
-
-    // Two seeding strategies:
-    //   - chain_seed=true: pre-seed full top-1 chain (defensive, guarantees
-    //     AL >= chain mode even with flat-softmax draft like Q4_K_M). Compensates
-    //     for quantization that shrinks top-1/top-2 logp gap.
-    //   - chain_seed=false: paper's pure best-first — heap starts with just
-    //     the depth-1 top-1 child of the root. Tree shape emerges from log-prob
-    //     ordering. Works only when the draft top-1 is dominant enough.
-    if (chain_seed) {
-        const int chain_depth = std::min(L, budget);
-        float cum_logw = 0.0f;
-        int   prev_idx = 0;
-        for (int d = 1; d <= chain_depth; d++) {
-            const int32_t tok_id = top_token_ids[(size_t)(d - 1) * K + 0];
-            cum_logw += top_log_probs[(size_t)(d - 1) * K + 0];
-
-            const int cur_idx = tree.n_nodes + 1;
-            tree.token_ids.push_back(tok_id);
-            tree.depths.push_back(d);
-            tree.parents.push_back(prev_idx);
-            tree.child_maps.emplace_back();
-            tree.child_maps[prev_idx][tok_id] = cur_idx;
-            tree.n_nodes++;
-
-            if (K > 1) {
-                const float sibling_logw = cum_logw
-                    - top_log_probs[(size_t)(d - 1) * K + 0]
-                    + top_log_probs[(size_t)(d - 1) * K + 1];
-                heap.push({
-                    /*neg_logw*/ -sibling_logw,
-                    /*ranks   */ {1},
-                    /*parent  */ prev_idx,
-                    /*depth   */ d,
-                    /*rank    */ 1,
-                    /*logw    */ sibling_logw,
-                });
-            }
-            prev_idx = cur_idx;
-        }
-    } else {
-        // Paper-style pure best-first: seed heap with depth-1 top-1 only.
-        const float root_logw = top_log_probs[0 * K + 0];
-        heap.push({
-            /*neg_logw*/ -root_logw,
-            /*ranks   */ {0},
-            /*parent  */ 0,  // root flat index
-            /*depth   */ 1,
-            /*rank    */ 0,
-            /*logw    */ root_logw,
-        });
-    }
-
-    while (!heap.empty() && tree.n_nodes < budget) {
-        HeapEntry top = heap.top();
-        heap.pop();
-
-        const int    depth_minus_1 = top.depth - 1;
-        const int    rank          = top.rank;
-        const int32_t token_id     = top_token_ids[(size_t)depth_minus_1 * K + rank];
-
-        const int current_index = tree.n_nodes + 1;  // slot in flat tree
-        tree.token_ids.push_back(token_id);
-        tree.depths.push_back(top.depth);
-        tree.parents.push_back(top.parent_index);
-        tree.child_maps.emplace_back();
-        tree.child_maps[top.parent_index][token_id] = current_index;
-        tree.n_nodes++;
-
-        // Push next sibling (same depth, next-best rank at this depth).
-        if (rank + 1 < K) {
-            const float sibling_logw = top.logw
-                - top_log_probs[(size_t)depth_minus_1 * K + rank]
-                + top_log_probs[(size_t)depth_minus_1 * K + rank + 1];
-            std::vector<int> sibling_ranks = top.ranks;
-            sibling_ranks.back() = rank + 1;
-            heap.push({
-                /*neg_logw*/ -sibling_logw,
-                /*ranks   */ std::move(sibling_ranks),
-                /*parent  */ top.parent_index,
-                /*depth   */ top.depth,
-                /*rank    */ rank + 1,
-                /*logw    */ sibling_logw,
-            });
-        }
-
-        // Push first child (next depth, top-1 rank under this node).
-        if (top.depth < L) {
-            const float child_logw = top.logw
-                + top_log_probs[(size_t)top.depth /*new depth_minus_1*/ * K + 0];
-            std::vector<int> child_ranks = top.ranks;
-            child_ranks.push_back(0);
-            heap.push({
-                /*neg_logw*/ -child_logw,
-                /*ranks   */ std::move(child_ranks),
-                /*parent  */ current_index,
-                /*depth   */ top.depth + 1,
-                /*rank    */ 0,
-                /*logw    */ child_logw,
-            });
-        }
-    }
-
-    // Build ancestor-only visibility mask (flat row-major, (1+n)^2).
-    const int N = 1 + tree.n_nodes;
-    tree.visibility.assign((size_t)N * N, 0);
-    tree.visibility[0 * N + 0] = 1;  // root sees itself
-    for (int i = 1; i < N; i++) {
-        const int p = tree.parents[i];  // immediate parent
-        // Inherit the parent's visibility row up to column i-1,
-        // then mark self at column i.
-        for (int j = 0; j < i; j++) {
-            tree.visibility[(size_t)i * N + j] = tree.visibility[(size_t)p * N + j];
-        }
-        tree.visibility[(size_t)i * N + i] = 1;
-    }
-
-    return tree;
-}
-
-// Walk the verified tree following the target's argmax (posterior) at each
-// node. Returns the list of flat-tree indices that make up the accepted path
-// (starting at root), plus the next "bonus" token (target's argmax at the
-// deepest accepted node, which didn't match any of that node's children).
-static std::vector<int> follow_verified_tree(const DDTree & tree,
-                                             const int32_t * posterior,
-                                             int & out_next_token,
-                                             int * out_node_idx = nullptr) {
-    std::vector<int> accepted;
-    accepted.reserve(tree.n_nodes + 1);
-    accepted.push_back(0);
-
-    int current_index = 0;
-    int next_token    = posterior[current_index];
-    while (true) {
-        const auto & children = tree.child_maps[current_index];
-        auto it = children.find(next_token);
-        if (it == children.end()) break;
-        current_index = it->second;
-        accepted.push_back(current_index);
-        next_token = posterior[current_index];
-    }
-    out_next_token = next_token;
-    if (out_node_idx) *out_node_idx = current_index;
-    return accepted;
-}
-
-// Build an f16 ancestor-only attention mask for tree verify:
-//   mask[q=i][k<past_length]          = 0    (past KV cache, attend freely)
-//   mask[q=i][k=past_length+j]        = 0 iff j is an ancestor of i in the tree
-//                                              (including j == i)
-//                                     = -inf otherwise
-// Shape matches the ggml flash_attn_ext expectation: [kv_pad, q_pad] f16.
-static void build_tree_mask(const DDTree & tree, int past_length,
-                            std::vector<uint16_t> & out_mask,
-                            int win_start = 0) {
-    const int N      = 1 + tree.n_nodes;
-    const int win_len = past_length + N - win_start;
-    const int kv_pad = align_up(win_len, g_kq_stride_pad);
-    const int q_pad  = align_up(N,      KQ_MASK_PAD);
-    out_mask.assign((size_t)kv_pad * q_pad, F16_NEG_INF);
-    for (int q = 0; q < N; q++) {
-        for (int k = std::max(0, win_start); k < past_length; k++) {
-            out_mask[(size_t)q * kv_pad + (k - win_start)] = F16_ZERO;
-        }
-        for (int j = 0; j < N; j++) {
-            if (tree.visibility[(size_t)q * N + j]) {
-                out_mask[(size_t)q * kv_pad + (past_length + j - win_start)] = F16_ZERO;
-            }
-        }
-    }
-}
-
-// ─── StepGraph — rebuilt per call since kv_len varies ──
-
-struct StepGraph {
-    ggml_context *  ctx = nullptr;
-    ggml_cgraph *   gf  = nullptr;
-    ggml_gallocr_t  alloc = nullptr;
-
-    // Named inputs (look up via ggml_get_tensor by name)
-    ggml_tensor *   inp_embed = nullptr;
-    ggml_tensor *   positions = nullptr;
-    ggml_tensor *   attn_mask = nullptr;     // may be null
-    ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
-    ggml_tensor *   target_hidden_cat = nullptr;  // draft only
-    ggml_tensor *   positions_k = nullptr;        // draft only
-    ggml_tensor *   hidden_input = nullptr;        // lm-head projection only
-
-    // Output
-    ggml_tensor *   logits = nullptr;
-    ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
-    ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
-    ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
-
-    // Per-delta-net-layer captures (verify only). One entry per delta-net layer.
-    // Each entry's tensors are graph views on the gated_delta_net result:
-    //   ssm_intermediate_states: [S_v, S_v, H_v, n_tokens]  (f32, ~50 MB/layer for n_tokens=16)
-    //   conv_input:              [kernel-1+n_tokens, conv_channels, 1]
-    // Marked as graph outputs so their data is valid after ggml_backend_graph_compute.
-    std::vector<DeltaNetCapture> delta_captures;
-};
-
-struct DraftFeatureMirror {
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * target_feat = nullptr; // F32 [5*hidden, cap]
-    void * bf16_staging = nullptr;
-    size_t bf16_staging_elems = 0;
-    int device = 0;
-    int target_device = 0;
-    int cap = 0;
-};
-
-static bool enable_peer_access_one_way(int device, int peer) {
-    if (device == peer) return true;
-    int can_access = 0;
-    cudaError_t err = cudaDeviceCanAccessPeer(&can_access, device, peer);
-    if (err != cudaSuccess || !can_access) return false;
-    err = cudaSetDevice(device);
-    if (err != cudaSuccess) return false;
-    err = cudaDeviceEnablePeerAccess(peer, 0);
-    if (err == cudaErrorPeerAccessAlreadyEnabled) {
-        cudaGetLastError();
-        return true;
-    }
-    return err == cudaSuccess;
-}
-
-static bool enable_peer_access_pair(int a, int b) {
-    if (a == b) return true;
-    const bool ab = enable_peer_access_one_way(a, b);
-    const bool ba = enable_peer_access_one_way(b, a);
-    return ab && ba;
-}
-
-static bool copy_peer_async(void * dst, int dst_device,
-                            const void * src, int src_device,
-                            size_t bytes,
-                            cudaStream_t stream = nullptr) {
-    if (bytes == 0) return true;
-    cudaError_t err = cudaSuccess;
-    if (dst_device == src_device) {
-        err = cudaSetDevice(dst_device);
-        if (err != cudaSuccess) return false;
-        err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
-    } else {
-        err = cudaSetDevice(dst_device);
-        if (err != cudaSuccess) return false;
-        err = cudaMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, stream);
-    }
-    return err == cudaSuccess;
-}
-
-static bool ensure_bf16_staging(DraftFeatureMirror & mirror, size_t elems) {
-    if (elems <= mirror.bf16_staging_elems) return true;
-    cudaError_t err = cudaSetDevice(mirror.device);
-    if (err != cudaSuccess) return false;
-    if (mirror.bf16_staging) {
-        cudaFree(mirror.bf16_staging);
-        mirror.bf16_staging = nullptr;
-        mirror.bf16_staging_elems = 0;
-    }
-    err = cudaMalloc(&mirror.bf16_staging, elems * sizeof(uint16_t));
-    if (err != cudaSuccess) return false;
-    mirror.bf16_staging_elems = elems;
-    return true;
-}
-
-static void draft_feature_mirror_free(DraftFeatureMirror & mirror) {
-    if (mirror.bf16_staging) {
-        cudaSetDevice(mirror.device);
-        cudaFree(mirror.bf16_staging);
-        mirror.bf16_staging = nullptr;
-        mirror.bf16_staging_elems = 0;
-    }
-    if (mirror.buf) {
-        ggml_backend_buffer_free(mirror.buf);
-        mirror.buf = nullptr;
-    }
-    if (mirror.ctx) {
-        ggml_free(mirror.ctx);
-        mirror.ctx = nullptr;
-    }
-    mirror.target_feat = nullptr;
-    mirror.device = 0;
-    mirror.target_device = 0;
-    mirror.cap = 0;
-}
-
-static bool draft_feature_mirror_init(DraftFeatureMirror & mirror,
-                                      ggml_backend_t backend,
-                                      int device,
-                                      int target_device,
-                                      int cap) {
-    draft_feature_mirror_free(mirror);
-    if (cap <= 0) return false;
-    mirror.device = device;
-    mirror.target_device = target_device;
-
-    ggml_init_params ip{};
-    ip.mem_size = ggml_tensor_overhead() * 4 + 16 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc = true;
-    mirror.ctx = ggml_init(ip);
-    if (!mirror.ctx) return false;
-
-    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
-    mirror.target_feat = ggml_new_tensor_2d(mirror.ctx, GGML_TYPE_F32, fc_in, cap);
-    ggml_set_name(mirror.target_feat, "draft_target_feat_mirror");
-    mirror.buf = ggml_backend_alloc_ctx_tensors(mirror.ctx, backend);
-    if (!mirror.buf) {
-        draft_feature_mirror_free(mirror);
-        return false;
-    }
-    const size_t bytes = (size_t)fc_in * (size_t)cap * sizeof(float);
-    cudaSetDevice(device);
-    cudaError_t err = cudaMemset(mirror.target_feat->data, 0, bytes);
-    if (err != cudaSuccess) {
-        draft_feature_mirror_free(mirror);
-        return false;
-    }
-    mirror.cap = cap;
-    return true;
-}
-
-static bool draft_feature_mirror_can_view(const DraftFeatureMirror & mirror,
-                                          int committed,
-                                          int ctx_len,
-                                          int & slot0) {
-    if (!mirror.target_feat || mirror.cap <= 0) return false;
-    if (ctx_len <= 0 || ctx_len > mirror.cap || committed < ctx_len) return false;
-    const int start = committed - ctx_len;
-    slot0 = start % mirror.cap;
-    return slot0 + ctx_len <= mirror.cap;
-}
-
-static bool draft_feature_mirror_sync_range(const TargetCache & cache,
-                                            const DraftFeatureMirror & mirror,
-                                            int start_pos,
-                                            int n_tokens) {
-    if (!cache.target_feat || !mirror.target_feat || mirror.cap <= 0) return false;
-    if (n_tokens <= 0) return true;
-    if (n_tokens > mirror.cap) return false;
-
-    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
-    const int src_cap = cache.target_feat_cap;
-    const size_t src_stride = cache.target_feat->nb[1];
-    const size_t dst_stride = mirror.target_feat->nb[1];
-
-    int done = 0;
-    while (done < n_tokens) {
-        const int src_slot = (start_pos + done) % src_cap;
-        const int dst_slot = (start_pos + done) % mirror.cap;
-        const int src_run = src_cap - src_slot;
-        const int dst_run = mirror.cap - dst_slot;
-        const int run = std::min(n_tokens - done, std::min(src_run, dst_run));
-        const size_t elems = (size_t)run * (size_t)fc_in;
-        const void * src =
-            (const char *)cache.target_feat->data + (size_t)src_slot * src_stride;
-        void * dst =
-            (char *)mirror.target_feat->data + (size_t)dst_slot * dst_stride;
-        auto bf16_to_f32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        if (mirror.device == mirror.target_device) {
-            cudaSetDevice(mirror.device);
-            bf16_to_f32(src, (float *)dst, (int64_t)elems, nullptr);
-        } else {
-            DraftFeatureMirror & mutable_mirror =
-                const_cast<DraftFeatureMirror &>(mirror);
-            if (!ensure_bf16_staging(mutable_mirror, elems)) return false;
-            if (!copy_peer_async(mirror.bf16_staging, mirror.device,
-                                 src, mirror.target_device,
-                                 elems * sizeof(uint16_t))) {
-                return false;
-            }
-            cudaSetDevice(mirror.device);
-            bf16_to_f32(mirror.bf16_staging, (float *)dst, (int64_t)elems, nullptr);
-        }
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) return false;
-        done += run;
-    }
-    return cudaDeviceSynchronize() == cudaSuccess;
-}
-
-static bool draft_feature_mirror_sync_tail(const TargetCache & cache,
-                                           const DraftFeatureMirror & mirror,
-                                           int committed) {
-    if (!mirror.target_feat || committed <= 0) return true;
-    const int n = std::min(committed, mirror.cap);
-    return draft_feature_mirror_sync_range(cache, mirror, committed - n, n);
-}
-
-// Reset the per-call graph state (ctx + graph + tensor handles) but KEEP the
-// persistent CUDA buffer in `sg.alloc` alive across steps. When the next
-// build_*_step re-walks ggml_gallocr_alloc_graph on the same (or smaller)
-// peak shape, gallocr reuses the existing CUDA buffer instead of doing a
-// fresh cudaMalloc/cudaFree of multi-GB at every step. That's the single
-// biggest per-step cost at long context — see the [timing] breakdown:
-// draft_compute 21ms and verify_compute 61ms both include the alloc cycle
-// inside ggml_backend_graph_compute when the buffer is fresh.
-static void step_graph_free(StepGraph & sg) {
-    if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
-    sg.gf = nullptr;
-    sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
-    sg.target_hidden_cat = sg.positions_k = nullptr;
-    sg.hidden_input = nullptr;
-    sg.parent_ids = nullptr;
-    sg.logits = nullptr;
-    sg.hidden_states = nullptr;
-    sg.argmax_tokens = nullptr;
-    sg.topk_indices = nullptr;
-    sg.delta_captures.clear();
-}
-
-// Called at shutdown only. Releases the persistent gallocr + its CUDA
-// backing buffer in addition to what step_graph_free already does.
-static void step_graph_destroy(StepGraph & sg) {
-    if (sg.alloc) { ggml_gallocr_free(sg.alloc); sg.alloc = nullptr; }
-    step_graph_free(sg);
-}
-
-// Build a single-layer forward graph for layer-segmented prefill.
-// Processes n_tokens tokens through one layer, reading from act_in and
-// writing to act_out. Returns false on failure.
-static bool build_layer_step(
-    StepGraph & sg,
-    const TargetWeights & w,
-    TargetCache & cache,
-    ggml_backend_t backend,
-    int layer_idx,
-    ggml_tensor * act_in,      // [hidden, prompt_len] full activation buffer
-    ggml_tensor * act_out,     // [hidden, prompt_len] full activation buffer
-    int chunk_start,           // token offset into activation buffers
-    int n_tokens,
-    int kv_start,
-    bool with_mask,
-    bool capture,
-    int fa_window = 0)
-{
-    step_graph_free(sg);
-
-    const bool is_attn = (((layer_idx + 1) % w.full_attention_interval) == 0);
-
-    ggml_init_params ip{};
-    ip.mem_size   = 512 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
-
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-
-    sg.inp_embed = ggml_view_2d(sg.ctx, act_in,
-        hidden, n_tokens,
-        act_in->nb[1], (size_t)chunk_start * act_in->nb[1]);
-    ggml_set_name(sg.inp_embed, "inp_embed");
-    ggml_set_input(sg.inp_embed);
-
-    if (is_attn) {
-        sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
-        ggml_set_name(sg.positions, "positions");
-        ggml_set_input(sg.positions);
-
-        if (with_mask) {
-            const int win_start_l = (fa_window > 0 && kv_start > fa_window)
-                                        ? (kv_start - fa_window) : 0;
-            const int win_len_l = kv_start + n_tokens - win_start_l;
-            const int kv_pad = align_up(win_len_l, g_kq_stride_pad);
-            const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-            sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-            ggml_set_name(sg.attn_mask, "attn_mask");
-            ggml_set_input(sg.attn_mask);
-        }
-    }
-
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
-
-    ggml_tensor * layer_out = dflash27b::build_qwen35_layer(
-        sg.ctx, sg.gf, w, cache, layer_idx,
-        sg.inp_embed, sg.positions, sg.attn_mask,
-        kv_start, n_tokens, capture, fa_window);
-    if (!layer_out) return false;
-
-    ggml_tensor * out_view = ggml_view_2d(sg.ctx, act_out,
-        hidden, n_tokens,
-        act_out->nb[1], (size_t)chunk_start * act_out->nb[1]);
-    ggml_build_forward_expand(sg.gf, ggml_cpy(sg.ctx, layer_out, out_view));
-
-    if (!sg.alloc) {
-        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
-}
-
-// Forward declaration used only by the tree-mode build_target_step_tree.
-struct DDTree;  // full def above
-
-// Build a target verify graph configured for a DDTree-flattened tree block.
-// Key differences vs build_target_step:
-//   - n_tokens = 1 + tree.n_nodes (root + flat tree nodes)
-//   - with_mask is always true; the caller fills a custom ancestor-only mask
-//     rather than the usual causal strip
-//   - A parent_ids[n_tokens] i32 input is added and wired into the delta-net
-//     kernel so recurrent state is reloaded at DFS branch transitions
-//   - capture_layers and capture_delta_intermediate are always on (the spec
-//     loop uses per-step SSM states for rollback and target_feat for the
-//     next iter's draft)
-static bool build_target_step_tree(
-    StepGraph & sg,
-    const TargetWeights & w,
-    TargetCache & cache,
-    ggml_backend_t backend,
-    int kv_start,
-    int n_tokens,
-    int fa_window = 0);   // implemented below after the regular build_target_step
-
-static bool build_target_step(
-    StepGraph & sg,
-    const TargetWeights & w,
-    TargetCache & cache,
-    ggml_backend_t backend,
-    int kv_start,
-    int n_tokens,
-    bool with_mask,
-    bool capture,
-    bool capture_delta_intermediate = false,
-    int fa_window = 0,
-    bool last_token_logits_only = false) {
-    step_graph_free(sg);
-
-    ggml_init_params ip{};
-    // ctx arena holds tensor *descriptors* only (no_alloc = true), so size
-    // just needs to cover the struct count. 512 MB is plenty for the target
-    // graph even with capture_delta_intermediate enabled (the 48 extra delta
-    // captures add ~48 descriptors, nothing).
-    ip.mem_size   = 512 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
-
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
-    ggml_set_name(sg.inp_embed, "inp_embed");
-    ggml_set_input(sg.inp_embed);
-
-    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
-    ggml_set_name(sg.positions, "positions");
-    ggml_set_input(sg.positions);
-
-    if (with_mask) {
-        const int win_start = (fa_window > 0 && kv_start > fa_window) ? (kv_start - fa_window) : 0;
-        const int win_len = kv_start + n_tokens - win_start;
-        const int kv_pad = align_up(win_len, g_kq_stride_pad);
-        const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-        sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-        ggml_set_name(sg.attn_mask, "attn_mask");
-        ggml_set_input(sg.attn_mask);
-    }
-
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
-
-    QwenGraphInputs gi{};
-    gi.inp_embed                  = sg.inp_embed;
-    gi.positions                  = sg.positions;
-    gi.attn_mask                  = sg.attn_mask;
-    gi.n_tokens                   = n_tokens;
-    gi.kv_start                   = kv_start;
-    gi.capture_layers             = capture;
-    gi.capture_delta_intermediate = capture_delta_intermediate;
-    gi.fa_window                  = fa_window;
-    gi.last_token_logits_only     = last_token_logits_only;
-
-    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
-    if (!go.logits) return false;
-    sg.logits = go.logits;
-    sg.delta_captures = std::move(go.delta_captures);
-    ggml_set_output(sg.logits);
-
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "chain_verify_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
-
-    if (!sg.alloc) {
-        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
-}
-
-// DDTree tree-verify graph builder. Same shape as build_target_step except:
-//   - n_tokens is the flat tree size (1 + tree.n_nodes)
-//   - attn_mask is caller-filled (ancestor-only); we build the tensor here
-//     but the values come from build_tree_mask() before compute
-//   - A fresh parent_ids[n_tokens] i32 input tensor is added and wired into
-//     QwenGraphInputs so build_delta_net_block can call ggml_gated_delta_net_tree
-//   - capture_layers=true, capture_delta_intermediate=true (spec loop relies
-//     on per-step intermediates for rollback)
-static bool build_target_step_tree(
-    StepGraph & sg,
-    const TargetWeights & w,
-    TargetCache & cache,
-    ggml_backend_t backend,
-    int kv_start,
-    int n_tokens,
-    int fa_window) {
-    step_graph_free(sg);
-
-    ggml_init_params ip{};
-    ip.mem_size   = 512 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
-
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
-    ggml_set_name(sg.inp_embed, "inp_embed");
-    ggml_set_input(sg.inp_embed);
-
-    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 4 * n_tokens);
-    ggml_set_name(sg.positions, "positions");
-    ggml_set_input(sg.positions);
-
-    // Use max possible mask size so gallocr shape stays fixed across steps.
-    // Actual valid region is filled before compute; unused area is -inf.
-    const int max_win_len = cache.max_ctx + n_tokens;
-    const int kv_pad = align_up(max_win_len, g_kq_stride_pad);
-    const int q_pad  = align_up(n_tokens, KQ_MASK_PAD);
-    sg.attn_mask = ggml_new_tensor_2d(sg.ctx, GGML_TYPE_F16, kv_pad, q_pad);
-    ggml_set_name(sg.attn_mask, "attn_mask");
-    ggml_set_input(sg.attn_mask);
-
-    sg.parent_ids = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, n_tokens);
-    ggml_set_name(sg.parent_ids, "parent_ids");
-    ggml_set_input(sg.parent_ids);
-
-    sg.gf = ggml_new_graph_custom(sg.ctx, 16384, false);
-
-    QwenGraphInputs gi{};
-    gi.inp_embed                  = sg.inp_embed;
-    gi.positions                  = sg.positions;
-    gi.attn_mask                  = sg.attn_mask;
-    gi.n_tokens                   = n_tokens;
-    gi.kv_start                   = kv_start;
-    gi.fa_window                  = fa_window;
-    gi.capture_layers             = true;
-    gi.capture_delta_intermediate = true;
-    gi.parent_ids                 = sg.parent_ids;
-
-    QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
-    if (!go.logits) return false;
-    sg.logits = go.logits;
-    sg.delta_captures = std::move(go.delta_captures);
-    ggml_set_output(sg.logits);
-
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "tree_verify_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
-
-    if (!sg.alloc) {
-        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
-}
-
-static bool build_draft_step(
-    StepGraph & sg,
-    const DraftWeights & dw,
-    const TargetWeights * tw,   // optional target lm_head
-    ggml_backend_t backend,
-    int ctx_len,
-    const DraftFeatureMirror * mirror = nullptr,
-    int committed = 0) {
-    step_graph_free(sg);
-
-    ggml_init_params ip{};
-    ip.mem_size   = 256 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
-
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int q_len  = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int fc_in  = DFLASH27B_DRAFT_N_TARGET_LAYERS * hidden;
-
-    sg.inp_embed = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, q_len, 1);
-    ggml_set_name(sg.inp_embed, "inp_embed");
-    ggml_set_input(sg.inp_embed);
-
-    int mirror_slot0 = 0;
-    if (mirror && draft_feature_mirror_can_view(*mirror, committed, ctx_len, mirror_slot0)) {
-        const size_t stride = mirror->target_feat->nb[1];
-        sg.target_hidden_cat = ggml_view_3d(
-            sg.ctx,
-            mirror->target_feat,
-            fc_in, ctx_len, 1,
-            stride,
-            stride * (size_t)ctx_len,
-            (size_t)mirror_slot0 * stride);
-    } else {
-        sg.target_hidden_cat = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, fc_in, ctx_len, 1);
-        ggml_set_input(sg.target_hidden_cat);
-    }
-    ggml_set_name(sg.target_hidden_cat, "target_hidden_cat");
-
-    sg.positions = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, q_len);
-    ggml_set_name(sg.positions, "positions_q");
-    ggml_set_input(sg.positions);
-
-    sg.positions_k = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, ctx_len + q_len);
-    ggml_set_name(sg.positions_k, "positions_k");
-    ggml_set_input(sg.positions_k);
-
-    sg.gf = ggml_new_graph_custom(sg.ctx, 4096, false);
-
-    DraftGraphInputs gi{};
-    gi.ctx_len           = ctx_len;
-    gi.noise_embed       = sg.inp_embed;
-    gi.target_hidden_cat = sg.target_hidden_cat;
-    gi.positions_q       = sg.positions;
-    gi.positions_k       = sg.positions_k;
-    gi.lm_head           = tw ? tw->output : nullptr; // project through target.output when local
-    DraftGraphOutputs go = build_draft_graph(sg.ctx, dw, gi);
-    sg.hidden_states = go.hidden_states;
-    sg.logits = go.logits;
-    if (!sg.hidden_states) {
-        std::fprintf(stderr, "draft graph missing hidden_states\n");
-        return false;
-    }
-    if (sg.logits) {
-        // GPU-side argmax: avoids 16 CPU argmaxes over 248K vocab.
-        sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-        ggml_set_name(sg.argmax_tokens, "argmax_tokens");
-        ggml_set_output(sg.argmax_tokens);
-        ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
-    } else {
-        ggml_set_output(sg.hidden_states);
-        ggml_build_forward_expand(sg.gf, sg.hidden_states);
-    }
-
-    if (!sg.alloc) {
-        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
-}
-
-static bool build_lm_head_projection_step(
-    StepGraph & sg,
-    const TargetWeights & w,
-    ggml_backend_t backend,
-    int n_tokens) {
-    step_graph_free(sg);
-
-    ggml_init_params ip{};
-    ip.mem_size   = 64 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc   = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
-
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    sg.hidden_input = ggml_new_tensor_3d(sg.ctx, GGML_TYPE_F32, hidden, n_tokens, 1);
-    ggml_set_name(sg.hidden_input, "draft_hidden_for_lm_head");
-    ggml_set_input(sg.hidden_input);
-
-    sg.gf = ggml_new_graph_custom(sg.ctx, 1024, false);
-    sg.logits = ggml_mul_mat(sg.ctx, w.output, sg.hidden_input);
-    ggml_set_name(sg.logits, "draft_projected_logits");
-    ggml_set_output(sg.logits);
-    sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
-    ggml_set_name(sg.argmax_tokens, "draft_projected_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
-
-    if (!sg.alloc) {
-        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    return ggml_gallocr_alloc_graph(sg.alloc, sg.gf);
-}
-
-struct TargetLayerSplitShard {
-    int gpu = 0;
-    int layer_begin = 0;
-    int layer_end = 0;
-    ggml_backend_t backend = nullptr;
-    TargetWeights weights;
-    TargetCache cache;
-    StepGraph layer_graph;
-};
-
-struct ActivationPair {
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buf = nullptr;
-    ggml_tensor * a = nullptr;
-    ggml_tensor * b = nullptr;
-    ggml_backend_t backend = nullptr;
-    int n_tokens = 0;
-};
-
-static void activation_pair_free(ActivationPair & p) {
-    if (p.buf) { ggml_backend_buffer_free(p.buf); p.buf = nullptr; }
-    if (p.ctx) { ggml_free(p.ctx); p.ctx = nullptr; }
-    p.a = nullptr;
-    p.b = nullptr;
-    p.backend = nullptr;
-    p.n_tokens = 0;
-}
-
-static bool activation_pair_init(ActivationPair & p,
-                                 ggml_backend_t backend,
-                                 int hidden,
-                                 int n_tokens) {
-    activation_pair_free(p);
-    if (n_tokens <= 0) return false;
-    p.backend = backend;
-    p.n_tokens = n_tokens;
-    ggml_init_params ip{};
-    ip.mem_size = (size_t)8 * ggml_tensor_overhead() + 16 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc = true;
-    p.ctx = ggml_init(ip);
-    if (!p.ctx) return false;
-    p.a = ggml_new_tensor_2d(p.ctx, GGML_TYPE_F32, hidden, n_tokens);
-    p.b = ggml_new_tensor_2d(p.ctx, GGML_TYPE_F32, hidden, n_tokens);
-    ggml_set_name(p.a, "target_split_act_a");
-    ggml_set_name(p.b, "target_split_act_b");
-    p.buf = ggml_backend_alloc_ctx_tensors(p.ctx, backend);
-    if (!p.buf) {
-        activation_pair_free(p);
-        return false;
-    }
-    return true;
-}
-
-static bool parse_int_list(const char * text, std::vector<int> & out) {
-    out.clear();
-    if (!text || !*text) return false;
-    const char * p = text;
-    while (*p) {
-        char * end = nullptr;
-        long v = std::strtol(p, &end, 10);
-        if (end == p || v < 0 || v > INT32_MAX) return false;
-        out.push_back((int)v);
-        if (*end == '\0') break;
-        if (*end != ',') return false;
-        p = end + 1;
-    }
-    return !out.empty();
-}
-
-static bool parse_float_list(const char * text, std::vector<double> & out) {
-    out.clear();
-    if (!text || !*text) return false;
-    const char * p = text;
-    while (*p) {
-        char * end = nullptr;
-        double v = std::strtod(p, &end);
-        if (end == p || v <= 0.0) return false;
-        out.push_back(v);
-        if (*end == '\0') break;
-        if (*end != ',') return false;
-        p = end + 1;
-    }
-    return !out.empty();
-}
-
-static int inspect_target_layer_count(const char * target_path) {
-    ggml_context * meta_ctx = nullptr;
-    gguf_init_params gip{};
-    gip.no_alloc = true;
-    gip.ctx = &meta_ctx;
-    gguf_context * gctx = gguf_init_from_file(target_path, gip);
-    if (!gctx) return -1;
-    int64_t id = gguf_find_key(gctx, "qwen35.block_count");
-    int n_layer = id >= 0 ? (int)gguf_get_val_u32(gctx, id) : -1;
-    gguf_free(gctx);
-    if (meta_ctx) ggml_free(meta_ctx);
-    return n_layer;
-}
-
-static std::vector<std::pair<int, int>> compute_layer_ranges(
-        int n_layer,
-        int n_shards,
-        const std::vector<double> & weights) {
-    std::vector<std::pair<int, int>> ranges;
-    if (n_layer <= 0 || n_shards <= 0 || n_shards > n_layer) return ranges;
-    std::vector<double> w = weights;
-    if (w.empty()) w.assign((size_t)n_shards, 1.0);
-    if ((int)w.size() != n_shards) return ranges;
-    double sum = 0.0;
-    for (double v : w) sum += v;
-    if (sum <= 0.0) return ranges;
-    ranges.reserve((size_t)n_shards);
-    int begin = 0;
-    double accum = 0.0;
-    for (int i = 0; i < n_shards; i++) {
-        accum += w[i];
-        int end = (i == n_shards - 1)
-            ? n_layer
-            : (int)std::llround((accum / sum) * n_layer);
-        const int min_end = begin + 1;
-        const int max_end = n_layer - (n_shards - i - 1);
-        end = std::max(min_end, std::min(max_end, end));
-        ranges.push_back({begin, end});
-        begin = end;
-    }
-    return ranges;
-}
-
-static TargetLayerSplitShard * find_target_shard(
-        std::vector<TargetLayerSplitShard> & shards,
-        int layer_idx) {
-    for (auto & shard : shards) {
-        if (layer_idx >= shard.layer_begin && layer_idx < shard.layer_end) {
-            return &shard;
-        }
-    }
-    return nullptr;
-}
-
-static int target_capture_index(const TargetWeights & w, int layer_idx) {
-    for (int k = 0; k < DFLASH27B_DRAFT_N_TARGET_LAYERS; k++) {
-        if (w.capture_layer_ids[k] == layer_idx) return k;
-    }
-    return -1;
-}
-
-static bool copy_capture_slice_to_draft_ring(
-        DraftFeatureMirror & feature_ring,
-        int capture_idx,
-        const ggml_tensor * act_out,
-        int src_device,
-        int chunk_start,
-        int start_pos,
-        int n_tokens) {
-    if (!feature_ring.target_feat || capture_idx < 0 || n_tokens <= 0) return true;
-    if (feature_ring.cap <= 0) return false;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const size_t dst_stride = feature_ring.target_feat->nb[1];
-    const size_t src_stride = act_out->nb[1];
-    const size_t row_bytes = (size_t)hidden * sizeof(float);
-    for (int i = 0; i < n_tokens; i++) {
-        const int slot = (start_pos + i) % feature_ring.cap;
-        const void * src = (const char *)act_out->data +
-            (size_t)(chunk_start + i) * src_stride;
-        void * dst = (char *)feature_ring.target_feat->data +
-            (size_t)slot * dst_stride +
-            (size_t)capture_idx * (size_t)hidden * sizeof(float);
-        if (!copy_peer_async(dst, feature_ring.device, src, src_device, row_bytes)) {
-            return false;
-        }
-    }
-    return cudaDeviceSynchronize() == cudaSuccess;
-}
-
-static bool copy_feature_ring_range_to_tensor(
-        const DraftFeatureMirror & feature_ring,
-        ggml_tensor * dst,
-        int start_pos,
-        int n_tokens) {
-    if (!feature_ring.target_feat || !dst || feature_ring.cap <= 0) return false;
-    if (n_tokens <= 0 || n_tokens > feature_ring.cap) return false;
-
-    const int fc_in = DFLASH27B_DRAFT_N_TARGET_LAYERS * DFLASH27B_TARGET_HIDDEN;
-    const size_t row_bytes = (size_t)fc_in * sizeof(float);
-    const size_t src_stride = feature_ring.target_feat->nb[1];
-    const size_t dst_stride = dst->nb[1];
-    int done = 0;
-    while (done < n_tokens) {
-        const int slot = (start_pos + done) % feature_ring.cap;
-        const int run = std::min(n_tokens - done, feature_ring.cap - slot);
-        const char * src_base =
-            (const char *)feature_ring.target_feat->data + (size_t)slot * src_stride;
-        char * dst_base = (char *)dst->data + (size_t)done * dst_stride;
-        if (src_stride == row_bytes && dst_stride == row_bytes) {
-            if (!copy_peer_async(dst_base, feature_ring.device,
-                                 src_base, feature_ring.device,
-                                 row_bytes * (size_t)run)) {
-                return false;
-            }
-        } else {
-            for (int i = 0; i < run; i++) {
-                if (!copy_peer_async(dst_base + (size_t)i * dst_stride,
-                                     feature_ring.device,
-                                     src_base + (size_t)i * src_stride,
-                                     feature_ring.device,
-                                     row_bytes)) {
-                    return false;
-                }
-            }
-        }
-        done += run;
-    }
-    return cudaDeviceSynchronize() == cudaSuccess;
-}
-
-static bool compute_target_split_argmax(
-        StepGraph & sg,
-        const TargetWeights & w,
-        ggml_backend_t backend,
-        ggml_tensor * act,
-        int token_offset,
-        int n_tokens,
-        int hidden,
-        int vocab,
-        std::vector<int32_t> & argmax_out) {
-    step_graph_free(sg);
-    ggml_init_params ip{};
-    ip.mem_size = 256 * 1024 * 1024;
-    ip.mem_buffer = nullptr;
-    ip.no_alloc = true;
-    sg.ctx = ggml_init(ip);
-    if (!sg.ctx) return false;
-
-    ggml_tensor * act_view = ggml_view_2d(
-        sg.ctx, act, hidden, n_tokens, act->nb[1],
-        (size_t)token_offset * act->nb[1]);
-    ggml_tensor * normed = ggml_rms_norm(sg.ctx, act_view, DFLASH27B_RMS_EPS);
-    normed = ggml_mul(sg.ctx, normed, w.out_norm);
-    ggml_tensor * logits = ggml_mul_mat(sg.ctx, w.output, normed);
-    ggml_set_name(logits, "target_split_logits");
-    sg.logits = logits;
-    sg.argmax_tokens = ggml_argmax(sg.ctx, logits);
-    ggml_set_name(sg.argmax_tokens, "target_split_argmax");
-    ggml_set_output(sg.argmax_tokens);
-    sg.gf = ggml_new_graph_custom(sg.ctx, 1024, false);
-    ggml_build_forward_expand(sg.gf, sg.argmax_tokens);
-    if (!sg.alloc) {
-        sg.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-    }
-    if (!ggml_gallocr_alloc_graph(sg.alloc, sg.gf)) return false;
-    auto st = ggml_backend_graph_compute(backend, sg.gf);
-    if (st != GGML_STATUS_SUCCESS) return false;
-    (void)vocab;
-    argmax_out.assign((size_t)n_tokens, 0);
-    ggml_backend_tensor_get(sg.argmax_tokens, argmax_out.data(), 0,
-                            sizeof(int32_t) * (size_t)n_tokens);
-    return true;
-}
-
-static bool run_target_layer_split_forward(
-        std::vector<TargetLayerSplitShard> & shards,
-        const TargetWeights & embed_source,
-        const std::vector<int32_t> & tokens,
-        int base_pos,
-        int ubatch,
-        int & last_tok,
-        DraftFeatureMirror * feature_ring = nullptr,
-        std::vector<int32_t> * argmax_out = nullptr,
-        std::vector<float> * logits_out = nullptr) {
-    if (shards.empty() || tokens.empty()) return false;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab = DFLASH27B_TARGET_VOCAB;
-    const int n_tokens_total = (int)tokens.size();
-    ubatch = std::max(1, ubatch);
-
-    ActivationPair acts;
-    if (!activation_pair_init(acts, shards.front().backend, hidden, n_tokens_total)) {
-        std::fprintf(stderr, "target-split activation alloc failed on gpu %d\n", shards.front().gpu);
-        return false;
-    }
-    ggml_tensor * act_in = acts.a;
-    ggml_tensor * act_out = acts.b;
-
-    {
-        const int EMBED_BATCH = 4096;
-        std::vector<float> emb_buf((size_t)hidden * std::min(EMBED_BATCH, n_tokens_total));
-        for (int i = 0; i < n_tokens_total; i += EMBED_BATCH) {
-            const int n = std::min(EMBED_BATCH, n_tokens_total - i);
-            if ((int)emb_buf.size() < hidden * n) emb_buf.resize((size_t)hidden * n);
-            if (!embed_source.embedder.embed(tokens.data() + i, n, emb_buf.data())) {
-                activation_pair_free(acts);
-                return false;
-            }
-            ggml_backend_tensor_set(act_in, emb_buf.data(),
-                                    (size_t)i * act_in->nb[1],
-                                    sizeof(float) * (size_t)hidden * n);
-        }
-    }
-
-    TargetLayerSplitShard * current_shard = &shards.front();
-    std::vector<uint16_t> mask_buf;
-    std::vector<int32_t> pos_buf;
-    for (int il = 0; il < embed_source.n_layer; il++) {
-        TargetLayerSplitShard * shard = find_target_shard(shards, il);
-        if (!shard) {
-            std::fprintf(stderr, "target-split missing owner for layer %d\n", il);
-            activation_pair_free(acts);
-            return false;
-        }
-        if (shard != current_shard) {
-            ActivationPair next_acts;
-            if (!activation_pair_init(next_acts, shard->backend, hidden, n_tokens_total)) {
-                std::fprintf(stderr, "target-split activation alloc failed on gpu %d\n", shard->gpu);
-                activation_pair_free(acts);
-                return false;
-            }
-            ggml_backend_synchronize(current_shard->backend);
-            ggml_backend_tensor_copy(act_in, next_acts.a);
-            ggml_backend_synchronize(shard->backend);
-            activation_pair_free(acts);
-            acts = next_acts;
-            act_in = acts.a;
-            act_out = acts.b;
-            current_shard = shard;
-        }
-
-        const bool is_attn = (((il + 1) % embed_source.full_attention_interval) == 0);
-        const int capture_idx = target_capture_index(embed_source, il);
-        for (int start = 0; start < n_tokens_total; start += ubatch) {
-            const int n = std::min(ubatch, n_tokens_total - start);
-            const int kv_start = base_pos + start;
-            const int kv_len = kv_start + n;
-            const bool with_mask = (g_kq_stride_pad > KQ_MASK_PAD) || (n > 1);
-            if (!build_layer_step(shard->layer_graph, shard->weights, shard->cache,
-                                  shard->backend, il, act_in, act_out,
-                                  start, n, kv_start, with_mask,
-                                  /*capture=*/false, g_fa_window)) {
-                std::fprintf(stderr, "target-split build layer=%d @%d gpu=%d\n",
-                             il, start, shard->gpu);
-                activation_pair_free(acts);
-                return false;
-            }
-            if (is_attn && shard->layer_graph.positions) {
-                pos_buf.assign((size_t)4 * n, 0);
-                for (int i = 0; i < n; i++) {
-                    const int p = kv_start + i;
-                    pos_buf[0 * n + i] = p;
-                    pos_buf[1 * n + i] = p;
-                    pos_buf[2 * n + i] = p;
-                    pos_buf[3 * n + i] = 0;
-                }
-                ggml_backend_tensor_set(shard->layer_graph.positions, pos_buf.data(), 0,
-                                        sizeof(int32_t) * pos_buf.size());
-            }
-            if (is_attn && with_mask && shard->layer_graph.attn_mask) {
-                const int win_start_l = (g_fa_window > 0 && kv_start > g_fa_window)
-                                            ? (kv_start - g_fa_window) : 0;
-                const int win_len_l = kv_len - win_start_l;
-                build_causal_mask(mask_buf, win_len_l, n, kv_start, win_start_l);
-                ggml_backend_tensor_set(shard->layer_graph.attn_mask, mask_buf.data(), 0,
-                                        sizeof(uint16_t) * mask_buf.size());
-            }
-            auto st = ggml_backend_graph_compute(shard->backend, shard->layer_graph.gf);
-            if (st != GGML_STATUS_SUCCESS) {
-                std::fprintf(stderr, "target-split compute layer=%d @%d gpu=%d status=%d\n",
-                             il, start, shard->gpu, (int)st);
-                activation_pair_free(acts);
-                return false;
-            }
-            if (feature_ring && capture_idx >= 0) {
-                if (!copy_capture_slice_to_draft_ring(*feature_ring, capture_idx,
-                                                      act_out, shard->gpu,
-                                                      start, base_pos + start, n)) {
-                    std::fprintf(stderr,
-                                 "target-split capture copy failed layer=%d capture=%d gpu=%d\n",
-                                 il, capture_idx, shard->gpu);
-                    activation_pair_free(acts);
-                    return false;
-                }
-            }
-        }
-        std::swap(act_in, act_out);
-    }
-
-    StepGraph final_sg;
-    std::vector<int32_t> argmax_tokens;
-    TargetLayerSplitShard & last_shard = shards.back();
-    const bool need_all_argmax = argmax_out != nullptr;
-    const int argmax_offset = need_all_argmax ? 0 : (n_tokens_total - 1);
-    const int argmax_count = need_all_argmax ? n_tokens_total : 1;
-    const bool ok = compute_target_split_argmax(
-        final_sg, last_shard.weights, last_shard.backend, act_in,
-        argmax_offset, argmax_count, hidden, vocab, argmax_tokens);
-    step_graph_destroy(final_sg);
-    activation_pair_free(acts);
-    if (!ok) return false;
-    last_tok = argmax_tokens.empty() ? -1 : argmax_tokens.back();
-    if (argmax_out) *argmax_out = std::move(argmax_tokens);
-    if (logits_out) logits_out->clear();
-    return true;
-}
-
-static void free_target_layer_split_shards(std::vector<TargetLayerSplitShard> & shards) {
-    for (auto & shard : shards) {
-        step_graph_destroy(shard.layer_graph);
-        free_target_cache(shard.cache);
-        free_target_weights(shard.weights);
-        if (shard.backend) {
-            ggml_backend_free(shard.backend);
-            shard.backend = nullptr;
-        }
-    }
-    shards.clear();
-}
-
-static bool run_target_layer_split_dflash_decode(
-        std::vector<TargetLayerSplitShard> & shards,
-        DraftWeights & draft_weights,
-        ggml_backend_t draft_backend,
-        int draft_gpu,
-        DraftFeatureMirror & feature_ring,
-        const std::vector<int32_t> & prompt,
-        int n_gen,
-        int last_tok,
-        const char * out_path) {
-    if (shards.empty() || !feature_ring.target_feat) return false;
-    const int hidden = DFLASH27B_TARGET_HIDDEN;
-    const int vocab = DFLASH27B_TARGET_VOCAB;
-    const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
-    const int output_gpu = shards.back().gpu;
-    ggml_backend_t output_backend = shards.back().backend;
-
-    StepGraph draft_sg;
-    StepGraph proj_sg;
-    std::vector<float> noise_embed((size_t)hidden * q_len);
-    std::vector<int32_t> noise_ids(q_len);
-    std::vector<int32_t> draft_tok(q_len);
-    std::vector<int32_t> target_tok(q_len);
-    std::vector<int32_t> pos_q(q_len);
-    std::vector<int32_t> pos_k;
-    std::vector<int32_t> out_all = prompt;
-    int committed = (int)prompt.size();
-    int n_generated = 0;
-    int n_draft_steps = 0;
-    int n_accept_sum = 0;
-
-    auto sync_all = [&]() {
-        for (auto & shard : shards) ggml_backend_synchronize(shard.backend);
-        ggml_backend_synchronize(draft_backend);
-    };
-
-    auto t_dec0 = std::chrono::steady_clock::now();
-    while (n_generated < n_gen) {
-        const int need_commit_budget = n_gen - n_generated;
-
-        noise_ids[0] = last_tok;
-        for (int i = 1; i < q_len; i++) noise_ids[i] = DFLASH27B_DRAFT_MASK_TOKEN_ID;
-        if (!shards.front().weights.embedder.embed(noise_ids.data(), q_len,
-                                                   noise_embed.data())) {
-            std::fprintf(stderr, "target-split-dflash noise embed failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-
-        constexpr int DRAFT_CTX_MAX = 2048;
-        const int draft_ctx = std::min(committed, std::min(feature_ring.cap,
-            std::max(DRAFT_CTX_MAX, g_draft_ctx_max)));
-        const int draft_start = committed - draft_ctx;
-        int mirror_slot0 = 0;
-        const bool use_mirror_view =
-            draft_feature_mirror_can_view(feature_ring, committed, draft_ctx, mirror_slot0);
-        if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
-                              draft_ctx, use_mirror_view ? &feature_ring : nullptr,
-                              committed)) {
-            std::fprintf(stderr, "target-split-dflash draft build failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        if (!use_mirror_view &&
-            !copy_feature_ring_range_to_tensor(feature_ring, draft_sg.target_hidden_cat,
-                                               draft_start, draft_ctx)) {
-            std::fprintf(stderr, "target-split-dflash draft feature copy failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                sizeof(float) * noise_embed.size());
-        pos_k.resize((size_t)draft_ctx + q_len);
-        for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
-        auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "target-split-dflash draft compute %d\n", (int)st);
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-
-        if (!proj_sg.gf || !proj_sg.hidden_input || proj_sg.hidden_input->ne[1] != q_len) {
-            if (!build_lm_head_projection_step(proj_sg, shards.back().weights,
-                                               output_backend, q_len)) {
-                std::fprintf(stderr, "target-split-dflash projection build failed\n");
-                step_graph_destroy(draft_sg);
-                step_graph_destroy(proj_sg);
-                return false;
-            }
-        }
-        const size_t hidden_bytes = ggml_nbytes(draft_sg.hidden_states);
-        if (!copy_peer_async(proj_sg.hidden_input->data, output_gpu,
-                             draft_sg.hidden_states->data, draft_gpu,
-                             hidden_bytes)) {
-            std::fprintf(stderr, "target-split-dflash hidden peer copy failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        cudaSetDevice(output_gpu);
-        cudaDeviceSynchronize();
-        st = ggml_backend_graph_compute(output_backend, proj_sg.gf);
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "target-split-dflash projection compute %d\n", (int)st);
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        ggml_backend_tensor_get(proj_sg.argmax_tokens, draft_tok.data(), 0,
-                                sizeof(int32_t) * q_len);
-        draft_tok[0] = last_tok;
-
-        for (auto & shard : shards) snapshot_ssm_state(shard.cache);
-
-        int verify_last_tok = -1;
-        if (!run_target_layer_split_forward(shards, shards.front().weights,
-                                            draft_tok, committed, q_len,
-                                            verify_last_tok, &feature_ring,
-                                            &target_tok)) {
-            std::fprintf(stderr, "target-split-dflash verify failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-
-        int accept_n = 1;
-        for (int i = 0; i < q_len - 1; i++) {
-            if (draft_tok[i + 1] == target_tok[i]) accept_n++;
-            else break;
-        }
-        int bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
-        int commit_n = accept_n + (bonus_tok >= 0 ? 1 : 0);
-        if (commit_n > need_commit_budget) {
-            commit_n = need_commit_budget;
-            if (commit_n <= accept_n) bonus_tok = -1;
-        }
-
-        for (auto & shard : shards) restore_ssm_state(shard.cache);
-
-        std::vector<int32_t> replay_tok((size_t)commit_n);
-        for (int i = 0; i < commit_n; i++) {
-            replay_tok[i] = (i < accept_n) ? draft_tok[i] : bonus_tok;
-        }
-        int replay_last_tok = -1;
-        if (!run_target_layer_split_forward(shards, shards.front().weights,
-                                            replay_tok, committed, commit_n,
-                                            replay_last_tok, &feature_ring)) {
-            std::fprintf(stderr, "target-split-dflash replay failed\n");
-            step_graph_destroy(draft_sg);
-            step_graph_destroy(proj_sg);
-            return false;
-        }
-        last_tok = replay_last_tok;
-
-        bool hit_eos = false;
-        for (int i = 0; i < commit_n; i++) {
-            out_all.push_back(replay_tok[i]);
-            if (IS_EOS_TOK(replay_tok[i], shards.front().weights)) hit_eos = true;
-        }
-        committed += commit_n;
-        n_generated += commit_n;
-        n_accept_sum += std::min(accept_n, commit_n);
-        n_draft_steps++;
-        if (hit_eos) break;
-    }
-    sync_all();
-    auto t_dec1 = std::chrono::steady_clock::now();
-    const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-    const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-    std::printf("[target-split-dflash] decode tokens=%d time=%.3f s speed=%.2f tok/s\n",
-                n_generated, decode_s, n_generated > 0 ? n_generated / decode_s : 0.0);
-    std::printf("[target-split-dflash] %d draft steps, accepted=%d/%d (%.1f%%), avg commit/step=%.2f\n",
-                n_draft_steps, n_accept_sum, total_draft_pos, accept_pct,
-                n_draft_steps > 0 ? (double)n_generated / (double)n_draft_steps : 0.0);
-    if (out_path) write_int32_file(out_path, out_all);
-
-    step_graph_destroy(draft_sg);
-    step_graph_destroy(proj_sg);
-    return true;
-}
-
-static int run_target_layer_split_harness(
-        const char * target_path,
-        const char * draft_path,
-        const char * prompt_path,
-        int n_gen,
-        const char * out_path,
-        const std::vector<int> & target_gpus,
-        const std::vector<double> & split_weights,
-        int draft_gpu,
-        bool load_draft,
-        bool run_draft_smoke,
-        bool run_dflash,
-        int max_ctx,
-        int max_verify_tokens) {
-    if (!prompt_path || !out_path) {
-        std::fprintf(stderr, "target layer split requires prompt/n_gen/out positional args\n");
-        return 2;
-    }
-    const int n_layer = inspect_target_layer_count(target_path);
-    if (n_layer <= 0) {
-        std::fprintf(stderr, "target-split could not read qwen35.block_count\n");
-        return 1;
-    }
-    const auto ranges = compute_layer_ranges(n_layer, (int)target_gpus.size(), split_weights);
-    if ((int)ranges.size() != (int)target_gpus.size()) {
-        std::fprintf(stderr, "bad --target-layer-split for %zu target GPUs and %d layers\n",
-                     target_gpus.size(), n_layer);
-        return 2;
-    }
-    std::vector<TargetLayerSplitShard> shards;
-    shards.resize(target_gpus.size());
-    for (size_t i = 0; i < target_gpus.size(); i++) {
-        shards[i].gpu = target_gpus[i];
-        shards[i].layer_begin = ranges[i].first;
-        shards[i].layer_end = ranges[i].second;
-    }
-    for (auto & shard : shards) {
-        shard.backend = ggml_backend_cuda_init(shard.gpu);
-        if (!shard.backend) {
-            std::fprintf(stderr, "target-split cuda init failed for gpu %d\n", shard.gpu);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-    }
-    for (size_t i = 0; i < target_gpus.size(); i++) {
-        for (size_t j = i + 1; j < target_gpus.size(); j++) {
-            if (!enable_peer_access_pair(target_gpus[i], target_gpus[j])) {
-                std::fprintf(stderr,
-                             "warning: CUDA peer access not fully enabled for target gpus %d,%d\n",
-                             target_gpus[i], target_gpus[j]);
-            }
-        }
-    }
-    for (auto & shard : shards) {
-        TargetLoadPlan plan;
-        plan.layer_begin = shard.layer_begin;
-        plan.layer_end = shard.layer_end;
-        plan.load_output = (&shard == &shards.back());
-        if (!load_target_gguf_partial(target_path, shard.backend, plan, shard.weights)) {
-            std::fprintf(stderr, "target-split load gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::printf("[target-split] gpu=%d layers=[%d,%d) %s\n",
-                    shard.gpu, shard.layer_begin, shard.layer_end,
-                    dflash27b_last_error());
-        const bool allocate_target_feat = false;
-        if (!create_target_cache_partial(shard.weights, max_ctx, max_verify_tokens,
-                                         shard.backend, shard.cache,
-                                         /*prefill_only=*/!run_dflash,
-                                         shard.layer_begin, shard.layer_end,
-                                         allocate_target_feat)) {
-            std::fprintf(stderr, "target-split cache gpu=%d: %s\n",
-                         shard.gpu, dflash27b_last_error());
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-    }
-
-    ggml_backend_t draft_backend = nullptr;
-    DraftWeights draft_weights;
-    DraftFeatureMirror feature_ring;
-    bool draft_backend_owned = false;
-    if (load_draft) {
-        for (auto & shard : shards) {
-            if (shard.gpu == draft_gpu) {
-                draft_backend = shard.backend;
-                break;
-            }
-        }
-        if (!draft_backend) {
-            draft_backend = ggml_backend_cuda_init(draft_gpu);
-            if (!draft_backend) {
-                std::fprintf(stderr, "target-split draft cuda init failed for gpu %d\n", draft_gpu);
-                free_target_layer_split_shards(shards);
-                return 1;
-            }
-            draft_backend_owned = true;
-        }
-        std::string dp(draft_path);
-        bool draft_ok = false;
-        if (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf") {
-            draft_ok = load_draft_gguf(draft_path, draft_backend, draft_weights);
-        } else {
-            draft_ok = load_draft_safetensors(draft_path, draft_backend, draft_weights);
-        }
-        if (!draft_ok) {
-            std::fprintf(stderr, "target-split draft load gpu=%d: %s\n",
-                         draft_gpu, dflash27b_last_error());
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::printf("[target-split] draft loaded on gpu=%d format=%s\n",
-                    draft_gpu,
-                    (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
-                        ? "gguf" : "safetensors");
-        if (g_draft_swa_window > 0) {
-            draft_weights.swa_window = g_draft_swa_window;
-            for (int il = 0; il < draft_weights.n_layer - 1; il++) {
-                draft_weights.layers[il].is_swa = true;
-            }
-            std::printf("[target-split] draft SWA layers: %d/%d (window=%d)\n",
-                        draft_weights.n_layer - 1, draft_weights.n_layer,
-                        draft_weights.swa_window);
-        }
-        const int cap = std::min(max_ctx, 4096);
-        if (!draft_feature_mirror_init(feature_ring, draft_backend,
-                                       draft_gpu, draft_gpu, cap)) {
-            std::fprintf(stderr, "target-split feature ring init failed on gpu=%d\n", draft_gpu);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::printf("[target-split] draft feature ring cap=%d gpu=%d\n", cap, draft_gpu);
-    }
-
-    auto prompt = read_int32_file(prompt_path);
-    if (prompt.empty()) {
-        std::fprintf(stderr, "target-split empty prompt\n");
-        draft_feature_mirror_free(feature_ring);
-        free_draft_weights(draft_weights);
-        if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
-        return 1;
-    }
-    if ((int)prompt.size() + n_gen + 1 > max_ctx) {
-        std::fprintf(stderr, "target-split prompt (%zu) + gen (%d) exceeds max_ctx (%d)\n",
-                     prompt.size(), n_gen, max_ctx);
-        draft_feature_mirror_free(feature_ring);
-        free_draft_weights(draft_weights);
-        if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
-        return 1;
-    }
-
-    int ubatch = (prompt.size() > 2048) ? 384 : 16;
-    if (const char * s = std::getenv("DFLASH27B_PREFILL_UBATCH")) {
-        ubatch = std::max(1, std::atoi(s));
-    }
-    std::printf("[target-split] n_gpus=%zu n_layer=%d ubatch=%d max_ctx=%d\n",
-                target_gpus.size(), n_layer, ubatch, max_ctx);
-
-    int last_tok = -1;
-    auto t_pf0 = std::chrono::steady_clock::now();
-    if (!run_target_layer_split_forward(shards, shards.front().weights,
-                                        prompt, 0, ubatch, last_tok,
-                                        load_draft ? &feature_ring : nullptr)) {
-        std::fprintf(stderr, "target-split prefill failed\n");
-        draft_feature_mirror_free(feature_ring);
-        free_draft_weights(draft_weights);
-        if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
-        return 1;
-    }
-    auto t_pf1 = std::chrono::steady_clock::now();
-    const double prefill_s = std::chrono::duration<double>(t_pf1 - t_pf0).count();
-    std::printf("[target-split] prefill tokens=%zu time=%.3f s speed=%.2f tok/s last_tok=%d\n",
-                prompt.size(), prefill_s, prompt.size() / prefill_s, last_tok);
-
-    if (run_draft_smoke) {
-        const int hidden = DFLASH27B_TARGET_HIDDEN;
-        const int q_len = DFLASH27B_DRAFT_BLOCK_SIZE;
-        const int draft_ctx = std::min((int)prompt.size(), feature_ring.cap);
-        const int draft_start = (int)prompt.size() - draft_ctx;
-        StepGraph draft_sg;
-        int mirror_slot0 = 0;
-        const bool use_mirror_view =
-            draft_feature_mirror_can_view(feature_ring, (int)prompt.size(),
-                                          draft_ctx, mirror_slot0);
-        if (!build_draft_step(draft_sg, draft_weights, nullptr, draft_backend,
-                              draft_ctx, use_mirror_view ? &feature_ring : nullptr,
-                              (int)prompt.size())) {
-            std::fprintf(stderr, "target-split draft smoke build failed\n");
-            step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        if (!use_mirror_view &&
-            !copy_feature_ring_range_to_tensor(feature_ring,
-                                               draft_sg.target_hidden_cat,
-                                               draft_start, draft_ctx)) {
-            std::fprintf(stderr, "target-split draft smoke feature copy failed\n");
-            step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::vector<int32_t> noise_ids(q_len, DFLASH27B_DRAFT_MASK_TOKEN_ID);
-        noise_ids[0] = last_tok;
-        std::vector<float> noise_embed((size_t)hidden * q_len);
-        if (!shards.front().weights.embedder.embed(noise_ids.data(), q_len, noise_embed.data())) {
-            std::fprintf(stderr, "target-split draft smoke embed failed\n");
-            step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
-                                sizeof(float) * noise_embed.size());
-        std::vector<int32_t> pos_q(q_len), pos_k(draft_ctx + q_len);
-        for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
-        for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
-        ggml_backend_tensor_set(draft_sg.positions, pos_q.data(), 0,
-                                sizeof(int32_t) * pos_q.size());
-        ggml_backend_tensor_set(draft_sg.positions_k, pos_k.data(), 0,
-                                sizeof(int32_t) * pos_k.size());
-        auto t_ds0 = std::chrono::steady_clock::now();
-        auto st = ggml_backend_graph_compute(draft_backend, draft_sg.gf);
-        auto t_ds1 = std::chrono::steady_clock::now();
-        if (st != GGML_STATUS_SUCCESS) {
-            std::fprintf(stderr, "target-split draft smoke compute failed status=%d\n", (int)st);
-            step_graph_destroy(draft_sg);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        std::printf("[target-split] draft smoke ctx=%d q=%d time=%.3f ms\n",
-                    draft_ctx, q_len,
-                    std::chrono::duration<double, std::milli>(t_ds1 - t_ds0).count());
-        step_graph_destroy(draft_sg);
-    }
-
-    if (run_dflash) {
-        const bool ok = run_target_layer_split_dflash_decode(
-            shards, draft_weights, draft_backend, draft_gpu, feature_ring,
-            prompt, n_gen, last_tok, out_path);
-        draft_feature_mirror_free(feature_ring);
-        free_draft_weights(draft_weights);
-        if (draft_backend_owned) ggml_backend_free(draft_backend);
-        free_target_layer_split_shards(shards);
-        return ok ? 0 : 1;
-    }
-
-    std::vector<int32_t> out_all = prompt;
-    auto t_dec0 = std::chrono::steady_clock::now();
-    int generated = 0;
-    for (; generated < n_gen; generated++) {
-        std::vector<int32_t> one(1, last_tok);
-        int next_tok = -1;
-        if (!run_target_layer_split_forward(shards, shards.front().weights,
-                                            one, (int)out_all.size(), 1, next_tok,
-                                            load_draft ? &feature_ring : nullptr)) {
-            std::fprintf(stderr, "target-split decode failed at %d\n", generated);
-            draft_feature_mirror_free(feature_ring);
-            free_draft_weights(draft_weights);
-            if (draft_backend_owned) ggml_backend_free(draft_backend);
-            free_target_layer_split_shards(shards);
-            return 1;
-        }
-        out_all.push_back(last_tok);
-        if (IS_EOS_TOK(last_tok, shards.front().weights)) {
-            generated++;
-            break;
-        }
-        last_tok = next_tok;
-    }
-    auto t_dec1 = std::chrono::steady_clock::now();
-    const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
-    std::printf("[target-split] decode tokens=%d time=%.3f s speed=%.2f tok/s\n",
-                generated, decode_s, generated > 0 ? generated / decode_s : 0.0);
-    if (out_path) write_int32_file(out_path, out_all);
-    draft_feature_mirror_free(feature_ring);
-    free_draft_weights(draft_weights);
-    if (draft_backend_owned) ggml_backend_free(draft_backend);
-    free_target_layer_split_shards(shards);
-    return 0;
-}
+// build_causal_mask moved to src/decode_helpers.cpp
+
+// extract_draft_topk, build_ddtree, follow_verified_tree, build_tree_mask,
+// enable_peer_access_one_way, enable_peer_access_pair, copy_peer_async,
+// ensure_bf16_staging, draft_feature_mirror_* → moved to src/decode_helpers.cpp
+
+// parse_int_list, parse_float_list, inspect_target_layer_count,
+// compute_layer_ranges, find_target_shard, target_capture_index,
+// copy_capture_slice_to_draft_ring, copy_feature_ring_range_to_tensor,
+// compute_target_split_argmax, run_target_layer_split_forward,
+// free_target_layer_split_shards, run_target_layer_split_dflash_decode,
+// run_target_layer_split_harness → moved to src/decode_target_split.cpp
 
 // ─── Main ─────────────────────────────────────────────────────────
 
-static SamplerCfg     g_sampler;
-static std::mt19937_64 g_sampler_rng{std::random_device{}()};
+SamplerCfg     g_sampler;
+std::mt19937_64 g_sampler_rng{std::random_device{}()};
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
@@ -2085,6 +220,7 @@ int main(int argc, char ** argv) {
     bool  draft_feature_mirror = false;
     bool  target_split_load_draft = false;
     bool  target_split_dflash = false;
+    bool  pflash = false;
     int   target_gpu = 0;
     int   draft_gpu = 0;
     std::vector<int> target_gpus;
@@ -2135,6 +271,9 @@ int main(int argc, char ** argv) {
         else if (std::strcmp(argv[i], "--target-split-dflash") == 0) {
             target_split_dflash = true;
             target_split_load_draft = true;
+        }
+        else if (std::strcmp(argv[i], "--pflash") == 0) {
+            pflash = true;
         }
         else if (std::strncmp(argv[i], "--target-gpu=", 13) == 0) {
             target_gpu = std::max(0, std::atoi(argv[i] + 13));
@@ -2288,10 +427,10 @@ int main(int argc, char ** argv) {
     if (target_split_dflash) target_split_load_draft = true;
     if (target_gpus.empty()) target_gpus.push_back(target_gpu);
     if (target_gpus.size() == 1) target_gpu = target_gpus[0];
-    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_swa=%d draft_ctx_max=%d draft_feature_mirror=%d target_gpu=%d draft_gpu=%d\n",
+    std::printf("[cfg] seq_verify=%d fast_rollback=%d ddtree=%d budget=%d temp=%.2f chain_seed=%d fa_window=%d draft_swa=%d draft_ctx_max=%d draft_feature_mirror=%d pflash=%d target_gpu=%d draft_gpu=%d\n",
                 (int)seq_verify, (int)fast_rollback, (int)ddtree_mode,
                 ddtree_budget, ddtree_temp, (int)ddtree_chain_seed, g_fa_window,
-                g_draft_swa_window, g_draft_ctx_max, (int)draft_feature_mirror, target_gpu, draft_gpu);
+                g_draft_swa_window, g_draft_ctx_max, (int)draft_feature_mirror, (int)pflash, target_gpu, draft_gpu);
 
     int cuda_device_count = 0;
     cudaGetDeviceCount(&cuda_device_count);
@@ -2351,7 +490,8 @@ int main(int argc, char ** argv) {
     std::printf("[target] %s\n", dflash27b_last_error());
 
     DraftWeights dw;
-    {
+    bool has_draft = false;
+    if (draft_path != nullptr) {
         // Auto-detect draft format: .gguf → GGUF loader, else safetensors.
         std::string dp(draft_path);
         bool draft_ok = false;
@@ -2364,17 +504,20 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "draft load: %s\n", dflash27b_last_error());
             return 1;
         }
-    }
-    std::printf("[draft]  loaded\n");
+        has_draft = true;
+        std::printf("[draft]  loaded\n");
 
-    // Apply --draft-swa=N: mark layers 0..n-2 as SWA, last layer stays full.
-    if (g_draft_swa_window > 0) {
-        dw.swa_window = g_draft_swa_window;
-        for (int il = 0; il < dw.n_layer - 1; il++) {
-            dw.layers[il].is_swa = true;
+        // Apply --draft-swa=N: mark layers 0..n-2 as SWA, last layer stays full.
+        if (g_draft_swa_window > 0) {
+            dw.swa_window = g_draft_swa_window;
+            for (int il = 0; il < dw.n_layer - 1; il++) {
+                dw.layers[il].is_swa = true;
+            }
+            std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
+                        dw.n_layer - 1, dw.n_layer, dw.swa_window);
         }
-        std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
-                    dw.n_layer - 1, dw.n_layer, dw.swa_window);
+    } else {
+        std::printf("[draft]  none (target-only mode)\n");
     }
 
     const int max_ctx = g_max_ctx_override > 0 ? g_max_ctx_override : 4096;
@@ -2678,17 +821,19 @@ int main(int argc, char ** argv) {
 
     while (true) {
         std::string prompt_file_str;
-        bool restore_from_slot        = false;
-        int  restore_slot_id          = -1;
-        bool chain_restore_requested  = false;
-        int  chain_thick_slot         = -1;
-        std::vector<int> chain_thin_ids;
         // Inline-snap: snapshot at boundary during prefill (single snap only;
         // multi-snap "snap=A:1,B:2" is not implemented — use separate SNAPSHOT).
         int  snap_pos  = -1;
         int  snap_slot = -1;
 
         if (daemon_mode) {
+            // Minimal DecodeCtx for snapshot command dispatch.
+            // Only pflash and stream_fd are set; other fields have
+            // safe defaults and are not touched by the snapshot module.
+            dflash27b::DecodeCtx ctx;
+            ctx.pflash    = pflash;
+            ctx.stream_fd = stream_fd;
+
             std::string line;
             if (!std::getline(std::cin, line)) break;
             g_sampler = SamplerCfg{};
@@ -2706,8 +851,10 @@ int main(int argc, char ** argv) {
             if (starts_with(line, "park")) {
                 bool want_draft  = (line == "park" || line == "park all" || line == "park draft");
                 bool want_target = (line == "park" || line == "park all" || line == "park target");
-                if (want_draft && !draft_parked) {
+                if (want_draft && has_draft && !draft_parked) {
                     free_draft_weights(dw);
+                    step_graph_destroy(draft_sg);
+                    step_graph_destroy(proj_sg);
                     draft_parked = true;
                     std::printf("[park] draft released\n"); std::fflush(stdout);
                 }
@@ -2740,7 +887,7 @@ int main(int argc, char ** argv) {
                     target_parked = false;
                     std::printf("[unpark] target restored\n"); std::fflush(stdout);
                 }
-                if (want_draft && draft_parked) {
+                if (want_draft && has_draft && draft_parked) {
                     std::string dp(draft_path);
                     bool draft_ok = (dp.size() >= 5 && dp.substr(dp.size() - 5) == ".gguf")
                         ? load_draft_gguf(draft_path, draft_backend, dw)
@@ -2792,6 +939,11 @@ if (starts_with(line, "compress ")) {
                               "[compress] bad args, need: <bin> <keep_x1000> <drafter.gguf>\n");
                 stream_emit(-1); continue;
             }
+            if (!pflash) {
+                std::fprintf(stderr, "[compress] pflash is disabled (pass --pflash to enable)\n");
+                stream_emit(-1); continue;
+            }
+
             auto src_ids = read_uncounted_i32(ppath);
             if (src_ids.empty()) {
                 std::fprintf(stderr, "[compress] empty input\n");
@@ -2799,7 +951,7 @@ if (starts_with(line, "compress ")) {
             }
 
             // Park draft to make room for drafter (target stays resident).
-            const bool restore_draft = !draft_parked;
+            const bool restore_draft = has_draft && !draft_parked;
             if (restore_draft) {
                 free_draft_weights(dw);
                 draft_parked = true;
@@ -2866,430 +1018,15 @@ if (starts_with(line, "compress ")) {
         }
 
             // ── Prefix-cache snapshot commands (#59) ──────────────────────
-            // Check longer prefixes before shorter ones to avoid mis-dispatch
-            // (SNAPSHOT_THIN must come before SNAPSHOT, RESTORE_CHAIN before RESTORE).
-            if (line.rfind("SNAPSHOT_THIN ", 0) == 0) {
-                int slot = -1, kv_start = -1, kv_end = -1;
-                if (std::sscanf(line.c_str() + 14, "%d %d %d", &slot, &kv_start, &kv_end) != 3
-                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
-                    std::fprintf(stderr, "[snap] SNAPSHOT_THIN bad args\n");
-                    stream_emit(-1);
-                    continue;
-                }
-                if (!snapshot_target_cache_thin(w, cache, backend, kv_start, kv_end,
-                                                 prefix_snapshots[slot])) {
-                    std::fprintf(stderr, "[snap] thin failed slot=%d: %s\n", slot,
-                                 dflash27b_last_error());
-                    stream_emit(-1);
-                    continue;
-                }
-                std::printf("[snap] thin slot=%d kv=%d,%d\n", slot, kv_start, kv_end);
-                std::fflush(stdout);
-                stream_emit(-1);
-                continue;
+            if (handle_snapshot_command(ctx, prefix_snapshots,
+                                        PREFIX_CACHE_SLOTS, line,
+                                        backend, w, cache)) {
+                continue;  // self-contained command handled — next iteration
             }
-            if (line.rfind("SNAPSHOT ", 0) == 0) {
-                int slot = -1;
-                if (std::sscanf(line.c_str() + 9, "%d", &slot) != 1
-                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
-                    std::fprintf(stderr, "[snap] invalid slot %d\n", slot);
-                    stream_emit(-1);
-                    continue;
-                }
-                if (!snapshot_target_cache(w, cache, backend, prefix_snapshots[slot])) {
-                    std::fprintf(stderr, "[snap] failed slot=%d: %s\n", slot, dflash27b_last_error());
-                    stream_emit(-1);
-                    continue;
-                }
-                std::printf("[snap] slot=%d cur_pos=%d\n", slot, prefix_snapshots[slot].cur_pos);
-                std::fflush(stdout);
-                stream_emit(-1);
-                continue;
-            }
-            if (line.rfind("FREE_SNAPSHOT ", 0) == 0) {
-                int slot = -1;
-                if (std::sscanf(line.c_str() + 14, "%d", &slot) != 1
-                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS) {
-                    stream_emit(-1);
-                    continue;
-                }
-                free_prefix_snapshot(prefix_snapshots[slot]);
-                std::printf("[snap] freed slot=%d\n", slot);
-                std::fflush(stdout);
-                stream_emit(-1);
-                continue;
-            }
-            // ── SSD swap: SAVE_SNAPSHOT / LOAD_SNAPSHOT ────────────────
-            if (line.rfind("SAVE_SNAPSHOT ", 0) == 0) {
-                int slot_local = -1;
-                char snap_path[1024] = {0};
-                if (std::sscanf(line.c_str() + 14, "%d %1023s", &slot_local, snap_path) != 2
-                    || slot_local < 0 || slot_local >= PREFIX_CACHE_SLOTS) {
-                    std::fprintf(stderr, "[snap] SAVE_SNAPSHOT bad args\n");
-                    stream_emit(-1);
-                    continue;
-                }
-                PrefixSnapshot & ps = prefix_snapshots[slot_local];
-                if (!ps.ctx) {
-                    std::fprintf(stderr, "[snap] SAVE_SNAPSHOT slot %d empty\n", slot_local);
-                    stream_emit(-1);
-                    continue;
-                }
-                {
-                    // Serialize to disk: header + raw tensor bytes.
-                    // Header: magic(4) version(4) cur_pos(4) last_tok(4)
-                    //          max_ctx(4) kv_k_type(4) kv_v_type(4) target_feat_cap(4)
-                    //          is_thin(1) kv_start(4) kv_end(4)
-                    //          n_full_attn(4) n_delta(4)
-                    std::ofstream sf(snap_path, std::ios::binary);
-                    if (!sf) {
-                        std::fprintf(stderr, "[snap] SAVE_SNAPSHOT open %s failed\n", snap_path);
-                        stream_emit(-1);
-                        continue;
-                    }
-                    const char magic[4] = {'D', 'F', 'S', 'N'};
-                    const uint32_t version = 2;
-                    sf.write(magic, 4);
-                    uint32_t v = version;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.cur_pos;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.last_tok;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.max_ctx;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.kv_k_type;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.kv_v_type;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.target_feat_cap;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    char is_thin = (char)ps.is_thin;
-                    sf.write(&is_thin, 1);
-                    v = (uint32_t)ps.kv_start;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.kv_end;
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.attn_k_snap.size();
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-                    v = (uint32_t)ps.ssm_state_snap.size();
-                    sf.write(reinterpret_cast<char *>(&v), 4);
-
-                    auto write_tensor = [&sf, &v](ggml_tensor * t) -> bool {
-                        if (!t) return true;
-                        v = (uint32_t)t->type;
-                        sf.write(reinterpret_cast<char *>(&v), 4);
-                        // Shape dims
-                        for (int d = 0; d < (int)GGML_MAX_DIMS; d++) {
-                            v = (uint32_t)t->ne[d];
-                            sf.write(reinterpret_cast<char *>(&v), 4);
-                        }
-                        // Data size
-                        const size_t nbytes = ggml_nbytes(t);
-                        uint64_t nb64 = (uint64_t)nbytes;
-                        sf.write(reinterpret_cast<char *>(&nb64), 8);
-                        if (nbytes > 0) {
-                            // GPU -> host copy
-                            std::vector<uint8_t> buf(nbytes);
-                            ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
-                            sf.write(reinterpret_cast<char *>(buf.data()), (std::streamsize)nbytes);
-                        }
-                        return (bool)sf;
-                    };
-
-                    bool ok = true;
-                    for (auto * t : ps.attn_k_snap) if (!write_tensor(t)) { ok = false; break; }
-                    if (ok) for (auto * t : ps.attn_v_snap) if (!write_tensor(t)) { ok = false; break; }
-                    if (ok && !ps.is_thin) {
-                        for (auto * t : ps.ssm_state_snap) if (!write_tensor(t)) { ok = false; break; }
-                        if (ok) for (auto * t : ps.conv_state_snap) if (!write_tensor(t)) { ok = false; break; }
-                        if (ok && !write_tensor(ps.target_feat_snap)) ok = false;
-                    }
-                    sf.close();
-                    if (!ok) {
-                        std::fprintf(stderr, "[snap] SAVE_SNAPSHOT write failed slot=%d\n", slot_local);
-                        std::remove(snap_path);
-                        stream_emit(-1);
-                        continue;
-                    }
-                }
-                // Free VRAM for the slot after saving.
-                free_prefix_snapshot(prefix_snapshots[slot_local]);
-                std::printf("[snap] saved slot=%d %s\n", slot_local, snap_path);
-                std::fflush(stdout);
-                stream_emit(-1);
-                continue;
-            }
-            if (line.rfind("LOAD_SNAPSHOT ", 0) == 0) {
-                int slot_local = -1;
-                char snap_path[1024] = {0};
-                if (std::sscanf(line.c_str() + 14, "%d %1023s", &slot_local, snap_path) != 2
-                    || slot_local < 0 || slot_local >= PREFIX_CACHE_SLOTS) {
-                    std::fprintf(stderr, "[snap] LOAD_SNAPSHOT bad args\n");
-                    stream_emit(-1);
-                    continue;
-                }
-                PrefixSnapshot & ps = prefix_snapshots[slot_local];
-                std::ifstream sf(snap_path, std::ios::binary);
-                if (!sf) {
-                    std::fprintf(stderr, "[snap] LOAD_SNAPSHOT open %s failed\n", snap_path);
-                    stream_emit(-1);
-                    continue;
-                }
-                auto read_u32 = [&sf]() -> uint32_t {
-                    uint32_t v; sf.read(reinterpret_cast<char *>(&v), 4); return v;
-                };
-                auto read_u64 = [&sf]() -> uint64_t {
-                    uint64_t v; sf.read(reinterpret_cast<char *>(&v), 8); return v;
-                };
-                char hdr[4];
-                sf.read(hdr, 4);
-                if (hdr[0] != 'D' || hdr[1] != 'F' || hdr[2] != 'S' || hdr[3] != 'N') {
-                    std::fprintf(stderr, "[snap] LOAD_SNAPSHOT bad magic\n");
-                    stream_emit(-1);
-                    continue;
-                }
-                uint32_t version = read_u32();
-                if (version != 1 && version != 2) {
-                    std::fprintf(stderr, "[snap] LOAD_SNAPSHOT unsupported version %u\n", version);
-                    stream_emit(-1);
-                    continue;
-                }
-                int32_t cur_pos_load   = (int32_t)read_u32();
-                int32_t last_tok_load  = (int32_t)read_u32();
-                int32_t max_ctx_load   = (int32_t)read_u32();
-                ggml_type kv_k_load    = (ggml_type)read_u32();
-                ggml_type kv_v_load    = GGML_TYPE_COUNT;
-                if (version >= 2) {
-                    kv_v_load = (ggml_type)read_u32();
-                }
-                int32_t feat_cap_load  = (int32_t)read_u32();
-                char is_thin_byte;
-                sf.read(&is_thin_byte, 1);
-                bool is_thin_load = (is_thin_byte != 0);
-                int32_t kv_start_load = (int32_t)read_u32();
-                int32_t kv_end_load   = (int32_t)read_u32();
-                int n_full_attn_load  = (int)read_u32();
-                int n_delta_load      = (int)read_u32();
-
-                // Free any existing snapshot in this slot.
-                free_prefix_snapshot(ps);
-
-                // Phase 1: read metadata (type, shape, nbytes) for all tensors.
-                struct TensorMeta {
-                    ggml_type ttype;
-                    int64_t ne[GGML_MAX_DIMS] = {};
-                    uint64_t nbytes = 0;
-                    ggml_tensor * t = nullptr;
-                    std::vector<uint8_t> data;
-                };
-                std::vector<TensorMeta> metas;
-                const int n_tensors = 2 * n_full_attn_load
-                    + (is_thin_load ? 0 : 2 * n_delta_load + 1);
-                metas.reserve(n_tensors);
-
-                for (int i = 0; i < n_tensors; i++) {
-                    TensorMeta m;
-                    m.ttype = (ggml_type)read_u32();
-                    for (int d = 0; d < (int)GGML_MAX_DIMS; d++)
-                        m.ne[d] = (int64_t)read_u32();
-                    m.nbytes = read_u64();
-                    // Read tensor data into temp buffer (will copy to GPU later).
-                    if (m.nbytes > 0) {
-                        m.data.resize(m.nbytes);
-                        sf.read(reinterpret_cast<char *>(m.data.data()),
-                                (std::streamsize)m.nbytes);
-                    }
-                    metas.push_back(std::move(m));
-                }
-
-                // Phase 2: create ggml tensors from metadata.
-                {
-                    ggml_init_params ip{};
-                    ip.mem_size   = (size_t)(n_tensors + 16) * ggml_tensor_overhead();
-                    ip.mem_buffer = nullptr;
-                    ip.no_alloc   = true;
-                    ps.ctx = ggml_init(ip);
-                    if (!ps.ctx) {
-                        std::fprintf(stderr, "[snap] LOAD_SNAPSHOT ggml_init\n");
-                        stream_emit(-1);
-                        continue;
-                    }
-                    ps.attn_k_snap.assign(n_full_attn_load, nullptr);
-                    ps.attn_v_snap.assign(n_full_attn_load, nullptr);
-
-                    int idx = 0;
-                    for (int i = 0; i < n_full_attn_load; i++) {
-                        ps.attn_k_snap[i] = ggml_new_tensor_3d(ps.ctx, metas[idx].ttype,
-                            metas[idx].ne[0], metas[idx].ne[1], metas[idx].ne[2]);
-                        metas[idx].t = ps.attn_k_snap[i]; idx++;
-                        ps.attn_v_snap[i] = ggml_new_tensor_3d(ps.ctx, metas[idx].ttype,
-                            metas[idx].ne[0], metas[idx].ne[1], metas[idx].ne[2]);
-                        metas[idx].t = ps.attn_v_snap[i]; idx++;
-                    }
-                    if (!is_thin_load) {
-                        ps.ssm_state_snap.assign(n_delta_load, nullptr);
-                        ps.conv_state_snap.assign(n_delta_load, nullptr);
-                        for (int i = 0; i < n_delta_load; i++) {
-                            ps.ssm_state_snap[i] = ggml_new_tensor_3d(ps.ctx, metas[idx].ttype,
-                                metas[idx].ne[0], metas[idx].ne[1], metas[idx].ne[2]);
-                            metas[idx].t = ps.ssm_state_snap[i]; idx++;
-                        }
-                        for (int i = 0; i < n_delta_load; i++) {
-                            ps.conv_state_snap[i] = ggml_new_tensor_2d(ps.ctx, metas[idx].ttype,
-                                metas[idx].ne[0], metas[idx].ne[1]);
-                            metas[idx].t = ps.conv_state_snap[i]; idx++;
-                        }
-                        ps.target_feat_snap = ggml_new_tensor_2d(ps.ctx, metas[idx].ttype,
-                            metas[idx].ne[0], metas[idx].ne[1]);
-                        metas[idx].t = ps.target_feat_snap; idx++;
-                    }
-
-                    // Phase 3: allocate backend buffer (sets tensor data pointers).
-                    ps.buf = ggml_backend_alloc_ctx_tensors(ps.ctx, backend);
-                    if (!ps.buf) {
-                        std::fprintf(stderr, "[snap] LOAD_SNAPSHOT alloc failed\n");
-                        free_prefix_snapshot(ps);
-                        stream_emit(-1);
-                        continue;
-                    }
-
-                    // Phase 4: copy data from temp buffers to GPU tensors.
-                    for (auto & m : metas) {
-                        if (m.t && m.data.empty() == false) {
-                            ggml_backend_tensor_set(m.t, m.data.data(), 0, m.data.size());
-                        }
-                    }
-                }
-                ps.cur_pos         = cur_pos_load;
-                ps.last_tok        = last_tok_load;
-                ps.max_ctx         = max_ctx_load;
-                ps.kv_k_type       = kv_k_load;
-                if (version >= 2) {
-                    ps.kv_v_type = kv_v_load;
-                } else if (!ps.attn_v_snap.empty() && ps.attn_v_snap[0] != nullptr) {
-                    ps.kv_v_type = ps.attn_v_snap[0]->type;
-                } else {
-                    ps.kv_v_type = kv_k_load;
-                }
-                ps.target_feat_cap = feat_cap_load;
-                ps.is_thin         = is_thin_load;
-                ps.kv_start        = kv_start_load;
-                ps.kv_end          = kv_end_load;
-                sf.close();
-                std::printf("[snap] loaded slot=%d %s\n", slot_local, snap_path);
-                std::fflush(stdout);
-                stream_emit(-1);
-                continue;
-            }
-            if (line == "LIST_SLOTS") {
-                std::printf("[snap] slots=");
-                bool first = true;
-                for (int i = 0; i < PREFIX_CACHE_SLOTS; i++) {
-                    if (prefix_snapshots[i].ctx != nullptr) {
-                        std::printf("%s%d", first ? "" : ",", i);
-                        first = false;
-                    }
-                }
-                std::printf("\n");
-                std::fflush(stdout);
-                continue;
-            }
-            if (line.rfind("RESTORE_CHAIN ", 0) == 0) {
-                // Format: RESTORE_CHAIN <thick_slot> <thin_slot_list> <prompt_file> <n_gen>
-                // <thin_slot_list> is "0,1,2" or "-" for empty.
-                int  thick_slot_local = -2;
-                char thin_str[256]    = {0};
-                char ppath[1024]      = {0};
-                int  n_gen_local      = 0;
-                if (std::sscanf(line.c_str() + 14, "%d %255s %1023s %d",
-                                &thick_slot_local, thin_str, ppath, &n_gen_local) != 4) {
-                    std::fprintf(stderr, "[snap] RESTORE_CHAIN bad args\n");
-                    stream_emit(-1);
-                    continue;
-                }
-                // Validate thick_slot (-1 = none).
-                if (thick_slot_local != -1
-                    && (thick_slot_local < 0 || thick_slot_local >= PREFIX_CACHE_SLOTS
-                        || prefix_snapshots[thick_slot_local].ctx == nullptr
-                        || prefix_snapshots[thick_slot_local].is_thin)) {
-                    std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thick slot=%d\n", thick_slot_local);
-                    stream_emit(-1);
-                    continue;
-                }
-                // Parse thin slot list. Strict: every comma-separated token
-                // must be a valid non-negative integer (rejects "1,foo,3",
-                // empty entries "1,,3", trailing junk). Codex review fix.
-                std::vector<int> thin_ids_local;
-                bool thin_parse_ok = true;
-                if (std::strcmp(thin_str, "-") != 0 && thin_str[0] != '\0') {
-                    const char * p = thin_str;
-                    while (*p && thin_parse_ok) {
-                        char * end = nullptr;
-                        long id_l = std::strtol(p, &end, 10);
-                        if (end == p) {
-                            std::fprintf(stderr,
-                                "[snap] RESTORE_CHAIN malformed thin list near '%s'\n", p);
-                            thin_parse_ok = false; break;
-                        }
-                        int id = (int)id_l;
-                        if (id < 0 || id >= PREFIX_CACHE_SLOTS
-                            || prefix_snapshots[id].ctx == nullptr
-                            || !prefix_snapshots[id].is_thin) {
-                            std::fprintf(stderr, "[snap] RESTORE_CHAIN bad thin slot=%d\n", id);
-                            thin_parse_ok = false; break;
-                        }
-                        thin_ids_local.push_back(id);
-                        if (*end == '\0') break;
-                        if (*end != ',') {
-                            std::fprintf(stderr,
-                                "[snap] RESTORE_CHAIN expected ',' after slot %d, got '%c'\n",
-                                id, *end);
-                            thin_parse_ok = false; break;
-                        }
-                        p = end + 1;
-                        if (*p == '\0' || *p == ',') {
-                            std::fprintf(stderr,
-                                "[snap] RESTORE_CHAIN empty thin slot entry\n");
-                            thin_parse_ok = false; break;
-                        }
-                    }
-                }
-                if (!thin_parse_ok) {
-                    stream_emit(-1);
-                    continue;
-                }
-                n_gen                    = n_gen_local;
-                prompt_file_str          = ppath;
-                prompt_path              = prompt_file_str.c_str();
-                chain_restore_requested  = true;
-                chain_thick_slot         = thick_slot_local;
-                chain_thin_ids           = std::move(thin_ids_local);
-                // Fall through into the existing cache-rebuild + prefill path.
-            } else if (line.rfind("RESTORE ", 0) == 0) {
-                int slot = -1;
-                char ppath[1024];
-                if (std::sscanf(line.c_str() + 8, "%d %1023s %d", &slot, ppath, &n_gen) != 3
-                    || slot < 0 || slot >= PREFIX_CACHE_SLOTS
-                    || prefix_snapshots[slot].ctx == nullptr) {
-                    std::fprintf(stderr, "[snap] RESTORE bad args or empty slot %d\n", slot);
-                    stream_emit(-1);
-                    continue;
-                }
-                prompt_file_str = ppath;
-                prompt_path = prompt_file_str.c_str();
-                restore_from_slot = true;
-                restore_slot_id   = slot;
-                // Parse optional inline-snap suffix: snap=<pos>:<slot_id>
-                if (const char * sp = std::strstr(line.c_str(), "snap=")) {
-                    if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
-                        || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
-                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
-                        snap_pos = -1; snap_slot = -1;
-                    }
-                }
-                // Fall through into the existing prefill path; the cache reset
-                // and restore happen after the cache rebuild block below.
+            // Fall-through: RESTORE_CHAIN or RESTORE was parsed.
+            if (ctx.chain_restore_requested || ctx.restore_from_slot) {
+                prompt_path = ctx.prompt_file_str.c_str();
+                n_gen       = ctx.n_gen;
             } else {
                 // Legacy: bare `<prompt_file> <n_gen>` line — full reset path.
                 char ppath[1024];
@@ -3300,7 +1037,6 @@ if (starts_with(line, "compress ")) {
                 if (const char * sp = std::strstr(line.c_str(), "snap=")) {
                     if (std::sscanf(sp, "snap=%d:%d", &snap_pos, &snap_slot) != 2
                         || snap_slot < 0 || snap_slot >= PREFIX_CACHE_SLOTS) {
-                        std::fprintf(stderr, "[snap] bad inline-snap arg\n");
                         snap_pos = -1; snap_slot = -1;
                     }
                 }
@@ -3316,42 +1052,9 @@ if (starts_with(line, "compress ")) {
             }
             daemon_first_iter = false;
 
-            // After cache is fresh, optionally restore from snapshot.
-            if (restore_from_slot) {
-                if (!restore_target_cache(prefix_snapshots[restore_slot_id], cache)) {
-                    std::fprintf(stderr, "[snap] restore failed: %s\n", dflash27b_last_error());
-                    stream_emit(-1);
-                    continue;
-                }
-                std::printf("[snap] restored slot=%d cur_pos=%d\n",
-                            restore_slot_id, cache.cur_pos);
-                std::fflush(stdout);
-                free_prefix_snapshot(prefix_snapshots[restore_slot_id]);
-            }
-
-            // After cache is fresh, optionally apply chain restore.
-            if (chain_restore_requested) {
-                const PrefixSnapshot * thick_ptr =
-                    (chain_thick_slot == -1) ? nullptr : &prefix_snapshots[chain_thick_slot];
-                std::vector<const PrefixSnapshot *> thin_ptrs;
-                for (int id : chain_thin_ids) thin_ptrs.push_back(&prefix_snapshots[id]);
-                if (!restore_target_cache_chain(thick_ptr,
-                                                 thin_ptrs.empty() ? nullptr : thin_ptrs.data(),
-                                                 (int)thin_ptrs.size(),
-                                                 cache)) {
-                    std::fprintf(stderr, "[snap] RESTORE_CHAIN failed: %s\n", dflash27b_last_error());
-                    stream_emit(-1);
-                    continue;
-                }
-                std::printf("[snap] chain restored thick=%d thins=%zu cur_pos=%d\n",
-                            chain_thick_slot, thin_ptrs.size(), cache.cur_pos);
-                std::fflush(stdout);
-                if (chain_thick_slot >= 0) {
-                    free_prefix_snapshot(prefix_snapshots[chain_thick_slot]);
-                }
-                for (int id : chain_thin_ids) {
-                    free_prefix_snapshot(prefix_snapshots[id]);
-                }
+            // Apply pending snapshot / chain restore (set by handle_snapshot_command).
+            if (!apply_snapshot_restore(ctx, prefix_snapshots, cache)) {
+                continue;
             }
         }
 
@@ -3727,6 +1430,63 @@ if (starts_with(line, "compress ")) {
         }
         std::printf("[draft-mirror] synced tail committed=%d cap=%d\n",
                     committed, feature_mirror.cap);
+    }
+
+    // ── Target-only autoregressive decode (no draft) ──
+    if (!has_draft) {
+        auto t_gen0 = std::chrono::steady_clock::now();
+        int n_generated = 0;
+        while (n_generated < n_gen) {
+            if (!build_target_step(sg, w, cache, backend,
+                                    committed, /*n_tokens=*/1,
+                                    /*with_mask=*/false, /*capture=*/true,
+                                    /*capture_delta_intermediate=*/false,
+                                    /*fa_window=*/g_fa_window,
+                                    /*last_token_logits_only=*/false)) {
+                std::fprintf(stderr, "target decode build failed\n"); return 1;
+            }
+            std::vector<float> single_embed(hidden);
+            if (!w.embedder.embed(&last_tok, 1, single_embed.data())) return 1;
+            ggml_backend_tensor_set(sg.inp_embed, single_embed.data(), 0,
+                                    sizeof(float) * hidden);
+
+            int32_t pos4[4] = {committed, committed, committed, 0};
+            ggml_backend_tensor_set(sg.positions, pos4, 0, sizeof(int32_t) * 4);
+
+            auto st = ggml_backend_graph_compute(backend, sg.gf);
+            if (st != GGML_STATUS_SUCCESS) {
+                std::fprintf(stderr, "target decode compute failed\n"); return 1;
+            }
+
+            std::vector<float> logits_buf(vocab);
+            ggml_backend_tensor_get(sg.logits, logits_buf.data(), 0,
+                                    sizeof(float) * vocab);
+
+            last_tok = (g_sampler.temp > 0.0f)
+                ? sample_logits(logits_buf.data(), vocab, g_sampler, out_all, g_sampler_rng)
+                : argmax_f32(logits_buf.data(), vocab);
+
+            out_all.push_back(last_tok);
+            stream_emit(last_tok);
+            committed++;
+            n_generated++;
+            if (IS_EOS_TOK(last_tok, w)) break;
+        }
+        auto t_gen1 = std::chrono::steady_clock::now();
+        double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
+        double tps = n_generated / std::max(1e-9, gen_s);
+        std::printf("\n[target] generated %d tokens in %.3f s  ->  %.2f tok/s\n",
+                    n_generated, gen_s, tps);
+
+        if (daemon_mode) {
+            cache.cur_pos  = (int)out_all.size();
+            cache.last_tok = last_tok;
+            stream_emit(-1);
+        } else {
+            if (out_path) write_int32_file(out_path, out_all);
+            break;
+        }
+        continue;  // back to daemon while(true)
     }
 
     // ── DFlash decode loop
