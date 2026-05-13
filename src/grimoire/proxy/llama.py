@@ -130,6 +130,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             try:
                 rr = await client.post(f"{slot_url}?action=restore",
                     json={"filename": kv_name}, timeout=5)
+                log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
                 if rr.status_code == 200:
                     log.warning(f"pflash kv: restored {kv_name}")
             except Exception as e:
@@ -192,6 +193,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         slot_url = f"http://127.0.0.1:{active.port}/slots/0"
                         rr = await sc.post(f"{slot_url}?action=save",
                             json={"filename": _kv_save_key})
+                        log.warning(f"pflash kv: save status {rr.status_code} for {_kv_save_key}")
                         if rr.status_code == 200:
                             log.warning(f"pflash kv: saved {_kv_save_key}")
                 except Exception as e:
