@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 1ad83fa..12a7d02 100644
+index 1ad83fa9e425e60c64f9502b7ceaaee89347e131..12a7d02eb2125b009d949ddd3dc6d99fab5ce75b 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -3506,7 +3506,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
@@ -45,7 +45,7 @@ index 1ad83fa..12a7d02 100644
          {"--spec-ngram-size-n"}, "N",
          string_format("ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_size_n),
 diff --git a/common/common.cpp b/common/common.cpp
-index 24e91f2..ac6266d 100644
+index 24e91f2d6c0f83790197d9557d9f63238c170d98..ac6266d0f4b0e61141c2ef942e216eaeb6bc494d 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
 @@ -1524,6 +1524,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
@@ -58,14 +58,14 @@ index 24e91f2..ac6266d 100644
  }
  
 diff --git a/common/common.h b/common/common.h
-index 4137a87..7a504c5 100644
+index 4137a87f1d2040e806837f3356ba0a0816b3d994..45b54d71b40f9479247c2a28497fc20a1fda5143 100644
 --- a/common/common.h
 +++ b/common/common.h
 @@ -164,6 +164,7 @@ enum common_speculative_type {
      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
      COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
      COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-+    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash launch-contract compatibility; native implementation not yet ported
++    COMMON_SPECULATIVE_TYPE_DFLASH,        // native DFlash draft-model speculation
      COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
  };
  
@@ -73,13 +73,13 @@ index 4137a87..7a504c5 100644
      std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
      std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
  
-+    int32_t dflash_cross_ctx = 512; // DFlash cross-attention window placeholder until native DFlash is ported
++    int32_t dflash_cross_ctx = 512; // DFlash cross-attention window in tokens
 +
      bool has_dft() const {
          return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
      }
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index b2e6d8e..d3783dc 100644
+index b2e6d8e8d89b55600e21fa458e614c1bec70dd8c..d3783dc35bfaa85559c4a1b61776170246e56838 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -607,6 +607,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
@@ -198,7 +198,7 @@ index b2e6d8e..d3783dc 100644
      std::vector<int> idxs(draft.size() + 1);
      for (size_t i = 0; i < idxs.size(); ++i) {
 diff --git a/common/sampling.h b/common/sampling.h
-index 5b57ad6..c470e8f 100644
+index 5b57ad658119339ce698d7a5f500179482100b8c..c470e8f974ffcf8e835d14487236f0f79131961a 100644
 --- a/common/sampling.h
 +++ b/common/sampling.h
 @@ -64,6 +64,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
@@ -229,10 +229,18 @@ index 5b57ad6..c470e8f 100644
  std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
  
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 20e38be..0cafad7 100644
+index 20e38bec46ceda4b72088278648b1242cd58e9b9..26939f2adbb36f2091c69c777b32832d9de7d826 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
-@@ -26,7 +26,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
+@@ -10,6 +10,7 @@
+ #include "sampling.h"
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cstring>
+ #include <iomanip>
+ #include <map>
+@@ -26,7 +27,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
      COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
@@ -242,7 +250,7 @@ index 20e38be..0cafad7 100644
  };
  
  const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
-@@ -37,7 +38,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
+@@ -37,7 +39,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
      {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
      {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
      {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
@@ -252,7 +260,250 @@ index 20e38be..0cafad7 100644
  };
  
  struct common_speculative_config {
-@@ -901,6 +903,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
+@@ -142,6 +145,10 @@ struct common_speculative_state {
+             llama_token id_last,
+             llama_tokens & result) = 0;
+ 
++    virtual void set_seq_id(llama_seq_id seq_id) {
++        GGML_UNUSED(seq_id);
++    }
++
+     virtual void accept(uint16_t n_accepted) = 0;
+ };
+ 
+@@ -550,6 +557,231 @@ struct common_speculative_state_draft : public common_speculative_state {
+     }
+ };
+ 
++struct common_speculative_state_dflash : public common_speculative_state {
++    llama_context * ctx_tgt;
++    llama_context * ctx_dft;
++    llama_seq_id    seq_id = 0;
++
++    int         block_size = 0;
++    llama_token mask_token_id = LLAMA_TOKEN_NULL;
++    int         n_target_layers = 0;
++    int         n_embd = 0;
++    int         n_target_features = 0;
++    int         cross_ctx = LLAMA_DFLASH_PER_SLOT_CTX;
++
++    llama_batch batch_dft;
++    std::vector<float> history;
++
++    common_speculative_state_dflash(
++            llama_context * ctx_tgt,
++            llama_context * ctx_dft,
++            const llama_model * model_dft,
++            int cross_ctx)
++        : common_speculative_state(COMMON_SPECULATIVE_TYPE_DFLASH)
++        , ctx_tgt(ctx_tgt)
++        , ctx_dft(ctx_dft)
++        , cross_ctx(std::max(1, cross_ctx)) {
++        block_size = std::max(1, llama_model_dflash_block_size(model_dft));
++        mask_token_id = (llama_token) llama_model_dflash_mask_token_id(model_dft);
++        n_target_layers = llama_model_dflash_n_target_layers(model_dft);
++        n_embd = llama_model_n_embd(model_dft);
++        n_target_features = llama_model_dflash_n_target_features(model_dft);
++
++        GGML_ASSERT(n_target_layers > 0);
++        GGML_ASSERT(n_embd > 0);
++        GGML_ASSERT(n_target_features == n_target_layers * n_embd);
++
++        std::vector<int32_t> capture_layers((size_t) n_target_layers);
++        llama_model_dflash_target_layer_ids(model_dft, capture_layers.data(), n_target_layers);
++        llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);
++
++        batch_dft = llama_batch_init(block_size, 0, 1);
++    }
++
++    ~common_speculative_state_dflash() override {
++        llama_perf_context_print(ctx_dft);
++        llama_free(ctx_dft);
++        llama_batch_free(batch_dft);
++    }
++
++    void set_seq_id(llama_seq_id seq_id_) override {
++        seq_id = seq_id_;
++        llama_set_dflash_n_slots(ctx_tgt, std::max(1, (int) seq_id_ + 1));
++    }
++
++    size_t history_tokens() const {
++        return n_target_features > 0 ? history.size() / (size_t) n_target_features : 0;
++    }
++
++    int append_hidden_rows(int src_offset, int requested_rows, bool reset_history) {
++        if (requested_rows <= 0) {
++            if (reset_history) {
++                history.clear();
++            }
++            return 0;
++        }
++
++        llama_dflash_set_active_slot(ctx_tgt, seq_id);
++
++        const int n_layers_avail = llama_get_n_layer_hiddens(ctx_tgt);
++        if (n_layers_avail < n_target_layers) {
++            if (reset_history) {
++                history.clear();
++            }
++            return 0;
++        }
++
++        int actual_rows = requested_rows;
++        for (int layer = 0; layer < n_target_layers; ++layer) {
++            const float * data = llama_get_layer_hidden(ctx_tgt, layer);
++            const int64_t n_tokens = llama_get_layer_hidden_n_tokens(ctx_tgt, layer);
++            const int64_t n_embd_layer = llama_get_layer_hidden_n_embd(ctx_tgt, layer);
++            if (!data || n_tokens <= 0 || n_embd_layer != n_embd) {
++                if (reset_history) {
++                    history.clear();
++                }
++                return 0;
++            }
++
++            actual_rows = std::min(actual_rows, std::max(0, (int) n_tokens - src_offset));
++        }
++
++        if (actual_rows <= 0) {
++            if (reset_history) {
++                history.clear();
++            }
++            return 0;
++        }
++
++        const size_t old_tokens = reset_history ? 0 : history_tokens();
++        const size_t keep_limit = cross_ctx > 0 ? (size_t) cross_ctx : old_tokens + (size_t) actual_rows;
++        const size_t old_keep = reset_history ? 0 : std::min(old_tokens, keep_limit > (size_t) actual_rows ? keep_limit - (size_t) actual_rows : 0);
++        const size_t new_tokens = old_keep + (size_t) actual_rows;
++
++        std::vector<float> next(new_tokens * (size_t) n_target_features);
++        if (!reset_history && old_keep > 0) {
++            const size_t old_offset = old_tokens - old_keep;
++            memcpy(next.data(),
++                    history.data() + old_offset * (size_t) n_target_features,
++                    old_keep * (size_t) n_target_features * sizeof(float));
++        }
++
++        for (int layer = 0; layer < n_target_layers; ++layer) {
++            const float * data = llama_get_layer_hidden(ctx_tgt, layer);
++            for (int row = 0; row < actual_rows; ++row) {
++                memcpy(next.data() + (old_keep + (size_t) row) * (size_t) n_target_features + (size_t) layer * (size_t) n_embd,
++                        data + (size_t) (src_offset + row) * (size_t) n_embd,
++                        (size_t) n_embd * sizeof(float));
++            }
++        }
++
++        history.swap(next);
++        return actual_rows;
++    }
++
++    void capture_target_hiddens() {
++        llama_dflash_set_active_slot(ctx_tgt, seq_id);
++
++        const int n_layers_avail = llama_get_n_layer_hiddens(ctx_tgt);
++        if (n_layers_avail < n_target_layers) {
++            history.clear();
++            return;
++        }
++
++        int n_tokens = 0;
++        for (int layer = 0; layer < n_target_layers; ++layer) {
++            n_tokens = std::max(n_tokens, (int) llama_get_layer_hidden_n_tokens(ctx_tgt, layer));
++        }
++
++        if (n_tokens <= 0) {
++            history.clear();
++            return;
++        }
++
++        const int start = std::max(0, n_tokens - cross_ctx);
++        append_hidden_rows(start, n_tokens - start, true);
++    }
++
++    void append_target_hiddens(int n_rows) {
++        append_hidden_rows(0, n_rows, false);
++    }
++
++    void begin(const llama_tokens & prompt) override {
++        GGML_UNUSED(prompt);
++        capture_target_hiddens();
++    }
++
++    void draft(
++            const common_params_speculative & params,
++            const llama_tokens & prompt_tgt,
++            llama_token id_last,
++            llama_tokens & result) override {
++        GGML_UNUSED(prompt_tgt);
++
++        result.clear();
++        if (history.empty()) {
++            return;
++        }
++
++        const int n_draft = std::min(params.n_max, block_size - 1);
++        if (n_draft <= 0) {
++            return;
++        }
++
++        const int cross_len = (int) history_tokens();
++        llama_set_cross_data_seq(ctx_dft, seq_id, history.data(), n_target_features, cross_len);
++        llama_memory_clear(llama_get_memory(ctx_dft), false);
++
++        common_batch_clear(batch_dft);
++        common_batch_add(batch_dft, id_last, cross_len, { 0 }, true);
++        for (int i = 1; i < n_draft + 1; ++i) {
++            common_batch_add(batch_dft, mask_token_id, cross_len + i, { 0 }, true);
++        }
++
++        const int ret = llama_decode(ctx_dft, batch_dft);
++        if (ret != 0) {
++            LOG_WRN("%s: dflash draft decode failed: %d\n", __func__, ret);
++            return;
++        }
++
++        int32_t * argmax = llama_get_logits_argmax(ctx_dft);
++        float * argmax_probs = llama_get_logits_argmax_probs(ctx_dft);
++        const int k_flat = llama_get_logits_argmax_k(ctx_dft);
++
++        if (argmax != nullptr) {
++            for (int i = 1; i < n_draft + 1; ++i) {
++                if (argmax_probs && params.p_min > 0.0f && i > 1) {
++                    const float log_prob = argmax_probs[i * k_flat];
++                    if (log_prob < logf(params.p_min)) {
++                        break;
++                    }
++                }
++
++                result.push_back((llama_token) argmax[i * k_flat]);
++            }
++            return;
++        }
++
++        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
++        for (int i = 1; i < n_draft + 1; ++i) {
++            const float * logits = llama_get_logits_ith(ctx_dft, i);
++            if (!logits) {
++                break;
++            }
++
++            const llama_token best = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
++            result.push_back(best);
++        }
++    }
++
++    void accept(uint16_t n_accepted) override {
++        // Canonical server/common_speculative_accept passes the number of draft
++        // tokens that matched, but the next prompt prefix also includes the
++        // already-sampled target token that started the verification batch.
++        append_target_hiddens((int) n_accepted + 1);
++    }
++};
++
+ struct common_speculative_state_eagle3 : public common_speculative_state {
+     common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
+ 
+@@ -901,6 +1133,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
          case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
          case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
          case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
@@ -260,39 +511,116 @@ index 20e38be..0cafad7 100644
          default:                                    return "unknown";
      }
  }
-@@ -918,8 +921,9 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
+@@ -918,6 +1151,7 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
  common_speculative * common_speculative_init(
          common_params_speculative & params,
          llama_context             * ctx_tgt) {
 +    const bool wants_dflash = params.type == COMMON_SPECULATIVE_TYPE_DFLASH;
      llama_context * ctx_dft = nullptr;
--    if (params.model_dft) {
-+    if (params.model_dft && !wants_dflash) {
+     if (params.model_dft) {
          ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
-         if (ctx_dft == nullptr) {
-             LOG_ERR("%s", "failed to create draft context\n");
-@@ -930,7 +934,7 @@ common_speculative * common_speculative_init(
+@@ -930,7 +1164,8 @@ common_speculative * common_speculative_init(
      // Compute the implementations to use based on the config and their order of preference
      std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
      {
 -        bool has_draft = !params.mparams_dft.path.empty();
-+        bool has_draft = params.has_dft() && !wants_dflash;
++        bool has_draft = params.model_dft != nullptr && !wants_dflash;
++        bool has_dflash = wants_dflash && params.model_dft != nullptr;
          bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
  
          bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
-@@ -939,6 +943,10 @@ common_speculative * common_speculative_init(
+@@ -939,6 +1174,10 @@ common_speculative * common_speculative_init(
          bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
          bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
  
-+        if (wants_dflash) {
-+            LOG_WRN("%s", "DFlash launch contract recognized, but this build does not yet include a native DFlash implementation\n");
++        if (wants_dflash && !has_dflash) {
++            LOG_WRN("%s", "DFlash requires a loaded draft model\n");
 +        }
 +
          // In a more complex implementation we could use the same implementation but with different parameters.
          // This was initially used in PR-18471 but removed to simplify the code.
          if (has_ngram_simple) {
+@@ -971,6 +1210,9 @@ common_speculative * common_speculative_init(
+         if (has_ngram_cache) {
+             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
+         }
++        if (has_dflash) {
++            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DFLASH, params));
++        }
+         if (has_draft) {
+             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
+         }
+@@ -997,6 +1239,17 @@ common_speculative * common_speculative_init(
+                 ));
+                 break;
+             }
++            case COMMON_SPECULATIVE_TYPE_DFLASH: {
++                GGML_ASSERT(ctx_dft != nullptr);
++                impls.push_back(std::make_unique<common_speculative_state_dflash>(
++                    /* .ctx_tgt    = */ ctx_tgt,
++                    /* .ctx_dft    = */ ctx_dft,
++                    /* .model_dft  = */ params.model_dft,
++                    /* .cross_ctx  = */ params.dflash_cross_ctx
++                ));
++                ctx_dft = nullptr;
++                break;
++            }
+             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
+                 impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                 break;
+@@ -1043,6 +1296,9 @@ common_speculative * common_speculative_init(
+     }
+ 
+     if (impls.empty()) {
++        if (ctx_dft != nullptr) {
++            llama_free(ctx_dft);
++        }
+         LOG_WRN("%s", "no implementations specified for speculative decoding\n");
+         return nullptr;
+     }
+@@ -1063,6 +1319,16 @@ void common_speculative_free(common_speculative * spec) {
+     delete spec;
+ }
+ 
++void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id) {
++    if (spec == nullptr) {
++        return;
++    }
++
++    for (auto & impl : spec->impls) {
++        impl->set_seq_id(seq_id);
++    }
++}
++
+ void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt) {
+     if (spec == nullptr) {
+         return;
+@@ -1108,7 +1374,7 @@ llama_tokens common_speculative_draft(
+ }
+ 
+ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted) {
+-    if (n_accepted == 0) {
++    if (spec == nullptr) {
+         return;
+     }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index bca78d32b5b361507b8f9fc892d93f004d84e384..1d68c442daeece3b064f18ad51d8b1a6aadf29cc 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -18,6 +18,10 @@ common_speculative * common_speculative_init(
+         common_params_speculative & params,
+         llama_context             * ctx_tgt);
+ 
++void common_speculative_set_seq_id(
++        common_speculative * spec,
++        llama_seq_id         seq_id);
++
+ void common_speculative_free(common_speculative * spec);
+ 
+ // optionally call once at the beginning of a new generation
 diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
-index 5b4fb79..5dee3ff 100755
+index 5b4fb79fc1b3d2bcc434ecbd6be3e0dac6d31066..5dee3fff1b905d29520ebebf2b50ff1961f91c71 100755
 --- a/convert_hf_to_gguf.py
 +++ b/convert_hf_to_gguf.py
 @@ -4743,6 +4743,56 @@ class Qwen3Model(Qwen2Model):
@@ -352,8 +680,53 @@ index 5b4fb79..5dee3ff 100755
  @ModelBase.register("Qwen3MoeForCausalLM")
  class Qwen3MoeModel(Qwen2MoeModel):
      model_arch = gguf.MODEL_ARCH.QWEN3MOE
+diff --git a/examples/speculative-simple/speculative-simple.cpp b/examples/speculative-simple/speculative-simple.cpp
+index a03dbce887f2160388f52ef1a531991e401af2dd..0f6a02acdb4c55caa8f7ad92e511c893d54e410a 100644
+--- a/examples/speculative-simple/speculative-simple.cpp
++++ b/examples/speculative-simple/speculative-simple.cpp
+@@ -79,6 +79,16 @@ int main(int argc, char ** argv) {
+             return 1;
+         }
+ 
++        if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
++            params.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
++            params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
++            LOG_INF("auto-detected DFlash drafter (block_size=%d)\n", llama_model_dflash_block_size(model_dft.get()));
++        }
++
++        if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
++            llama_model_share_tensors(model_dft.get(), model_tgt);
++        }
++
+         params.speculative.model_dft = model_dft.get();
+         params.speculative.cparams_dft = common_context_params_to_llama(params_dft);
+     }
+@@ -137,6 +147,7 @@ int main(int argc, char ** argv) {
+     const auto & params_spec = params.speculative;
+ 
+     struct common_speculative * spec = common_speculative_init(params.speculative, ctx_tgt);
++    common_speculative_set_seq_id(spec, 0);
+ 
+     common_speculative_begin(spec, prompt_tgt);
+ 
+diff --git a/examples/speculative/speculative.cpp b/examples/speculative/speculative.cpp
+index 8f56a659b3e087805892c8f611aa507b2c415ebe..75a8b62a2e8363cc525713ce65339da852820a41 100644
+--- a/examples/speculative/speculative.cpp
++++ b/examples/speculative/speculative.cpp
+@@ -95,6 +95,11 @@ int main(int argc, char ** argv) {
+     model_dft = llama_init_dft->model();
+     ctx_dft   = llama_init_dft->context();
+ 
++    if (llama_model_dflash_block_size(model_dft) > 0) {
++        LOG_ERR("%s: DFlash draft models are not supported by this example; use speculative-simple or server\n", __func__);
++        return 1;
++    }
++
+     const llama_vocab * vocab_tgt = llama_model_get_vocab(model_tgt);
+     const llama_vocab * vocab_dft = llama_model_get_vocab(model_dft);
+ 
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index c3cd1c7..81c6fae 100644
+index c3cd1c7eafeadc121234c1464b9bec4e50b02939..81c6fae22ce832706919fdf8db8bc4928bc17005 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -1051,6 +1051,24 @@ extern "C" {
@@ -382,7 +755,7 @@ index c3cd1c7..81c6fae 100644
      GGML_API struct ggml_tensor * ggml_count_equal(
              struct ggml_context * ctx,
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 7234d7f..804dd66 100644
+index 7234d7f3b09b01ff01f305e1bb59a763d67ee1e6..804dd66117317950b599db01b6c9e68bb9a54bd1 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -2546,6 +2546,51 @@ struct ggml_tensor * ggml_argmax(
@@ -438,7 +811,7 @@ index 7234d7f..804dd66 100644
  
  struct ggml_tensor * ggml_count_equal(
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
-index 997744f..2adb032 100644
+index 997744f34c3475f974fe9f204e6e376a01ada8e7..2adb032964546a56a2dbb431aa6cdab413926244 100644
 --- a/gguf-py/gguf/constants.py
 +++ b/gguf-py/gguf/constants.py
 @@ -494,6 +494,7 @@ class MODEL_ARCH(IntEnum):
@@ -476,7 +849,7 @@ index 997744f..2adb032 100644
      MODEL_TENSOR.POSNET_CONV1:              "posnet.{bid}.conv1",
      MODEL_TENSOR.POSNET_CONV2:              "posnet.{bid}.conv2",
 diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
-index 01a9b23..25ab1f7 100644
+index 01a9b236000bcb50fe161f53bf18daca2e2bfbad..25ab1f700c3af116130a885f1fe2f2510ecb8e4e 100644
 --- a/gguf-py/gguf/tensor_mapping.py
 +++ b/gguf-py/gguf/tensor_mapping.py
 @@ -158,6 +158,12 @@ class TensorNameMap:
@@ -493,7 +866,7 @@ index 01a9b23..25ab1f7 100644
  
      block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
 diff --git a/include/llama.h b/include/llama.h
-index 49bd8e7..3ef5b61 100644
+index 49bd8e74150a3ca4ea4d77c6d18b130b4d62b82e..6d4e3da76fcd3d9cb025bfb069de31bd2909911d 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -382,6 +382,16 @@ extern "C" {
@@ -539,7 +912,7 @@ index 49bd8e7..3ef5b61 100644
      //
      // Adapters
      //
-@@ -965,6 +987,20 @@ extern "C" {
+@@ -965,6 +987,35 @@ extern "C" {
      // If true, all model tensors are activated during llama_decode() to load and cache their weights.
      LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
  
@@ -557,10 +930,25 @@ index 49bd8e7..3ef5b61 100644
 +    // Called on the drafter context. Invalidates the cached graph on change.
 +    LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
 +
++    // DFlash: configure which target-layer outputs are captured after decode.
++    // Passing no layers disables capture and removes the DFlash callback.
++    LLAMA_API void llama_set_dflash_capture(struct llama_context * ctx, const int32_t * layer_ids, int32_t n_layers);
++
++    // DFlash: drafter sampling parameters.
++    LLAMA_API void llama_set_dflash_sample_temp(struct llama_context * ctx, float temp);
++    LLAMA_API void llama_set_dflash_topk(struct llama_context * ctx, int k);
++
++    // DFlash: select which slot hidden-state readers use.
++    LLAMA_API void llama_dflash_set_active_slot(struct llama_context * ctx, int slot_idx);
++
++    // DFlash: feed target hidden states into the drafter cross-attention input.
++    LLAMA_API void llama_set_cross_data(struct llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens);
++    LLAMA_API void llama_set_cross_data_seq(struct llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
++
      // Set abort callback
      LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
  
-@@ -987,6 +1023,15 @@ extern "C" {
+@@ -987,6 +1038,15 @@ extern "C" {
      // returns NULL for invalid ids.
      LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
  
@@ -576,7 +964,21 @@ index 49bd8e7..3ef5b61 100644
      // Get all output token embeddings.
      // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
      // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
-@@ -1148,6 +1193,12 @@ extern "C" {
+@@ -1009,6 +1069,13 @@ extern "C" {
+     // otherwise: float[n_embd] (1-dimensional)
+     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
+ 
++    // DFlash hidden-state capture from the active slot.
++    // Call llama_dflash_set_active_slot() before reading when multiple slots are in use.
++    LLAMA_API float * llama_get_layer_hidden(struct llama_context * ctx, int layer_idx);
++    LLAMA_API int64_t llama_get_layer_hidden_n_tokens(struct llama_context * ctx, int layer_idx);
++    LLAMA_API int64_t llama_get_layer_hidden_n_embd(struct llama_context * ctx, int layer_idx);
++    LLAMA_API int32_t llama_get_n_layer_hiddens(struct llama_context * ctx);
++
+     //
+     // backend sampling API [EXPERIMENTAL]
+     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
+@@ -1148,6 +1215,12 @@ extern "C" {
                              bool   unparse_special);
  
      //
@@ -590,7 +992,7 @@ index 49bd8e7..3ef5b61 100644
      //
  
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 6904b9c..b04f85a 100644
+index 6904b9c1a645c7c3726a8b66aecfc18b2cc4fe46..b04f85abd51ec61acb7cbcf365b3ee483c10289e 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -132,6 +132,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -632,7 +1034,7 @@ index 6904b9c..b04f85a 100644
      {LLM_TENSOR_FFN_LATENT_DOWN,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
      {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
 diff --git a/src/llama-arch.h b/src/llama-arch.h
-index c4aabab..59e1bc3 100644
+index c4aabab7e0cf37e129c01c47ed5dfecb4fe41914..59e1bc308e103b8dd3fbee648cb2606bc1de2c67 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -136,6 +136,7 @@ enum llm_arch {
@@ -665,10 +1067,10 @@ index c4aabab..59e1bc3 100644
  
  enum llm_tensor_layer {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index debcf0b..58975de 100644
+index debcf0b71a63c7f1acf106fd4c0076683cd2922c..35395ab0e7721c31342d47819c9fa741ee3a81fc 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -11,6 +11,7 @@
+@@ -11,12 +11,149 @@
  #include "llama-ext.h"
  #include "llama.h"
  
@@ -676,7 +1078,149 @@ index debcf0b..58975de 100644
  #include <cinttypes>
  #include <cmath>
  #include <cstring>
-@@ -65,6 +66,12 @@ llama_context::llama_context(
+ #include <limits>
+ #include <stdexcept>
+ 
++static void dflash_read_tensor_to(struct ggml_tensor * t, float * dst, size_t n_floats) {
++    if (ggml_is_contiguous(t)) {
++        const size_t n_bytes = n_floats * sizeof(float);
++        if (ggml_backend_buffer_is_host(t->buffer)) {
++            memcpy(dst, t->data, n_bytes);
++        } else {
++            ggml_backend_tensor_get(t, dst, 0, n_bytes);
++        }
++        return;
++    }
++
++    const int64_t ne0 = t->ne[0];
++    const int64_t ne1 = t->ne[1];
++    const int64_t ne2 = t->ne[2];
++    const size_t esz = ggml_element_size(t);
++
++    size_t contig_elems = ne0;
++    if (t->nb[1] == ne0 * esz) {
++        contig_elems = ne0 * ne1;
++        if (t->nb[2] == ne0 * ne1 * esz) {
++            contig_elems = ne0 * ne1 * ne2;
++        }
++    }
++
++    size_t dst_off = 0;
++    const size_t n_chunks = n_floats / contig_elems;
++    const size_t chunk_bytes = contig_elems * sizeof(float);
++
++    for (size_t i = 0; i < n_chunks; ++i) {
++        size_t src_off = 0;
++        size_t idx = i;
++        if (contig_elems == (size_t) ne0) {
++            int64_t i1 = idx % ne1; idx /= ne1;
++            int64_t i2 = idx % ne2; idx /= ne2;
++            int64_t i3 = idx;
++            src_off = i1 * t->nb[1] + i2 * t->nb[2] + i3 * t->nb[3];
++        } else if (contig_elems == (size_t) (ne0 * ne1)) {
++            int64_t i2 = idx % ne2; idx /= ne2;
++            int64_t i3 = idx;
++            src_off = i2 * t->nb[2] + i3 * t->nb[3];
++        } else {
++            int64_t i3 = idx;
++            src_off = i3 * t->nb[3];
++        }
++
++        if (ggml_backend_buffer_is_host(t->buffer)) {
++            memcpy(dst + dst_off, (const char *) t->data + src_off, chunk_bytes);
++        } else {
++            ggml_backend_tensor_get(t, dst + dst_off, src_off, chunk_bytes);
++        }
++        dst_off += contig_elems;
++    }
++}
++
++static bool dflash_eval_callback(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * cap = static_cast<dflash_capture_data *>(user_data);
++    const auto it = cap->hidden_name_idx.find(t->name);
++    const bool wants_hidden = it != cap->hidden_name_idx.end();
++
++    if (ask) {
++        bool res = wants_hidden;
++        if (cap->fallback_cb) {
++            res = cap->fallback_cb(t, ask, cap->fallback_user_data) || res;
++        }
++        return res;
++    }
++
++    bool res = true;
++    if (wants_hidden) {
++        const int64_t new_embd = t->ne[0];
++        const int64_t new_n = t->ne[1];
++        const size_t h_idx = it->second;
++        const llama_ubatch * ub = cap->ubatch;
++        const uint32_t n_seqs_unq = ub ? ub->n_seqs_unq : 0;
++
++        if (n_seqs_unq <= 1) {
++            int slot = ub && ub->n_seqs_unq > 0 ? ub->seq_id_unq[0] : 0;
++            auto * sh = cap->slot_hiddens(slot);
++            if (!sh) {
++                sh = cap->slot_hiddens(0);
++            }
++            if (sh && h_idx < sh->size()) {
++                auto & buf = (*sh)[h_idx];
++                buf.n_embd = new_embd;
++                const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
++                const size_t add_elems = (size_t) new_n * (size_t) new_embd;
++                buf.data.resize(old_elems + add_elems);
++                dflash_read_tensor_to(t, buf.data.data() + old_elems, add_elems);
++                buf.n_tokens += new_n;
++            }
++        } else if (ub && (int64_t) ub->n_tokens == new_n) {
++            cap->scatter_buf.resize((size_t) new_embd * (size_t) new_n);
++            dflash_read_tensor_to(t, cap->scatter_buf.data(), cap->scatter_buf.size());
++
++            const int n_slots = cap->hiddens ? (int) cap->hiddens->size() : 0;
++            for (uint32_t s = 0; s < n_seqs_unq; ++s) {
++                const llama_seq_id seq = ub->seq_id_unq[s];
++                if (seq < 0 || seq >= n_slots) {
++                    continue;
++                }
++                auto & slot_bufs = (*cap->hiddens)[seq];
++                if (h_idx >= slot_bufs.size()) {
++                    continue;
++                }
++                auto & buf = slot_bufs[h_idx];
++                buf.n_embd = new_embd;
++                buf.data.reserve((size_t) (buf.n_tokens + new_n) * (size_t) new_embd);
++            }
++
++            for (int64_t i = 0; i < new_n; ++i) {
++                const llama_seq_id seq = ub->seq_id[i][0];
++                if (seq < 0 || seq >= n_slots) {
++                    continue;
++                }
++                auto & slot_bufs = (*cap->hiddens)[seq];
++                if (h_idx >= slot_bufs.size()) {
++                    continue;
++                }
++                auto & buf = slot_bufs[h_idx];
++                const size_t old_elems = (size_t) buf.n_tokens * (size_t) new_embd;
++                buf.data.resize(old_elems + (size_t) new_embd);
++                memcpy(buf.data.data() + old_elems,
++                        cap->scatter_buf.data() + (size_t) i * (size_t) new_embd,
++                        (size_t) new_embd * sizeof(float));
++                buf.n_tokens += 1;
++            }
++        }
++    }
++
++    if (cap->fallback_cb) {
++        res = cap->fallback_cb(t, ask, cap->fallback_user_data) && res;
++    }
++
++    return res;
++}
++
+ //
+ // llama_context
+ //
+@@ -65,6 +202,12 @@ llama_context::llama_context(
      cparams.cb_eval           = params.cb_eval;
      cparams.cb_eval_user_data = params.cb_eval_user_data;
  
@@ -689,7 +1233,7 @@ index debcf0b..58975de 100644
      // Initialize backend samplers here so they are part of the sampling graph
      // before the reserve passes run later in this function. This avoids a later
      // re-reserve when graph nodes change.
-@@ -820,6 +827,74 @@ float * llama_context::get_logits_ith(int32_t i) {
+@@ -820,6 +963,74 @@ float * llama_context::get_logits_ith(int32_t i) {
      }
  }
  
@@ -764,7 +1308,7 @@ index debcf0b..58975de 100644
  float * llama_context::get_embeddings() {
      output_reorder();
  
-@@ -1065,6 +1140,34 @@ void llama_context::set_warmup(bool value) {
+@@ -1065,6 +1276,203 @@ void llama_context::set_warmup(bool value) {
      //sched_need_reserve = true;
  }
  
@@ -783,6 +1327,140 @@ index debcf0b..58975de 100644
 +    cparams.dflash_reduced_consumer_active = enabled;
 +}
 +
++float * llama_context::get_layer_hidden(int layer_idx) {
++    if (dflash_active_slot < 0 || dflash_active_slot >= (int) layer_hiddens.size()) {
++        return nullptr;
++    }
++    auto & slot = layer_hiddens[dflash_active_slot];
++    if (layer_idx < 0 || layer_idx >= (int) slot.size()) {
++        return nullptr;
++    }
++    auto & buf = slot[layer_idx];
++    if (buf.n_tokens <= 0 || buf.data.empty()) {
++        return nullptr;
++    }
++    return buf.data.data();
++}
++
++int64_t llama_context::get_layer_hidden_n_tokens(int layer_idx) const {
++    if (dflash_active_slot < 0 || dflash_active_slot >= (int) layer_hiddens.size()) {
++        return 0;
++    }
++    const auto & slot = layer_hiddens[dflash_active_slot];
++    if (layer_idx < 0 || layer_idx >= (int) slot.size()) {
++        return 0;
++    }
++    return slot[layer_idx].n_tokens;
++}
++
++int64_t llama_context::get_layer_hidden_n_embd(int layer_idx) const {
++    if (dflash_active_slot < 0 || dflash_active_slot >= (int) layer_hiddens.size()) {
++        return 0;
++    }
++    const auto & slot = layer_hiddens[dflash_active_slot];
++    if (layer_idx < 0 || layer_idx >= (int) slot.size()) {
++        return 0;
++    }
++    return slot[layer_idx].n_embd;
++}
++
++int32_t llama_context::get_n_layer_hiddens() const {
++    if (dflash_active_slot < 0 || dflash_active_slot >= (int) layer_hiddens.size()) {
++        return 0;
++    }
++    return (int32_t) layer_hiddens[dflash_active_slot].size();
++}
++
++void llama_context::dflash_resize_layer_hiddens(int n_slots) {
++    if (layer_hiddens.empty()) {
++        dflash_active_slot = 0;
++        return;
++    }
++
++    const size_t n_capture_layers = layer_hiddens.front().size();
++    layer_hiddens.resize(n_slots);
++    for (auto & slot_bufs : layer_hiddens) {
++        slot_bufs.resize(n_capture_layers);
++    }
++
++    if (layer_hiddens.empty()) {
++        dflash_active_slot = 0;
++    } else {
++        dflash_active_slot = std::clamp(dflash_active_slot, 0, (int) layer_hiddens.size() - 1);
++    }
++}
++
++void llama_context::dflash_reset_hidden_capture() {
++    if (!dflash_capture) {
++        return;
++    }
++
++    for (auto & slot_bufs : layer_hiddens) {
++        for (auto & buf : slot_bufs) {
++            buf.data.clear();
++            buf.n_embd = 0;
++            buf.n_tokens = 0;
++        }
++    }
++
++    dflash_capture->scatter_buf.clear();
++    dflash_capture->ubatch = nullptr;
++}
++
++void llama_context::set_dflash_capture(const int32_t * layer_ids, int32_t n_layers) {
++    ggml_backend_sched_eval_callback fallback_cb = cparams.cb_eval;
++    void * fallback_user_data = cparams.cb_eval_user_data;
++    if (dflash_capture) {
++        fallback_cb = dflash_capture->fallback_cb;
++        fallback_user_data = dflash_capture->fallback_user_data;
++    }
++
++    cparams.dflash_capture_layers.clear();
++
++    if (!layer_ids || n_layers <= 0) {
++        dflash_capture.reset();
++        layer_hiddens.clear();
++        dflash_active_slot = 0;
++        cparams.cb_eval = fallback_cb;
++        cparams.cb_eval_user_data = fallback_user_data;
++        return;
++    }
++
++    for (int32_t i = 0; i < n_layers; ++i) {
++        cparams.dflash_capture_layers.push_back(layer_ids[i]);
++    }
++
++    auto capture = std::make_unique<dflash_capture_data>();
++    capture->fallback_cb = fallback_cb;
++    capture->fallback_user_data = fallback_user_data;
++    capture->hiddens = &layer_hiddens;
++
++    for (int32_t i = 0; i < n_layers; ++i) {
++        capture->hidden_name_idx.emplace("l_out-" + std::to_string(layer_ids[i]), i);
++    }
++
++    layer_hiddens.assign(std::max(1, cparams.dflash_n_slots), std::vector<dflash_layer_hidden_buf>(n_layers));
++    dflash_active_slot = std::clamp(dflash_active_slot, 0, (int) layer_hiddens.size() - 1);
++
++    dflash_capture = std::move(capture);
++    cparams.cb_eval = dflash_eval_callback;
++    cparams.cb_eval_user_data = dflash_capture.get();
++}
++
++void llama_context::set_dflash_sample_temp(float temp) {
++    cparams.dflash_sample_temp = std::max(0.0f, temp);
++}
++
++void llama_context::set_dflash_topk(int k) {
++    const int clamped = std::max(1, k);
++    if (cparams.dflash_topk == clamped) {
++        return;
++    }
++
++    cparams.dflash_topk = clamped;
++    gf_res_prev->reset();
++}
++
 +void llama_context::set_dflash_n_slots(int n) {
 +    const int clamped = std::max(1, std::min(n, (int) LLAMA_DFLASH_MAX_SLOTS));
 +    if (cparams.dflash_n_slots == clamped) {
@@ -790,16 +1468,51 @@ index debcf0b..58975de 100644
 +    }
 +
 +    cparams.dflash_n_slots = clamped;
++    dflash_resize_layer_hiddens(clamped);
 +
 +    // DFlash drafter graph width depends on n_slots, so invalidate the cached graph.
 +    sched_need_reserve = true;
 +    gf_res_prev->reset();
 +}
 +
++void llama_context::set_active_dflash_slot(int slot_idx) {
++    if (layer_hiddens.empty()) {
++        dflash_active_slot = 0;
++        return;
++    }
++
++    dflash_active_slot = std::clamp(slot_idx, 0, (int) layer_hiddens.size() - 1);
++}
++
++void llama_context::set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens) {
++    const bool shape_changed = cross.n_embd != n_embd || cross.n_enc != n_tokens;
++    cross.n_embd = n_embd;
++    cross.n_enc = n_tokens;
++    cross.seq_ids_enc.clear();
++
++    const size_t n_values = n_embd > 0 && n_tokens > 0 ? (size_t) n_embd * (size_t) n_tokens : 0;
++    cross.v_embd.resize(n_values);
++    if (data && n_values > 0) {
++        memcpy(cross.v_embd.data(), data, n_values * sizeof(float));
++    } else if (n_values > 0) {
++        std::fill(cross.v_embd.begin(), cross.v_embd.end(), 0.0f);
++    }
++
++    if (shape_changed) {
++        sched_need_reserve = true;
++        gf_res_prev->reset();
++    }
++}
++
++void llama_context::set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens) {
++    GGML_UNUSED(seq_id);
++    set_cross_data(data, n_embd, n_tokens);
++}
++
  bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
      if (!sampler && sampling.samplers.count(seq_id) == 0) {
          return true;
-@@ -1274,6 +1377,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1274,6 +1682,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // TODO: this clear of the buffer can easily be forgotten - need something better
      embd_seq.clear();
@@ -810,7 +1523,7 @@ index debcf0b..58975de 100644
  
      sched_reserve();
  
-@@ -1313,8 +1420,26 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1313,8 +1725,26 @@ int llama_context::encode(const llama_batch & batch_inp) {
      }
  
      auto * t_logits = res->get_logits();
@@ -837,7 +1550,7 @@ index debcf0b..58975de 100644
      // extract logits
      if (logits.data && t_logits) {
          ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-@@ -1607,6 +1732,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1607,6 +2037,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
      // TODO: this clear of the buffer can easily be forgotten - need something better
      embd_seq.clear();
@@ -848,7 +1561,23 @@ index debcf0b..58975de 100644
      output_swaps.clear();
  
      sched_reserve();
-@@ -1728,14 +1857,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1669,9 +2103,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     int64_t n_outputs_prev = 0;
+ 
++    dflash_reset_hidden_capture();
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
++        if (dflash_capture) {
++            dflash_capture->ubatch = &ubatch;
++        }
++
+         // count the outputs in this ubatch
+         {
+             int32_t n_outputs_new = 0;
+@@ -1728,14 +2168,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
          //}
  
          auto * t_logits = res->get_logits();
@@ -891,7 +1620,18 @@ index debcf0b..58975de 100644
              ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
              GGML_ASSERT(backend_res != nullptr);
              GGML_ASSERT(logits.data != nullptr);
-@@ -2034,6 +2190,18 @@ void llama_context::output_reorder() {
+@@ -1825,6 +2292,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+         n_outputs_prev += n_outputs;
+     } while (mctx->next());
+ 
++    if (dflash_capture) {
++        dflash_capture->ubatch = nullptr;
++    }
++
+     // set to total number of outputs in the batch, for use in llama_get_logits_ith
+     n_outputs = n_outputs_all;
+ 
+@@ -2034,6 +2505,18 @@ void llama_context::output_reorder() {
              }
          }
  
@@ -910,7 +1650,7 @@ index debcf0b..58975de 100644
          if (!sampling.samplers.empty()) {
              assert(sampling.logits.size > 0);
              assert(sampling.probs.size > 0);
-@@ -2916,8 +3084,10 @@ llama_context_params llama_context_default_params() {
+@@ -2916,8 +3399,10 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -923,7 +1663,7 @@ index debcf0b..58975de 100644
      };
  
      return result;
-@@ -3108,6 +3278,18 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
+@@ -3108,6 +3593,42 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
      ctx->set_warmup(warmup);
  }
  
@@ -939,10 +1679,34 @@ index debcf0b..58975de 100644
 +    ctx->set_dflash_n_slots(n);
 +}
 +
++void llama_set_dflash_capture(llama_context * ctx, const int32_t * layer_ids, int32_t n_layers) {
++    ctx->set_dflash_capture(layer_ids, n_layers);
++}
++
++void llama_set_dflash_sample_temp(llama_context * ctx, float temp) {
++    ctx->set_dflash_sample_temp(temp);
++}
++
++void llama_set_dflash_topk(llama_context * ctx, int k) {
++    ctx->set_dflash_topk(k);
++}
++
++void llama_dflash_set_active_slot(llama_context * ctx, int slot_idx) {
++    ctx->set_active_dflash_slot(slot_idx);
++}
++
++void llama_set_cross_data(llama_context * ctx, const float * data, int64_t n_embd, int64_t n_tokens) {
++    ctx->set_cross_data(data, n_embd, n_tokens);
++}
++
++void llama_set_cross_data_seq(llama_context * ctx, llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens) {
++    ctx->set_cross_data_seq(seq_id, data, n_embd, n_tokens);
++}
++
  void llama_synchronize(llama_context * ctx) {
      ctx->synchronize();
  }
-@@ -3132,6 +3314,42 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+@@ -3132,6 +3653,42 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
      return res;
  }
  
@@ -985,11 +1749,75 @@ index debcf0b..58975de 100644
  float * llama_get_embeddings(llama_context * ctx) {
      ctx->synchronize();
  
+@@ -3150,6 +3707,24 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
+     return ctx->get_embeddings_seq(seq_id);
+ }
+ 
++float * llama_get_layer_hidden(llama_context * ctx, int layer_idx) {
++    ctx->synchronize();
++
++    return ctx->get_layer_hidden(layer_idx);
++}
++
++int64_t llama_get_layer_hidden_n_tokens(llama_context * ctx, int layer_idx) {
++    return ctx->get_layer_hidden_n_tokens(layer_idx);
++}
++
++int64_t llama_get_layer_hidden_n_embd(llama_context * ctx, int layer_idx) {
++    return ctx->get_layer_hidden_n_embd(layer_idx);
++}
++
++int32_t llama_get_n_layer_hiddens(llama_context * ctx) {
++    return ctx->get_n_layer_hiddens();
++}
++
+ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
+     return ctx->set_sampler(seq_id, smpl);
+ }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 53c705e..88ff29f 100644
+index 53c705eaffce285928b81842ad19bfa091bc9250..54a07cb8eb7a4f5618e2f8d45f86e5465bdb6d7b 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
-@@ -64,6 +64,12 @@ struct llama_context {
+@@ -11,6 +11,8 @@
+ #include "ggml-opt.h"
+ 
+ #include <map>
++#include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ struct llama_model;
+@@ -23,6 +25,29 @@ class llama_io_write_i;
+ struct llama_memory_i;
+ struct llama_memory_context_i;
+ 
++struct dflash_layer_hidden_buf {
++    std::vector<float> data;
++    int64_t n_embd = 0;
++    int64_t n_tokens = 0;
++};
++
++struct dflash_capture_data {
++    ggml_backend_sched_eval_callback fallback_cb = nullptr;
++    void * fallback_user_data = nullptr;
++
++    std::unordered_map<std::string, size_t> hidden_name_idx;
++    std::vector<std::vector<dflash_layer_hidden_buf>> * hiddens = nullptr;
++    const llama_ubatch * ubatch = nullptr;
++    std::vector<float> scatter_buf;
++
++    std::vector<dflash_layer_hidden_buf> * slot_hiddens(int slot) const {
++        if (!hiddens || slot < 0 || slot >= (int) hiddens->size()) {
++            return nullptr;
++        }
++        return &(*hiddens)[slot];
++    }
++};
++
+ struct llama_context {
+     // init scheduler and compute buffers, reserve worst-case graphs
+     llama_context(
+@@ -64,6 +89,12 @@ struct llama_context {
  
      float * get_logits();
      float * get_logits_ith(int32_t i);
@@ -1002,17 +1830,47 @@ index 53c705e..88ff29f 100644
  
      float * get_embeddings();
      float * get_embeddings_ith(int32_t i);
-@@ -94,6 +100,9 @@ struct llama_context {
+@@ -94,6 +125,20 @@ struct llama_context {
      void set_embeddings (bool value);
      void set_causal_attn(bool value);
      void set_warmup(bool value);
 +    void set_dflash_verify_logits(bool enabled, int top_k);
 +    void set_dflash_consume_reduced(bool enabled);
 +    void set_dflash_n_slots(int n);
++    void set_dflash_capture(const int32_t * layer_ids, int32_t n_layers);
++    void set_dflash_sample_temp(float temp);
++    void set_dflash_topk(int k);
++    void set_active_dflash_slot(int slot_idx);
++    void set_cross_data(const float * data, int64_t n_embd, int64_t n_tokens);
++    void set_cross_data_seq(llama_seq_id seq_id, const float * data, int64_t n_embd, int64_t n_tokens);
++
++    float * get_layer_hidden(int layer_idx);
++    int64_t get_layer_hidden_n_tokens(int layer_idx) const;
++    int64_t get_layer_hidden_n_embd(int layer_idx) const;
++    int32_t get_n_layer_hiddens() const;
  
      void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
  
-@@ -258,6 +267,12 @@ private:
+@@ -225,6 +270,9 @@ public:
+     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
+ 
+ private:
++    void dflash_resize_layer_hiddens(int n_slots);
++    void dflash_reset_hidden_capture();
++
+     llm_graph_params graph_params(
+                         llm_graph_result * res,
+                       const llama_ubatch & ubatch,
+@@ -252,12 +300,21 @@ private:
+     llama_adapter_loras_ptr loras;
+ 
+     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
++    std::unique_ptr<dflash_capture_data> dflash_capture;
++    std::vector<std::vector<dflash_layer_hidden_buf>> layer_hiddens;
++    int dflash_active_slot = 0;
+ 
+     std::unique_ptr<llama_memory_i> memory;
+ 
      // decode output (2-dimensional array: [n_outputs][n_vocab])
      buffer_view<float> logits = {nullptr, 0};
  
@@ -1026,13 +1884,30 @@ index 53c705e..88ff29f 100644
      // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
      buffer_view<float> embd = {nullptr, 0};
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 9d35947..c9ab6be 100644
+index 9d359474132f91e56e0100ef21e967279c098dea..ad7288eb0cfd42f3da2f428d80452c6e92d33a8a 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
-@@ -40,6 +40,18 @@ struct llama_cparams {
+@@ -3,6 +3,7 @@
+ #include "llama.h"
+ 
+ #include <cstdint>
++#include <vector>
+ 
+ #define LLAMA_MAX_SEQ 256
+ 
+@@ -40,6 +41,27 @@ struct llama_cparams {
      bool kv_unified;
      bool pipeline_parallel;
  
++    // DFlash: target layer indices to capture hidden states from (empty = disabled)
++    std::vector<int> dflash_capture_layers;
++
++    // DFlash: drafter sampling temperature (0 = greedy argmax)
++    float dflash_sample_temp = 0.0f;
++
++    // DFlash: top-K candidates per drafted position (1 = argmax only)
++    int dflash_topk = 1;
++
 +    // DFlash: cross-attention window in tokens (how many target hidden states the drafter sees).
 +    int dflash_cross_ctx = LLAMA_DFLASH_PER_SLOT_CTX;
 +
@@ -1049,7 +1924,7 @@ index 9d35947..c9ab6be 100644
  
      ggml_backend_sched_eval_callback cb_eval;
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 5e5b9c9..f6f7875 100644
+index 5e5b9c9054e16496c5cf65f247abd940b02a6fca..f6f78750c26f6ee94e700c4ce6210e632f327d3b 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -803,6 +803,7 @@ void llm_graph_result::reset() {
@@ -1071,7 +1946,7 @@ index 5e5b9c9..f6f7875 100644
          ggml_set_output(t_embd);
      }
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 5cb1756..63ac998 100644
+index 5cb1756c6a977e5c05150ff98b6dcc82ac553411..63ac9984bf84ba073e741acaf36339f6c688e28c 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -626,6 +626,8 @@ struct llm_graph_params {
@@ -1098,7 +1973,7 @@ index 5cb1756..63ac998 100644
      std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
      std::map<llama_seq_id, ggml_tensor*> t_candidates;
 diff --git a/src/llama-hparams.h b/src/llama-hparams.h
-index c2000c7..258cd1e 100644
+index c2000c77c37a2bde9d4bc1f67cb41ea559e8aeb7..258cd1e59a64545dbaafcbba5863aec1381933a4 100644
 --- a/src/llama-hparams.h
 +++ b/src/llama-hparams.h
 @@ -147,6 +147,13 @@ struct llama_hparams {
@@ -1116,7 +1991,7 @@ index c2000c7..258cd1e 100644
      std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f77b2e9..4760154 100644
+index f77b2e9217ff5bafec7360fdb8ec70048c6b7b1a..730926a47e7cba6797eef79dd15196dd909d7fab 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -2948,6 +2948,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
@@ -1187,7 +2062,18 @@ index f77b2e9..4760154 100644
              case LLM_ARCH_MIMO2:
                  {
                      tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-@@ -9300,6 +9354,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+@@ -9048,6 +9102,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+             {
+                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
+             } break;
++        case LLM_ARCH_DFLASH_DRAFT:
++            {
++                llm = std::make_unique<llm_build_dflash_draft>(*this, params);
++            } break;
+         default:
+             GGML_ABORT("fatal error");
+     }
+@@ -9300,6 +9358,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
          case LLM_ARCH_QWEN3NEXT:
          case LLM_ARCH_MIMO2:
          case LLM_ARCH_STEP35:
@@ -1195,7 +2081,7 @@ index f77b2e9..4760154 100644
              return LLAMA_ROPE_TYPE_NEOX;
  
          case LLM_ARCH_QWEN2VL:
-@@ -9416,6 +9471,42 @@ uint64_t llama_model_n_params(const llama_model * model) {
+@@ -9416,6 +9475,42 @@ uint64_t llama_model_n_params(const llama_model * model) {
      return model->n_elements();
  }
  
@@ -1239,7 +2125,7 @@ index f77b2e9..4760154 100644
      switch (model->arch) {
          case LLM_ARCH_T5:        return true;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 5f101bd..6708b1d 100644
+index 5f101bd637452f15112381fbe15934e34a0bba59..6708b1dfe3fc923b80f60f8e7d19f29250b8012b 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -533,6 +533,10 @@ struct llama_model {
@@ -1253,8 +2139,23 @@ index 5f101bd..6708b1d 100644
      // classifier
      struct ggml_tensor * cls       = nullptr;
      struct ggml_tensor * cls_b     = nullptr;
+diff --git a/src/models/models.h b/src/models/models.h
+index 94991c55fe879b4c78b026fbf0c186f2f98df203..d25045bf5a011e763ce359c35da101d7f3323148 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -202,6 +202,10 @@ struct llm_build_dream : public llm_graph_context {
+     llm_build_dream(const llama_model & model, const llm_graph_params & params);
+ };
+ 
++struct llm_build_dflash_draft : public llm_graph_context {
++    llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);
++};
++
+ struct llm_build_ernie4_5 : public llm_graph_context {
+     llm_build_ernie4_5(const llama_model & model, const llm_graph_params & params);
+ };
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 87790f0..5f41d37 100644
+index 87790f08e4ee8233cfdfca1102c1f824482579cc..5f41d37f6956756e6238d5d2a4c395f6f17a3abc 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
 @@ -84,6 +84,16 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
@@ -1275,7 +2176,7 @@ index 87790f0..5f41d37 100644
  }
  
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 7dc6a23..54b1504 100644
+index 7dc6a23c75183538bb1beb6f502154aa3a1991d2..54b1504a62c0bc25cca4969d6afebd878d237774 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
 @@ -84,6 +84,16 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
@@ -1296,7 +2197,7 @@ index 7dc6a23..54b1504 100644
  }
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fb86317..80bfd9e 100644
+index fb86317de3cbfcb20977254be7659c190de789c6..4aa02bfd1cc5deb1a4c0b66056ebb07efbd1260b 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -60,6 +60,127 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
@@ -1506,7 +2407,7 @@ index fb86317..80bfd9e 100644
  
  
  //
-@@ -795,6 +988,12 @@ private:
+@@ -795,6 +988,16 @@ private:
                  return false;
              }
  
@@ -1516,10 +2417,22 @@ index fb86317..80bfd9e 100644
 +                SRV_INF("auto-detected DFlash drafter (block_size=%d)\n", llama_model_dflash_block_size(model_dft.get()));
 +            }
 +
++            if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DFLASH) {
++                llama_model_share_tensors(model_dft.get(), llama_get_model(ctx));
++            }
++
              params_base.speculative.model_dft = model_dft.get();
              params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
          }
-@@ -2764,6 +2963,21 @@ private:
+@@ -900,6 +1103,7 @@ private:
+                 slot.spec.reset(common_speculative_init(params_base.speculative, slot.ctx));
+ 
+                 if (slot.spec) {
++                    common_speculative_set_seq_id(slot.spec.get(), slot.id);
+                     SLT_INF(slot, "%s", "speculative decoding context initialized\n");
+                 }
+             }
+@@ -2764,6 +2968,21 @@ private:
              n_empty_consecutive = 0;
          }
  
@@ -1541,7 +2454,7 @@ index fb86317..80bfd9e 100644
          int32_t i_next = 0;
  
          // process the created batch of tokens
-@@ -2780,8 +2994,23 @@ private:
+@@ -2780,8 +2999,23 @@ private:
                  batch.logits   + i,
              };
  
@@ -1565,7 +2478,7 @@ index fb86317..80bfd9e 100644
              metrics.on_decoded(slots);
  
              if (ret != 0) {
-@@ -2963,7 +3192,35 @@ private:
+@@ -2963,7 +3197,35 @@ private:
                      common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
  
                      GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -1602,7 +2515,7 @@ index fb86317..80bfd9e 100644
                      slot.spec_i_batch.clear();
  
                      SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
-@@ -3046,6 +3303,8 @@ private:
+@@ -3046,6 +3308,8 @@ private:
              }
          }
  
