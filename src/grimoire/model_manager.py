@@ -179,6 +179,7 @@ class ActiveModel:
     def _park_llama(self):
         """Park llama-server: SIGTERM to free VRAM. Weights stay in OS page cache."""
         try:
+            import signal, subprocess
             if self.process and self.process.poll() is None:
                 import signal
                 os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
@@ -197,6 +198,7 @@ class ActiveModel:
     def _unpark_llama(self):
         """Unpark llama-server: restart with compressed prompt. Fast reload from page cache."""
         try:
+            import time, urllib.request
             self.process = self._start_llama()
             if self.process:
                 import urllib.request

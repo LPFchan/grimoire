@@ -15,7 +15,7 @@
 #define VMM_G 0x200000ULL
 #define LOG(fmt, ...) do { fprintf(stderr,"[pflash_shim] "fmt"\n",##__VA_ARGS__); fflush(stderr); } while(0)
 
-typedef struct { CUdeviceptr p; size_t s; int a; } E;
+typedef struct { CUdeviceptr p; size_t s; int a; CUmemGenericAllocationHandle h; } E;
 static E es[MAX_A];
 static int ne;
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
