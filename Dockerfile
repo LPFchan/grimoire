@@ -9,7 +9,7 @@ ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature-turboquant-kv-cache-b9079-69d8e4b
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=5
+ARG CACHE_BUST=6
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -147,7 +147,7 @@ RUN --mount=type=cache,target=/root/.ccache \
     cp /app/.cache/dflash-build/build/pflash_daemon /opt/dflash/pflash_daemon; \
     # Copy dflash's own ggml shared libs so the binary resolves symbols
     # against its build-time llama.cpp, not the independently-built one.
-    find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
+    ccache --clear -q 2>/dev/null || rm -rf /root/.ccache/* 2>/dev/null; \n    find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
     ls -la /opt/dflash/
 
 # Compile the park/unpark LD_PRELOAD shim

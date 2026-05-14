@@ -117,8 +117,12 @@ bool forward_qwen35_0p8b_drafter(
     };
     std::vector<DeltaState> delta_state((size_t)w.n_layer);
 
+    // The persistent batch buffer — MUST be freed via ggml_backend_buffer_free,
+    // not just ggml_free(bctx) which only frees metadata.
+    ggml_backend_buffer_t one_buf = nullptr;
+
     auto cleanup_all = [&]() {
-        // All PersBuf share bctx/one_buf.  ggml_free once is enough.
+        if (one_buf) { ggml_backend_buffer_free(one_buf); one_buf = nullptr; }
         if (hidden_buf.ctx) { ggml_free(hidden_buf.ctx); }
         hidden_buf.ctx = nullptr; Q_buf.ctx = nullptr; attn_out_buf.ctx = nullptr;
         pos_buf.ctx = nullptr; mask_tail_buf.ctx = nullptr;
@@ -127,8 +131,6 @@ bool forward_qwen35_0p8b_drafter(
         for (auto & pb : V_curr_v) pb.ctx = nullptr;
         for (auto & pb : Q_last_v) pb.ctx = nullptr;
         for (auto & ds : delta_state) { ds.conv.ctx = nullptr; ds.ssm.ctx = nullptr; }
-        // one_buf freed by calling ggml_free on the shared context.
-        // (one_buf doesn't need separate ggml_backend_buffer_free)
     };
 
     // Count attn/delta layers
@@ -194,7 +196,7 @@ bool forward_qwen35_0p8b_drafter(
             }
         }
 
-        ggml_backend_buffer_t one_buf = ggml_backend_alloc_ctx_tensors(bctx, w.backend);
+        one_buf = ggml_backend_alloc_ctx_tensors(bctx, w.backend);
         if (!one_buf) {
             set_last_error("0p8b: batch buf alloc failed"); ggml_free(bctx); cleanup_all(); return false;
         }
