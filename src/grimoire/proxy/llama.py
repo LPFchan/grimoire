@@ -59,6 +59,9 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
     # PFlash compression: if the model has a pflash daemon and the prompt
     # exceeds the threshold, compress before proxying to llama-server.
+    # Compression is MANDATORY when the prompt exceeds threshold — if the
+    # daemon is missing or fails, the request is rejected with a 503 so the
+    # user knows compression is broken instead of silently passing through.
     daemon = getattr(active, 'pflash_daemon', None)
     pcfg = getattr(active, 'prefill_config', None)
     log = logging.getLogger(__name__)
@@ -73,7 +76,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         kv_dir = "/dev/shm/grimoire-slots"
         return os.path.isfile(f"{kv_dir}/{_kv_filename(cid)}") if cid else False
 
-    if daemon and daemon.is_running() and pcfg and pcfg.enabled:
+    if pcfg and pcfg.enabled:
         try:
             tokenizer = active.get_tokenizer()
             messages = payload.get("messages", [])
@@ -81,13 +84,24 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 tokenizer, messages, add_generation_prompt=True,
                 model_cfg=model_cfg, active=active,
             )
-            if len(prompt_ids) > pcfg.threshold:
+
+            if len(prompt_ids) >= pcfg.threshold:
+                if not daemon or not daemon.is_running():
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"pflash compression required for {active.name} "
+                            f"(prompt={len(prompt_ids)} ≥ threshold={pcfg.threshold}) "
+                            f"but pflash daemon is not running. Check that the drafter model "
+                            f"file exists and the daemon started at model load time."
+                        ),
+                    )
+
                 cid = payload.get("conversation_id")
                 is_warm = _check_warm(cid)
 
                 if not is_warm:
                     # ── COLD TURN: park + full compress + unpark ────────────
-                    # Park llama-server before compression
                     park_ok = False
                     _park_ctl_fd = None
                     _park_ack_fd = None
@@ -109,11 +123,16 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         except Exception as e:
                             log.warning(f"pflash park: failed ({e}) — continuing without park")
 
-                    compressed_ids, fired, blocks = await maybe_compress(
-                        prompt_ids, daemon, pcfg, blocks=prompt_blocks,
-                    )
+                    try:
+                        compressed_ids, fired, blocks = await maybe_compress(
+                            prompt_ids, daemon, pcfg, blocks=prompt_blocks,
+                        )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"pflash compression failed for {active.name}: {e}",
+                        )
 
-                    # Unpark after compression
                     if park_ok and _park_ctl_fd is not None:
                         try:
                             import os, select
@@ -133,9 +152,15 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 else:
                     # ── WARM TURN: skip park, only compress delta blocks ────
                     log.warning(f"pflash warm: KV cache exists for {cid}")
-                    compressed_ids, fired, blocks = await maybe_compress(
-                        prompt_ids, daemon, pcfg, blocks=prompt_blocks,
-                    )
+                    try:
+                        compressed_ids, fired, blocks = await maybe_compress(
+                            prompt_ids, daemon, pcfg, blocks=prompt_blocks,
+                        )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"pflash compression failed for {active.name}: {e}",
+                        )
 
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
@@ -186,9 +211,13 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     if payload.get("conversation_id"):
                         _kv_save_key = f"pflash-{payload['conversation_id']}.kv"
                         log.warning(f"pflash kv: will save as {_kv_save_key}")
+        except HTTPException:
+            raise
         except Exception as e:
-            _log = __import__('logging').getLogger(__name__)
-            _log.warning(f"PFlash compression failed for {active.name}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"pflash compression setup failed for {active.name}: {e}",
+            )
 
     client = httpx.AsyncClient(timeout=None)
     try:

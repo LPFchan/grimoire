@@ -109,7 +109,16 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
     try:
         effective_ids = prompt_ids
         effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
-        if daemon is not None and daemon.is_running() and prefill_config and prefill_config.enabled:
+        if prefill_config and prefill_config.enabled and len(prompt_ids) >= prefill_config.threshold:
+            if daemon is None or not daemon.is_running():
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"pflash compression required for {active.name} "
+                        f"(prompt={len(prompt_ids)} ≥ threshold={prefill_config.threshold}) "
+                        f"but dflash daemon is not running."
+                    ),
+                )
             try:
                 effective_ids, _, effective_blocks = await maybe_compress(
                     prompt_ids,
@@ -118,9 +127,10 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     blocks=prompt_blocks,
                 )
             except Exception as e:
-                logger.error(f"pflash compression failed: {e}")
-                effective_ids = prompt_ids
-                effective_blocks = materialize_blocks(prompt_ids, prompt_blocks)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"pflash compression failed for {active.name}: {e}",
+                )
 
         if max_effective_context is not None:
             max_effective_context = int(max_effective_context)
@@ -384,6 +394,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     completion_id, created,
                     len(effective_ids), len(tokens_emitted),
                     decoded_prefix, ctx_size,
+                    cached_tokens=restored_prefix_len or None,
                 )
                 final["timings"] = {
                     "predicted_n": len(tokens_emitted),
