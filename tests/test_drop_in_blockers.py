@@ -339,6 +339,8 @@ class DropInBlockerTests(unittest.TestCase):
         e2e = (ROOT / "tests" / "test_e2e_smoke.py").read_text()
         stress = (ROOT / "tests" / "test_stress_dflash.py").read_text()
         pflash = (ROOT / "tests" / "test_pflash_pipeline.py").read_text()
+        tune_ctx = (ROOT / "tests" / "tune_ctx.py").read_text()
+        pflash_ctx_tune = (ROOT / "tests" / "test_pflash_ctx_tune.py").read_text()
 
         self.assertIn('DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL", "dflash-pflash-qwen3.6-27B")', e2e)
         self.assertIn('LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")', e2e)
@@ -346,9 +348,13 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn('MODEL = LLAMA_SMOKE_MODEL', e2e)
         self.assertIn('MODEL = os.environ.get("STRESS_MODEL", "dflash-pflash-qwen3.6-27B")', stress)
         self.assertIn('MODEL = os.environ.get("MODEL", "pflash-qwen3.6-27B")', pflash)
+        self.assertIn('MODEL = "pflash-qwen3.6-27B"', tune_ctx)
+        self.assertIn('MODEL = "pflash-qwen3.6-27B"', pflash_ctx_tune)
         self.assertNotIn("dflash-pflash-qwen-27B", e2e)
         self.assertNotIn("dflash-pflash-qwen-27B", stress)
         self.assertNotIn("dflash-pflash-qwen-27B", pflash)
+        self.assertNotIn("pflash-qwen-27B", tune_ctx)
+        self.assertNotIn("pflash-qwen-27B", pflash_ctx_tune)
 
     def test_text_only_served_pflash_models_have_no_mmproj(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
@@ -356,6 +362,42 @@ class DropInBlockerTests(unittest.TestCase):
             cfg = data["models"][name]
             self.assertEqual(cfg.get("capabilities"), ["completion"], name)
             self.assertNotIn("mmproj", cfg, name)
+
+    def test_llama_side_pflash_startup_fails_closed_when_daemon_boot_fails(self):
+        class FakeRegistry:
+            def resolve(self, name):
+                return name
+
+            def get(self, name):
+                return {
+                    "file": "target.gguf",
+                    "pflash": True,
+                    "drafter": "drafter.gguf",
+                }
+
+            def validate(self, name, gpu_count=None):
+                return True, "OK"
+
+            def get_fixed_gpu(self, name):
+                return None
+
+            def is_fixed(self, name):
+                return False
+
+        old_registry = mm_module.registry
+        try:
+            mm_module.registry = FakeRegistry()
+            manager = entrypoint.ModelManager(gpu_count=1)
+            with patch.object(mm_module, "resolve_path", side_effect=lambda cfg, key: f"/tmp/{key}.gguf"), \
+                 patch.object(mm_module.ActiveModel, "_start_pflash_daemon", side_effect=RuntimeError("daemon boom")), \
+                 patch.object(mm_module.ActiveModel, "start") as start_backend:
+                with self.assertRaises(RuntimeError) as cm:
+                    asyncio.run(manager.start_model("pflash-qwen3.6-27B"))
+            self.assertIn("daemon boom", str(cm.exception))
+            self.assertFalse(start_backend.called)
+            self.assertEqual(manager.active, {})
+        finally:
+            mm_module.registry = old_registry
 
     def test_native_dflash_patch_is_copied_and_build_patches_reapply_on_fresh_clone(self):
         patch_path = ROOT / "patches" / "spec-dflash-contract.patch"

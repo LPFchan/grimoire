@@ -570,8 +570,9 @@ class ModelManager:
                 try:
                     await asyncio.to_thread(active._start_pflash_daemon)
                     logger.warning(f"pflash: daemon started for {model_name}")
-                except Exception as e:
-                    logger.warning(f"pflash: daemon failed for {model_name}: {e}")
+                except Exception:
+                    self.active.pop(model_name, None)
+                    raise
 
             await asyncio.to_thread(active.start)
             try:
