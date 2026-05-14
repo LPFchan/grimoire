@@ -1,0 +1,125 @@
+diff --git a/common/common.h b/common/common.h
+--- a/common/common.h
++++ b/common/common.h
+@@ -163,7 +163,8 @@ enum common_speculative_type {
+     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
+     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
++    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash launch-contract compatibility; native implementation not yet ported
+     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
+ };
+@@ -339,6 +340,8 @@ struct common_params_speculative {
+     std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
+     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+ 
++    int32_t dflash_cross_ctx = 512; // DFlash cross-attention window placeholder until native DFlash is ported
++
+     bool has_dft() const {
+         return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
+     }
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -26,7 +26,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
+     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
+     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
++    ,COMMON_SPECULATIVE_TYPE_DFLASH
+ };
+ 
+ const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
+@@ -38,7 +39,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
+     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
+     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
+     {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
++    ,{"dflash",      COMMON_SPECULATIVE_TYPE_DFLASH}
+ };
+ 
+ struct common_speculative_config {
+@@ -901,6 +903,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
+         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
+         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
+         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
++        case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
+         default:                                    return "unknown";
+     }
+ }
+@@ -917,8 +920,9 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
+ common_speculative * common_speculative_init(
+         common_params_speculative & params,
+         llama_context             * ctx_tgt) {
++    const bool wants_dflash = params.type == COMMON_SPECULATIVE_TYPE_DFLASH;
+     llama_context * ctx_dft = nullptr;
+-    if (params.model_dft) {
++    if (params.model_dft && !wants_dflash) {
+         ctx_dft = llama_init_from_model(params.model_dft, params.cparams_dft);
+         if (ctx_dft == nullptr) {
+             LOG_ERR("%s", "failed to create draft context\n");
+@@ -930,13 +934,17 @@ common_speculative * common_speculative_init(
+     // Compute the implementations to use based on the config and their order of preference
+     std::vector<common_speculative_config> configs = {}; // list of speculative configs to try
+     {
+-        bool has_draft = !params.mparams_dft.path.empty();
++        bool has_draft = params.has_dft() && !wants_dflash;
+         bool has_draft_eagle3 = false; // TODO PR-18039: if params.speculative.eagle3
+ 
+         bool has_ngram_cache   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_CACHE);
+         bool has_ngram_simple  = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
+         bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
+         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
+         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
++
++        if (wants_dflash) {
++            LOG_WRN("%s", "DFlash launch contract recognized, but this build does not yet include a native DFlash implementation\n");
++        }
+ 
+         // In a more complex implementation we could use the same implementation but with different parameters.
+         // This was initially used in PR-18471 but removed to simplify the code.
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3506,7 +3506,7 @@ void common_params_parser_init(common_params_context & context, bool server, int
+             }
+         }
+     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_N_GPU_LAYERS_DRAFT"));
+     add_opt(common_arg(
+-        {"-md", "--model-draft"}, "FNAME",
++        {"--spec-draft-model", "-md", "--model-draft"}, "FNAME",
+         "draft model for speculative decoding (default: unused)",
+         [](common_params & params, const std::string & value) {
+             params.speculative.mparams_dft.path = value;
+@@ -3520,7 +3520,7 @@ void common_params_parser_init(common_params_context & context, bool server, int
+         }
+     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+     add_opt(common_arg(
+-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
++        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|dflash]",
+         string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
+             common_speculative_type_to_str(params.speculative.type).c_str()),
+         [](common_params & params, const std::string & value) {
+@@ -3535,6 +3535,8 @@ void common_params_parser_init(common_params_context & context, bool server, int
+                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
+             } else if (value == "ngram-mod") {
+                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
++            } else if (value == "dflash") {
++                params.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
+             } else {
+                 throw std::invalid_argument("unknown speculative decoding type without draft model");
+             }
+@@ -3541,6 +3543,17 @@ void common_params_parser_init(common_params_context & context, bool server, int
+         }
+     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TYPE"));
+     add_opt(common_arg(
++        {"--spec-dflash-cross-ctx"}, "N",
++        string_format("DFlash cross-attention window in tokens; accepted for launch-contract compatibility (default: %d)", params.speculative.dflash_cross_ctx),
++        [](common_params & params, int value) {
++            if (value < 1) {
++                throw std::invalid_argument("dflash cross context must be at least 1");
++            }
++            params.speculative.dflash_cross_ctx = value;
++        }
++    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DFLASH_CROSS_CTX"));
++    add_opt(common_arg(
+         {"--spec-ngram-size-n"}, "N",
+         string_format("ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_size_n),
+         [](common_params & params, int value) {

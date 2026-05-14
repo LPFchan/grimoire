@@ -327,6 +327,26 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
         self.assertEqual(cfg["draft"], "gguf/Qwen3-0.6B-BF16.gguf")
 
+    def test_native_dflash_patch_is_copied_and_build_patches_reapply_on_fresh_clone(self):
+        patch_path = ROOT / "patches" / "spec-dflash-contract.patch"
+        self.assertTrue(patch_path.exists(), "native dflash contract patch file is missing")
+        content = patch_path.read_text()
+        self.assertIn("--spec-draft-model", content)
+        self.assertIn("--spec-dflash-cross-ctx", content)
+        self.assertIn('COMMON_SPECULATIVE_TYPE_DFLASH', content)
+
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("COPY patches/spec-dflash-contract.patch /app/patches/", dockerfile)
+        self.assertIn("patch_hash_file=/app/.cache/llama-cpp-build/.patch_hash", dockerfile)
+        self.assertIn("need_patches=1", dockerfile)
+        self.assertIn("printf '%s' \"$patch_hash\" > \"$patch_hash_file\"", dockerfile)
+
+    def test_webui_patches_reapply_on_fresh_clone_and_patch_change(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("webui_patch_hash_file=/cache/webui-src/.patch_hash", dockerfile)
+        self.assertIn("need_webui_patches=1", dockerfile)
+        self.assertIn("printf '%s' \"$webui_patch_hash\" > \"$webui_patch_hash_file\"", dockerfile)
+
     def test_webui_history_patch_is_well_formed(self):
         patch_path = ROOT / "patches" / "grimoire-webui-history.patch"
         self.assertTrue(patch_path.exists(), "webui history patch file is missing")
