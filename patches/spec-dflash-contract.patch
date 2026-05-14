@@ -44,6 +44,19 @@ index 1ad83fa..12a7d02 100644
      add_opt(common_arg(
          {"--spec-ngram-size-n"}, "N",
          string_format("ngram size N for ngram-simple/ngram-map speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_size_n),
+diff --git a/common/common.cpp b/common/common.cpp
+index 24e91f2..ac6266d 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1524,6 +1524,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.type_k = params.cache_type_k;
+     cparams.type_v = params.cache_type_v;
+ 
++    cparams.dflash_cross_ctx = params.speculative.dflash_cross_ctx;
++
+     return cparams;
+ }
+ 
 diff --git a/common/common.h b/common/common.h
 index 4137a87..7a504c5 100644
 --- a/common/common.h
@@ -245,10 +258,27 @@ index 01a9b23..25ab1f7 100644
  
      block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
 diff --git a/include/llama.h b/include/llama.h
-index 49bd8e7..92f6935 100644
+index 49bd8e7..010c932 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -604,6 +604,14 @@ extern "C" {
+@@ -382,6 +382,16 @@ extern "C" {
+         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
+         struct llama_sampler_seq_config * samplers;
+         size_t                            n_samplers;
++
++        // DFlash drafter: initial number of cross-attention slots.
++        // Sets the drafter graph width at reservation. Clamped to [1, LLAMA_DFLASH_MAX_SLOTS].
++        // Set this BEFORE llama_init_from_model; runtime widening past this value requires
++        // a larger compute buffer than was allocated at init.
++        int32_t dflash_n_slots;
++
++        // DFlash drafter: cross-attention window in tokens.
++        // How many target hidden states the drafter sees (default: 512).
++        int32_t dflash_cross_ctx;
+     };
+ 
+     struct llama_model_tensor_override {
+@@ -604,6 +614,14 @@ extern "C" {
      // Returns the total number of parameters in the model
      LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
  
@@ -263,7 +293,7 @@ index 49bd8e7..92f6935 100644
      // Returns true if the model contains an encoder that requires llama_encode() call
      LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
  
-@@ -629,6 +637,10 @@ extern "C" {
+@@ -629,6 +647,10 @@ extern "C" {
              const char * fname_out,
              const llama_model_quantize_params * params);
  
@@ -274,6 +304,30 @@ index 49bd8e7..92f6935 100644
      //
      // Adapters
      //
+@@ -965,6 +987,10 @@ extern "C" {
+     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
+     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
+ 
++    // DFlash: set the number of concurrent slots the drafter graph is reserved for.
++    // Called on the drafter context. Invalidates the cached graph on change.
++    LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);
++
+     // Set abort callback
+     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
+ 
+@@ -1148,6 +1174,12 @@ extern "C" {
+                             bool   unparse_special);
+ 
+     //
++    // DFlash compile-time reservation defaults.
++    enum {
++        LLAMA_DFLASH_MAX_SLOTS    = 8,
++        LLAMA_DFLASH_PER_SLOT_CTX = 512,
++    };
++
+     // Chat templates
+     //
+ 
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
 index 6904b9c..b04f85a 100644
 --- a/src/llama-arch.cpp
@@ -349,6 +403,105 @@ index c4aabab..59e1bc3 100644
  };
  
  enum llm_tensor_layer {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index debcf0b..fe0e3ff 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -11,6 +11,7 @@
+ #include "llama-ext.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -65,6 +66,12 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
++    // DFlash: reserve drafter graph width at init so future native decode wiring has
++    // the requested cross-context settings available in cparams.
++    cparams.dflash_n_slots = std::clamp(params.dflash_n_slots <= 0 ? 1 : params.dflash_n_slots,
++                                        1, (int) LLAMA_DFLASH_MAX_SLOTS);
++    cparams.dflash_cross_ctx = params.dflash_cross_ctx > 0 ? params.dflash_cross_ctx : LLAMA_DFLASH_PER_SLOT_CTX;
++
+     // Initialize backend samplers here so they are part of the sampling graph
+     // before the reserve passes run later in this function. This avoids a later
+     // re-reserve when graph nodes change.
+@@ -1065,6 +1072,19 @@ void llama_context::set_warmup(bool value) {
+     //sched_need_reserve = true;
+ }
+ 
++void llama_context::set_dflash_n_slots(int n) {
++    const int clamped = std::max(1, std::min(n, (int) LLAMA_DFLASH_MAX_SLOTS));
++    if (cparams.dflash_n_slots == clamped) {
++        return;
++    }
++
++    cparams.dflash_n_slots = clamped;
++
++    // DFlash drafter graph width depends on n_slots, so invalidate the cached graph.
++    sched_need_reserve = true;
++    gf_res_prev->reset();
++}
++
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+@@ -2916,8 +2936,10 @@ llama_context_params llama_context_default_params() {
+         /*.op_offload                  =*/ true,
+         /*.swa_full                    =*/ true,
+         /*.kv_unified                  =*/ false,
+-        /*.sampler                     =*/ nullptr,
+-        /*.n_sampler                   =*/ 0,
++        /*.samplers                    =*/ nullptr,
++        /*.n_samplers                  =*/ 0,
++        /*.dflash_n_slots              =*/ 1,
++        /*.dflash_cross_ctx            =*/ LLAMA_DFLASH_PER_SLOT_CTX,
+     };
+ 
+     return result;
+@@ -3108,6 +3130,10 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
+     ctx->set_warmup(warmup);
+ }
+ 
++void llama_set_dflash_n_slots(llama_context * ctx, int n) {
++    ctx->set_dflash_n_slots(n);
++}
++
+ void llama_synchronize(llama_context * ctx) {
+     ctx->synchronize();
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 53c705e..5b85282 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -94,6 +94,7 @@ struct llama_context {
+     void set_embeddings (bool value);
+     void set_causal_attn(bool value);
+     void set_warmup(bool value);
++    void set_dflash_n_slots(int n);
+ 
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+ 
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 9d35947..353e22b 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -40,6 +40,13 @@ struct llama_cparams {
+     bool kv_unified;
+     bool pipeline_parallel;
+ 
++    // DFlash: cross-attention window in tokens (how many target hidden states the drafter sees).
++    int dflash_cross_ctx = LLAMA_DFLASH_PER_SLOT_CTX;
++
++    // DFlash drafter: number of concurrent slots the reserved drafter graph is sized for.
++    // Default 1 keeps the graph narrow until multi-slot DFlash decode is ported.
++    int dflash_n_slots = 1;
++
+     enum llama_pooling_type pooling_type;
+ 
+     ggml_backend_sched_eval_callback cb_eval;
 diff --git a/src/llama-hparams.h b/src/llama-hparams.h
 index c2000c7..258cd1e 100644
 --- a/src/llama-hparams.h
