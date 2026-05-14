@@ -64,6 +64,27 @@
 - Full removal of `/opt/dflash` is required for the final served runtime, not just normal-llama decoupling.
 - Smoke and stress harness defaults using the stale alias `dflash-pflash-qwen-27B` must be aligned with current served model IDs before they are treated as release gates.
 
+## Phase 0 Status Artifacts
+- The inventory and behavior matrix below close the remaining software-only Phase 0 documentation gap.
+- Baseline metrics for decode, restore, compression, TTFT, decode TPS, and snapshot-store growth are still open and remain hardware-gated.
+
+### Required-vs-Retired Behavior Matrix
+| Surface | Must Preserve | Explicitly Retired / Not A Gate Yet |
+| --- | --- | --- |
+| `dflash-pflash-qwen3.6-27B` served decode | Text-only chat semantics, `parallel=1`, `ctx-size=60000`, `max-effective-context=60000`, `budget=18`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `<|im_end|>` stop-string behavior, block-aware prompt compression/reconstruction, and `snapshot-mode=compact-full`. | Final served-path dependency on the Lucebox decode daemon. Early `.safetensors` -> GGUF draft cutover before the converted artifact is proven and versioned. |
+| `pflash-qwen3.6-27B` preserved PFlash path | Standalone `pflash_daemon`, raw `compress <path> <keep_x1000>` protocol, `Qwen3.5-0.8B Q8_0` drafter path, and token -> text -> message reconstruction after compression. | Multimodal serving and `mmproj` wiring for this model. |
+| `pflash-park-qwen3.6-27B` preserved park path | FIFO park/unpark via `pflash_shim.so` plus the same text-only compression semantics as `pflash-qwen3.6-27B`. | Global `/opt/dflash` library-path coupling outside preserved PFlash components. |
+| `qwen-3.6-27B` normal llama path | Canonical non-PFlash startup and serve path, including the current multimodal config in `etc/models.json`, must resolve against `TheTom` libraries without `/opt/dflash`. | Any hidden fallback that only works because `/opt/dflash` is present in the runtime search path. |
+| `dflash-native-qwen3.6-27B-canary` native canary | Dormant native-control-plane launch contract for compile/test coverage and later hardware validation. | Treating the canary as a served replacement or release gate before real-hardware decode verification is green. |
+
+### Served Model Inventory And Harness Mapping
+- `qwen-3.6-27B`: baseline llama.cpp served alias; multimodal; default normal-llama smoke target in `tests/test_e2e_smoke.py::LlamaCppSmokeTests`.
+- `dflash-pflash-qwen3.6-27B`: primary served DFlash alias; text-only; current `.safetensors` draft artifact; default DFlash smoke target in `tests/test_e2e_smoke.py::DFlashSmokeTests` and default stress target via `STRESS_MODEL` in `tests/test_stress_dflash.py`.
+- `dflash-native-qwen3.6-27B-canary`: dormant native DFlash canary alias; control-plane only; intentionally not the default target of smoke, stress, or PFlash harnesses.
+- `pflash-qwen3.6-27B`: primary preserved standalone PFlash alias; text-only; default `MODEL` in `tests/test_pflash_pipeline.py`.
+- `pflash-park-qwen3.6-27B`: preserved park/unpark PFlash alias; text-only; parameterized harness target only.
+- Stale alias `dflash-pflash-qwen-27B` is not a valid current registry entry and must not reappear in harness defaults or release-gate docs.
+
 ## Required Verification Suite
 - Semantic regression suite: `tests/test_dflash.py`.
 - Live smoke suite: `tests/test_e2e_smoke.py`.
@@ -97,6 +118,7 @@ Canonical Base Bring-Up And `/opt/dflash` Isolation
 - Repos: canonical working fork of `TheTom/llama-cpp-turboquant` plus `grimoire` for startup integration.
 - Primary files: `CMakeLists.txt`, `include/llama.h`, `src/llama-context.cpp`, `src/llama-context.h`, `tools/server/server-context.cpp`, `tools/server/server.cpp`, `src/grimoire/model_manager.py`, `Dockerfile`.
 - Deliverables: bootable canonical native branch, successful `llama-server` startup for `qwen-3.6-27B`, and a normal llama path that does not depend on `/opt/dflash` to resolve symbols.
+- Current software-only status: Grimoire-side launch wiring and image/runtime-path isolation are covered locally by `tests/test_drop_in_blockers.py`, including normal llama startup env construction without `/opt/dflash` in `LD_LIBRARY_PATH`, park-model shim scoping via `LD_PRELOAD`, and runtime-image assertions that only preserved PFlash components land under `/opt/dflash`.
 - Verification: startup and serve text on the target GPU, inspect runtime library resolution, and prove the non-PFlash llama path is anchored on canonical `TheTom` libraries only.
 - Exit criteria: TurboQuant behavior remains intact, normal llama startup is decoupled from `/opt/dflash`, and any remaining `/opt/dflash` usage is explicitly limited to preserved PFlash components.
 - Decision gate: stay on `TheTom` unless base bring-up exposes blocking incompatibilities that make a temporary selective `Bee` borrow materially faster overall.

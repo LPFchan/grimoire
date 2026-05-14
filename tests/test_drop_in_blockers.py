@@ -327,6 +327,36 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
         self.assertEqual(cfg["draft"], "gguf/Qwen3-0.6B-BF16.gguf")
 
+    def test_phase0_checklist_includes_behavior_matrix_and_inventory(self):
+        checklist = (ROOT / "MIGRATION_EXECUTION_CHECKLIST.md").read_text()
+        self.assertIn("## Phase 0 Status Artifacts", checklist)
+        self.assertIn("### Required-vs-Retired Behavior Matrix", checklist)
+        self.assertIn("### Served Model Inventory And Harness Mapping", checklist)
+        self.assertIn("dflash-native-qwen3.6-27B-canary", checklist)
+        self.assertIn("Stale alias `dflash-pflash-qwen-27B` is not a valid current registry entry", checklist)
+
+    def test_harness_defaults_match_current_registry_aliases(self):
+        e2e = (ROOT / "tests" / "test_e2e_smoke.py").read_text()
+        stress = (ROOT / "tests" / "test_stress_dflash.py").read_text()
+        pflash = (ROOT / "tests" / "test_pflash_pipeline.py").read_text()
+
+        self.assertIn('DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL", "dflash-pflash-qwen3.6-27B")', e2e)
+        self.assertIn('LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")', e2e)
+        self.assertIn('MODEL = DFLASH_SMOKE_MODEL', e2e)
+        self.assertIn('MODEL = LLAMA_SMOKE_MODEL', e2e)
+        self.assertIn('MODEL = os.environ.get("STRESS_MODEL", "dflash-pflash-qwen3.6-27B")', stress)
+        self.assertIn('MODEL = os.environ.get("MODEL", "pflash-qwen3.6-27B")', pflash)
+        self.assertNotIn("dflash-pflash-qwen-27B", e2e)
+        self.assertNotIn("dflash-pflash-qwen-27B", stress)
+        self.assertNotIn("dflash-pflash-qwen-27B", pflash)
+
+    def test_text_only_served_pflash_models_have_no_mmproj(self):
+        data = json.loads((ROOT / "etc" / "models.json").read_text())
+        for name in ("dflash-pflash-qwen3.6-27B", "pflash-qwen3.6-27B", "pflash-park-qwen3.6-27B", "dflash-native-qwen3.6-27B-canary"):
+            cfg = data["models"][name]
+            self.assertEqual(cfg.get("capabilities"), ["completion"], name)
+            self.assertNotIn("mmproj", cfg, name)
+
     def test_native_dflash_patch_is_copied_and_build_patches_reapply_on_fresh_clone(self):
         patch_path = ROOT / "patches" / "spec-dflash-contract.patch"
         self.assertTrue(patch_path.exists(), "native dflash contract patch file is missing")

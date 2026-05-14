@@ -17,6 +17,10 @@ Run selectively:
 
 Skip entirely:
     SKIP_E2E=1 python -m pytest tests/
+
+Model overrides:
+    GRIMOIRE_DFLASH_SMOKE_MODEL=dflash-native-qwen3.6-27B-canary python -m pytest tests/test_e2e_smoke.py::DFlashSmokeTests -v
+    GRIMOIRE_LLAMA_SMOKE_MODEL=qwen-3.6-27B python -m pytest tests/test_e2e_smoke.py::LlamaCppSmokeTests -v
 """
 
 import json
@@ -34,6 +38,8 @@ from tests._monitor import SystemMonitor
 SKIP_E2E = os.environ.get("SKIP_E2E", "0") == "1"
 BASE_URL = os.environ.get("GRIMOIRE_SMOKE_URL", "http://localhost:9001")
 API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
+DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL", "dflash-pflash-qwen3.6-27B")
+LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")
 FIXTURES_DIR = Path(
     os.environ.get("GRIMOIRE_OPENCODE_SESSION_FIXTURES", "/home/yeowool/opencode_splits")
 )
@@ -186,7 +192,7 @@ class E2ESmokeTestCase(unittest.TestCase):
 class DFlashSmokeTests(E2ESmokeTestCase):
     """Smoke tests for the DFlash speculative-decoding backend."""
 
-    MODEL = "dflash-pflash-qwen3.6-27B"
+    MODEL = DFLASH_SMOKE_MODEL
 
     def test_01_basic_chat_completion(self):
         """Single-turn chat with real fixture data returns a valid, timed response."""
@@ -240,7 +246,7 @@ class DFlashSmokeTests(E2ESmokeTestCase):
 class LlamaCppSmokeTests(E2ESmokeTestCase):
     """Smoke tests for the llama.cpp backend."""
 
-    MODEL = "qwen-3.6-27B"
+    MODEL = LLAMA_SMOKE_MODEL
 
     def test_01_basic_chat_completion(self):
         """Single-turn chat with real fixture data returns a valid, timed response."""
