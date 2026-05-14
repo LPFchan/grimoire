@@ -305,6 +305,13 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(order[2][0], "cleanup")
         self.assertEqual(order[3], ("stop", None))
 
+    def test_pflash_shim_listener_uses_fifo_open_pattern_compatible_with_python_client(self):
+        shim = (ROOT / "src" / "grimoire" / "dflash" / "pflash_shim.c").read_text()
+        self.assertIn('cf = open("/tmp/pflash_shim.ctl", O_RDWR);', shim)
+        self.assertIn('af = open("/tmp/pflash_shim.ack", O_WRONLY);', shim)
+        self.assertIn('close(af);', shim)
+        self.assertNotIn('af = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);', shim)
+
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:
             def get_conversation(self, user_hash, conversation_id):

@@ -209,10 +209,8 @@ static int unpark(void) {
 }
 
 static void listener(void) {
-    cf = open("/tmp/pflash_shim.ctl", O_RDONLY);
+    cf = open("/tmp/pflash_shim.ctl", O_RDWR);
     if (cf < 0) return;
-    af = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);
-    if (af < 0) return;
     LOG("listener ready");
     char buf[256];
     while (thr) {
@@ -223,9 +221,16 @@ static void listener(void) {
         if (!strcmp(buf,"park")) r = park()==0?"ok\n":"err:park\n";
         else if (!strcmp(buf,"unpark")) r = unpark()==0?"ok\n":"err:unpark\n";
         else if (!strcmp(buf,"quit")) break;
-        write(af, r, strlen(r)); fsync(af);
+        af = open("/tmp/pflash_shim.ack", O_WRONLY);
+        if (af >= 0) {
+            write(af, r, strlen(r));
+            fsync(af);
+            close(af);
+            af = -1;
+        }
     }
-    close(cf); close(af);
+    close(cf);
+    if (af >= 0) close(af);
     unlink("/tmp/pflash_shim.ctl"); unlink("/tmp/pflash_shim.ack");
 }
 

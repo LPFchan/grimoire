@@ -71,8 +71,11 @@ class _FakeUpstream:
 
 
 class _FakeClient:
+    instances = []
+
     def __init__(self, *args, **kwargs):
         self.requests = []
+        type(self).instances.append(self)
 
     async def __aenter__(self):
         return self
@@ -96,6 +99,9 @@ class _FakeClient:
 
 
 class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        _FakeClient.instances.clear()
+
     async def test_park_model_unparks_when_compression_raises(self):
         active = _FakeActive()
         payload = {
@@ -126,6 +132,94 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(active._unpark_calls, 1)
         body = b"".join(chunks).decode()
         self.assertIn("ok", body)
+
+    async def test_slot_restore_and_save_use_validated_conversation_id(self):
+        active = _FakeActive()
+        payload = {
+            "model": active.name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+            "conversation_id": "../../raw-payload-id",
+        }
+
+        async def fake_before_backend_request(payload, model_name, model_cfg, backend_model_id, client, url, headers):
+            return payload
+
+        async def fake_compress(prompt_ids, daemon, config, blocks=None):
+            return prompt_ids, False, blocks or []
+
+        with patch.object(llama_proxy, "_prompt_layout_from_messages", return_value=([1, 2, 3], [])), \
+             patch.object(llama_proxy, "maybe_compress", side_effect=fake_compress), \
+             patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda payload, *_: payload), \
+             patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=fake_before_backend_request), \
+             patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda stream, *_: stream), \
+             patch.object(llama_proxy, "_has_saved_kv", return_value=False), \
+             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient):
+            response = await llama_proxy._proxy_chat(
+                active.name,
+                payload,
+                active,
+                user_hash=None,
+                conversation_id="validated-conv-id",
+            )
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+
+        self.assertIn("ok", b"".join(chunks).decode())
+        requests = [req for client in _FakeClient.instances for req, _ in client.requests]
+        slot_calls = [req for req in requests if req["method"] == "POST" and "/slots/0?action=" in req["url"]]
+        self.assertEqual(len(slot_calls), 2)
+        self.assertIn("action=restore", slot_calls[0]["url"])
+        self.assertIn("action=save", slot_calls[1]["url"])
+        self.assertEqual(slot_calls[0]["json"]["filename"], "pflash-validated-conv-id.kv")
+        self.assertEqual(slot_calls[1]["json"]["filename"], "pflash-validated-conv-id.kv")
+
+    async def test_restore_success_saves_even_without_compression(self):
+        active = _FakeActive()
+        payload = {
+            "model": active.name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+            "conversation_id": "raw-conversation-id",
+        }
+
+        async def fake_before_backend_request(payload, model_name, model_cfg, backend_model_id, client, url, headers):
+            return payload
+
+        async def fake_compress(prompt_ids, daemon, config, blocks=None):
+            return prompt_ids, False, blocks or []
+
+        with patch.object(llama_proxy, "_prompt_layout_from_messages", return_value=([1, 2, 3], [])), \
+             patch.object(llama_proxy, "maybe_compress", side_effect=fake_compress), \
+             patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda payload, *_: payload), \
+             patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=fake_before_backend_request), \
+             patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda stream, *_: stream), \
+             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient):
+            response = await llama_proxy._proxy_chat(
+                active.name,
+                payload,
+                active,
+                user_hash=None,
+                conversation_id="conv-1",
+            )
+            async for _ in response.body_iterator:
+                pass
+
+        requests = [req for client in _FakeClient.instances for req, _ in client.requests]
+        slot_calls = [req for req in requests if req["method"] == "POST" and "/slots/0?action=" in req["url"]]
+        self.assertEqual(len(slot_calls), 2)
+        self.assertIn("action=restore", slot_calls[0]["url"])
+        self.assertIn("action=save", slot_calls[1]["url"])
+        self.assertEqual(slot_calls[0]["json"]["filename"], "pflash-conv-1.kv")
+        self.assertEqual(slot_calls[1]["json"]["filename"], "pflash-conv-1.kv")
+
+    def test_kv_filename_sanitizes_unsafe_conversation_ids(self):
+        filename = llama_proxy._kv_filename("../../bad/id?name=1")
+        self.assertTrue(filename.startswith("pflash-bad_id_name_1-"))
+        self.assertTrue(filename.endswith(".kv"))
+        self.assertNotIn("/", filename)
+        self.assertNotIn("..", filename)
 
 
 if __name__ == "__main__":

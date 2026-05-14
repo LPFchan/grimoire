@@ -2,8 +2,10 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
+import os
 
 import httpx
 from fastapi.responses import StreamingResponse
@@ -15,6 +17,22 @@ from grimoire.prompt.generic import _prompt_layout_from_messages
 from grimoire.registry import BACKEND_DFLASH, resolve_path
 
 logger = logging.getLogger(__name__)
+
+
+def _kv_filename(conversation_id: str) -> str:
+    raw = str(conversation_id)
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+    safe = safe.strip("_-") or "conversation"
+    if safe != raw or len(safe) > 96:
+        digest = hashlib.sha1(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+        safe = f"{safe[:96].rstrip('_-') or 'conversation'}-{digest}"
+    return f"pflash-{safe}.kv"
+
+
+def _has_saved_kv(conversation_id: str) -> bool:
+    if not conversation_id:
+        return False
+    return os.path.isfile(f"/dev/shm/grimoire-slots/{_kv_filename(conversation_id)}")
 
 
 def _backend_request_headers(headers):
@@ -54,8 +72,9 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     payload["model"] = backend_model_id
     url = f"http://127.0.0.1:{active.port}/v1/chat/completions"
     headers = {}
+    validated_conversation_id = conversation_id if isinstance(conversation_id, str) else None
 
-    _kv_save_key = None  # set inside if fired: block when compression fires
+    _kv_save_key = None
 
     # PFlash compression: if the model has a pflash daemon and the prompt
     # exceeds the threshold, compress before proxying to llama-server.
@@ -63,15 +82,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     pcfg = getattr(active, 'prefill_config', None)
     log = logging.getLogger(__name__)
     log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
-
-    def _kv_filename(cid: str) -> str:
-        return f"pflash-{cid}.kv"
-
-    def _check_warm(cid: str) -> bool:
-        """Check if a KV save file exists for this conversation (warm vs cold)."""
-        import os
-        kv_dir = "/dev/shm/grimoire-slots"
-        return os.path.isfile(f"{kv_dir}/{_kv_filename(cid)}") if cid else False
 
     if daemon and daemon.is_running() and pcfg and pcfg.enabled:
         try:
@@ -82,8 +92,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 model_cfg=model_cfg, active=active,
             )
             if len(prompt_ids) > pcfg.threshold:
-                cid = payload.get("conversation_id")
-                is_warm = _check_warm(cid)
+                is_warm = _has_saved_kv(validated_conversation_id)
 
                 if not is_warm:
                     # ── COLD TURN: park + full compress + unpark ────────────
@@ -110,7 +119,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
                 else:
                     # ── WARM TURN: skip park, only compress delta blocks ────
-                    log.warning(f"pflash warm: KV cache exists for {cid}")
+                    log.warning(f"pflash warm: KV cache exists for {validated_conversation_id}")
                     compressed_ids, fired, blocks = await maybe_compress(
                         prompt_ids, daemon, pcfg, blocks=prompt_blocks,
                     )
@@ -148,8 +157,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
-                    if payload.get("conversation_id"):
-                        _kv_save_key = f"pflash-{payload['conversation_id']}.kv"
+                    if validated_conversation_id:
+                        _kv_save_key = _kv_filename(validated_conversation_id)
                         log.warning(f"pflash kv: will save as {_kv_save_key}")
         except Exception as e:
             _log = __import__('logging').getLogger(__name__)
@@ -162,16 +171,16 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         )
 
         # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
-        _kv_key_raw = payload.get("conversation_id")
-        log.warning(f"pflash kv: raw key = {_kv_key_raw}")
-        if _kv_key_raw:
-            kv_name = f"pflash-{_kv_key_raw}.kv"
+        log.warning(f"pflash kv: validated key = {validated_conversation_id}")
+        if validated_conversation_id:
+            kv_name = _kv_filename(validated_conversation_id)
             slot_url = f"http://127.0.0.1:{active.port}/slots/0"
             try:
                 rr = await client.post(f"{slot_url}?action=restore",
                     json={"filename": kv_name}, timeout=5)
                 log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
                 if rr.status_code == 200:
+                    _kv_save_key = _kv_save_key or kv_name
                     log.warning(f"pflash kv: restored {kv_name}")
             except Exception as e:
                 log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
