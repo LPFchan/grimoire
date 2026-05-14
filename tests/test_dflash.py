@@ -1761,6 +1761,28 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         self.assertIn("timings", final)
         self.assertGreater(final["timings"]["predicted_per_second"], 0)
 
+    def test_streaming_holds_back_multi_token_stop_sequence(self):
+        self._install_fake_active([ord("h"), ord("i"), ord("E"), ord("N"), ord("D"), 0])
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+                "stop": ["END"],
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        frames = _parse_sse(response.text)
+        deltas = [
+            f["choices"][0]["delta"].get("content", "")
+            for f in frames
+            if isinstance(f, dict) and "choices" in f and f["choices"][0].get("delta", {}).get("content")
+        ]
+        self.assertEqual("".join(deltas), "hi")
+        self.assertNotIn("END", "".join(deltas))
+
     def test_context_overflow_returns_400_before_daemon_call(self):
         active, daemon = self._install_fake_active([], cfg_overrides={"ctx-size": 4, "predict": 64})
         long_text = "x" * 100
@@ -1871,6 +1893,17 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         body = response.json()
         self.assertEqual(body["choices"][0]["message"]["content"], "ok")
         self.assertEqual(body["usage"]["completion_tokens"], 2)
+
+    def test_non_streaming_preserves_backend_error_detail(self):
+        active, daemon = self._install_fake_active([])
+        daemon._running = False
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "dflash-test", "messages": [{"role": "user", "content": "ping"}], "stream": False},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("dflash daemon not running", response.json()["detail"])
 
     def test_session_kv_saves_compact_full_snapshot_and_restores_next_turn(self):
         active, daemon = self._install_fake_active([ord("x"), 0])

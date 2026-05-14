@@ -94,6 +94,35 @@ def _extract_usage(raw_bytes):
     return found
 
 
+def _extract_error_message(raw_bytes):
+    """Extract an SSE or JSON error message if present."""
+    text = raw_bytes.decode("utf-8", errors="ignore")
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+            return error["message"]
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+        return error["message"]
+    return None
+
+
 def _extract_tokens_per_sec(raw_bytes):
     """Extract predicted_per_second from the last timing chunk in SSE data."""
     text = raw_bytes.decode("utf-8", errors="ignore")

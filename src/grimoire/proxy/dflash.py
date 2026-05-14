@@ -228,16 +228,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
                 decoded_prefix = ""
                 tokens_emitted = []
-                # Sliding-window detokenize state: `read_offset` is the count of
-                # tokens whose decoded text has been emitted; `prefix_offset` is
-                # the earliest token still inside the decode window. Both reset
-                # to the current tail after every successful emit, so each
-                # decode is bounded to the most recent few tokens — overall O(n)
-                # over the response instead of O(n²) over `decode(full_list)`
-                # per token.
-                prefix_offset = 0
-                read_offset = 0
                 stop_seq_lens = sorted({len(seq) for seq in stop_seqs}, reverse=True)
+                holdback = max(stop_seq_lens, default=0)
                 t0 = time.monotonic()
 
                 def _decode(start, stop):
@@ -250,6 +242,21 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 try:
                     index = 0
                     hit_stop = False
+
+                    def _next_committed_delta() -> str:
+                        nonlocal decoded_prefix, index
+                        committed_len = len(tokens_emitted)
+                        if holdback > 0:
+                            committed_len = max(0, committed_len - holdback)
+                        if committed_len <= 0:
+                            return ""
+                        committed_text = _decode(0, committed_len)
+                        if committed_text.endswith("�") or len(committed_text) <= len(decoded_prefix):
+                            return ""
+                        delta = committed_text[len(decoded_prefix):]
+                        decoded_prefix = committed_text
+                        return delta
+
                     while True:
                         tok = await asyncio.to_thread(daemon.read_next_token)
                         if tok is None:
@@ -273,12 +280,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                     break
 
                             if stop_hit:
-                                # The trim may have removed tokens we already emitted
-                                # bytes for; re-decode against the shortened buffer
-                                # and reconcile decoded_prefix so the final usage
-                                # text matches what's actually in tokens_emitted.
-                                read_offset = min(read_offset, len(tokens_emitted))
-                                prefix_offset = min(prefix_offset, read_offset)
                                 final_text = _decode(0, len(tokens_emitted))
                                 if len(final_text) > len(decoded_prefix):
                                     delta = final_text[len(decoded_prefix):]
@@ -286,24 +287,11 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                     frame = _delta_sse(completion_id, created, delta, index)
                                     index += 1
                                     yield f"data: {json.dumps(frame)}\n\n".encode()
-                                else:
-                                    decoded_prefix = final_text
-                                read_offset = len(tokens_emitted)
-                                prefix_offset = read_offset
                                 hit_stop = True
                                 break
 
-                            # Wait for a complete UTF-8 sequence before emitting:
-                            # multi-byte chars can straddle BPE/SentencePiece pieces,
-                            # so we keep accumulating while the window still ends in
-                            # the replacement char U+FFFD.
-                            prefix_text = _decode(prefix_offset, read_offset)
-                            new_text = _decode(prefix_offset, len(tokens_emitted))
-                            if not new_text.endswith("�") and len(new_text) > len(prefix_text):
-                                delta = new_text[len(prefix_text):]
-                                decoded_prefix += delta
-                                prefix_offset = read_offset
-                                read_offset = len(tokens_emitted)
+                            delta = _next_committed_delta()
+                            if delta:
                                 frame = _delta_sse(completion_id, created, delta, index)
                                 index += 1
                                 yield f"data: {json.dumps(frame)}\n\n".encode()
@@ -317,19 +305,17 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             if leftover is None:
                                 break
 
-                    # Flush any complete bytes still trapped in the sliding
-                    # window (loop exited via EOS, max_tokens, or pipe close —
-                    # not via the stop-hit branch, which already reconciled).
-                    if read_offset < len(tokens_emitted):
-                        prefix_text = _decode(prefix_offset, read_offset)
-                        final_text = _decode(prefix_offset, len(tokens_emitted))
-                        if len(final_text) > len(prefix_text):
-                            delta = final_text[len(prefix_text):].rstrip("�")
-                            if delta:
-                                decoded_prefix += delta
-                                frame = _delta_sse(completion_id, created, delta, index)
-                                index += 1
-                                yield f"data: {json.dumps(frame)}\n\n".encode()
+                    # Flush any remaining committed text after the read loop.
+                    final_text = _decode(0, len(tokens_emitted))
+                    if final_text.endswith("�"):
+                        final_text = final_text.rstrip("�")
+                    if len(final_text) > len(decoded_prefix):
+                        delta = final_text[len(decoded_prefix):]
+                        if delta:
+                            decoded_prefix = final_text
+                            frame = _delta_sse(completion_id, created, delta, index)
+                            index += 1
+                            yield f"data: {json.dumps(frame)}\n\n".encode()
                 finally:
                     try:
                         os.unlink(cmd_path)
@@ -445,7 +431,10 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         async for chunk in stream:
             body.extend(chunk)
 
-        from grimoire.proxy.sse import _extract_assistant_text, _extract_usage
+        from grimoire.proxy.sse import _extract_assistant_text, _extract_error_message, _extract_usage
+        error_message = _extract_error_message(bytes(body))
+        if error_message:
+            raise HTTPException(status_code=503, detail=error_message)
         text = _extract_assistant_text(bytes(body))
         usage = _extract_usage(bytes(body)) or {"input_tokens": len(effective_ids), "output_tokens": 0}
 
