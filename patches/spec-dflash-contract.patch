@@ -78,6 +78,156 @@ index 4137a87..7a504c5 100644
      bool has_dft() const {
          return !mparams_dft.path.empty() || !mparams_dft.hf_repo.empty();
      }
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index b2e6d8e..d3783dc 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -607,6 +607,26 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+     return id;
+ }
+ 
++bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl) {
++    if (!gsmpl) {
++        return true;
++    }
++
++    return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
++}
++
++bool common_sampler_supports_reduced(struct common_sampler * gsmpl) {
++    if (!gsmpl) {
++        return false;
++    }
++
++    if (gsmpl->grmr) {
++        return false;
++    }
++
++    return common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING;
++}
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+ 
+@@ -621,6 +641,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+ 
+         result.push_back(id);
+ 
++        if (common_sampler_blocks_speculative(gsmpl)) {
++            break;
++        }
++
+         if (draft[i] != id) {
+             break;
+         }
+@@ -637,6 +661,76 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+     return result;
+ }
+ 
++std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
++        struct common_sampler * gsmpl,
++        const llama_token     * candidate_ids,
++        const float           * candidate_logits,
++        int32_t                 n_rows,
++        int32_t                 k,
++        const llama_tokens    & draft) {
++    GGML_ASSERT(gsmpl != nullptr);
++    GGML_ASSERT(candidate_ids != nullptr);
++    GGML_ASSERT(candidate_logits != nullptr);
++    GGML_ASSERT(n_rows == (int32_t) draft.size() + 1 && "n_rows must be draft.size() + 1");
++    GGML_ASSERT(k > 0);
++
++    if (!common_sampler_supports_reduced(gsmpl)) {
++        return {};
++    }
++
++    auto sample_row = [&](int32_t row) -> llama_token {
++        gsmpl->cur.resize(k);
++        const size_t row_off = (size_t) row * (size_t) k;
++        for (int32_t i = 0; i < k; ++i) {
++            gsmpl->cur[i] = llama_token_data {
++                candidate_ids[row_off + i],
++                candidate_logits[row_off + i],
++                0.0f,
++            };
++        }
++
++        // Reduced verifier rows are already bounded to K candidates, but some
++        // backends may not preserve descending order.
++        gsmpl->cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), -1, false };
++
++        llama_sampler_apply(gsmpl->rbudget, &gsmpl->cur_p);
++        llama_sampler_apply(gsmpl->chain, &gsmpl->cur_p);
++
++        GGML_ASSERT(gsmpl->cur_p.selected >= 0 && "no selected token during reduced sampling");
++        GGML_ASSERT((size_t) gsmpl->cur_p.selected < gsmpl->cur_p.size);
++
++        return gsmpl->cur_p.data[gsmpl->cur_p.selected].id;
++    };
++
++    std::vector<llama_token> result;
++    result.reserve((size_t) n_rows);
++
++    size_t i = 0;
++    for (; i < draft.size(); ++i) {
++        const llama_token id = sample_row((int32_t) i);
++
++        common_sampler_accept(gsmpl, id, true);
++        result.push_back(id);
++
++        if (common_sampler_blocks_speculative(gsmpl)) {
++            break;
++        }
++
++        if (draft[i] != id) {
++            break;
++        }
++    }
++
++    if (i == draft.size()) {
++        const llama_token id = sample_row((int32_t) i);
++
++        common_sampler_accept(gsmpl, id, true);
++        result.push_back(id);
++    }
++
++    return result;
++}
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+     std::vector<int> idxs(draft.size() + 1);
+     for (size_t i = 0; i < idxs.size(); ++i) {
+diff --git a/common/sampling.h b/common/sampling.h
+index 5b57ad6..c470e8f 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -64,6 +64,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+ //
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+ 
++bool common_sampler_supports_reduced(struct common_sampler * gsmpl);
++bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);
++
+ // generalized version of common_sampler_sample
+ //
+ // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
+@@ -82,6 +85,16 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+ //
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+ 
++// DFlash verifier fast path: run the configured sampler chain over compact
++// per-row candidate lists instead of full-vocab logits.
++std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
++        struct common_sampler * gsmpl,
++        const llama_token     * candidate_ids,
++        const float           * candidate_logits,
++        int32_t                 n_rows,
++        int32_t                 k,
++        const llama_tokens    & draft);
++
+ // assume idxs == [ 0, 1, 2, ..., draft.size() ]
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+ 
 diff --git a/common/speculative.cpp b/common/speculative.cpp
 index 20e38be..0cafad7 100644
 --- a/common/speculative.cpp
@@ -343,7 +493,7 @@ index 01a9b23..25ab1f7 100644
  
      block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
 diff --git a/include/llama.h b/include/llama.h
-index 49bd8e7..e1fb6f0 100644
+index 49bd8e7..3ef5b61 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -382,6 +382,16 @@ extern "C" {
@@ -389,14 +539,19 @@ index 49bd8e7..e1fb6f0 100644
      //
      // Adapters
      //
-@@ -965,6 +987,15 @@ extern "C" {
+@@ -965,6 +987,20 @@ extern "C" {
      // If true, all model tensors are activated during llama_decode() to load and cache their weights.
      LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
  
 +    // DFlash: enable compact verifier-logit graph variants for target verification.
-+    // top_k must be in [1, 64]. This is reservation/gating plumbing only until the
-+    // reduced-logit output path is ported.
++    // top_k must be in [1, 64]. Keep this stable across verifier cycles so the
++    // backend can reuse the same graph shape where possible.
 +    LLAMA_API void llama_set_dflash_verify_logits(struct llama_context * ctx, bool enabled, int top_k);
++
++    // DFlash: mark whether the current verifier decode will consume compact
++    // verifier logits. This does not change graph topology; it only controls
++    // whether raw vocabulary logits can be skipped for this decode.
++    LLAMA_API void llama_set_dflash_consume_reduced(struct llama_context * ctx, bool enabled);
 +
 +    // DFlash: set the number of concurrent slots the drafter graph is reserved for.
 +    // Called on the drafter context. Invalidates the cached graph on change.
@@ -405,7 +560,7 @@ index 49bd8e7..e1fb6f0 100644
      // Set abort callback
      LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
  
-@@ -987,6 +1018,15 @@ extern "C" {
+@@ -987,6 +1023,15 @@ extern "C" {
      // returns NULL for invalid ids.
      LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
  
@@ -421,7 +576,7 @@ index 49bd8e7..e1fb6f0 100644
      // Get all output token embeddings.
      // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
      // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
-@@ -1148,6 +1188,12 @@ extern "C" {
+@@ -1148,6 +1193,12 @@ extern "C" {
                              bool   unparse_special);
  
      //
@@ -510,7 +665,7 @@ index c4aabab..59e1bc3 100644
  
  enum llm_tensor_layer {
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index debcf0b..75a3931 100644
+index debcf0b..58975de 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -11,6 +11,7 @@
@@ -609,7 +764,7 @@ index debcf0b..75a3931 100644
  float * llama_context::get_embeddings() {
      output_reorder();
  
-@@ -1065,6 +1140,30 @@ void llama_context::set_warmup(bool value) {
+@@ -1065,6 +1140,34 @@ void llama_context::set_warmup(bool value) {
      //sched_need_reserve = true;
  }
  
@@ -622,6 +777,10 @@ index debcf0b..75a3931 100644
 +    cparams.dflash_verify_logits = enabled;
 +    cparams.dflash_verify_topk = clamped_top_k;
 +    // Graph reuse already keys on these fields. Do not force a reserve here.
++}
++
++void llama_context::set_dflash_consume_reduced(bool enabled) {
++    cparams.dflash_reduced_consumer_active = enabled;
 +}
 +
 +void llama_context::set_dflash_n_slots(int n) {
@@ -640,7 +799,7 @@ index debcf0b..75a3931 100644
  bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
      if (!sampler && sampling.samplers.count(seq_id) == 0) {
          return true;
-@@ -1274,6 +1373,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1274,6 +1377,10 @@ int llama_context::encode(const llama_batch & batch_inp) {
  
      // TODO: this clear of the buffer can easily be forgotten - need something better
      embd_seq.clear();
@@ -651,7 +810,7 @@ index debcf0b..75a3931 100644
  
      sched_reserve();
  
-@@ -1313,8 +1416,26 @@ int llama_context::encode(const llama_batch & batch_inp) {
+@@ -1313,8 +1420,26 @@ int llama_context::encode(const llama_batch & batch_inp) {
      }
  
      auto * t_logits = res->get_logits();
@@ -678,7 +837,7 @@ index debcf0b..75a3931 100644
      // extract logits
      if (logits.data && t_logits) {
          ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-@@ -1607,6 +1728,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1607,6 +1732,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
  
      // TODO: this clear of the buffer can easily be forgotten - need something better
      embd_seq.clear();
@@ -689,7 +848,7 @@ index debcf0b..75a3931 100644
      output_swaps.clear();
  
      sched_reserve();
-@@ -1728,12 +1853,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
+@@ -1728,14 +1857,41 @@ int llama_context::decode(const llama_batch & batch_inp) {
          //}
  
          auto * t_logits = res->get_logits();
@@ -722,10 +881,17 @@ index debcf0b..75a3931 100644
 +            logits_argmax_k = K;
 +        }
 +
++        // Skip raw vocabulary logits only when this decode view is known to
++        // consume the compact verifier output instead.
++        const bool dflash_reduced_consumed = t_argmax != nullptr && cparams.dflash_reduced_consumer_active;
++
          // extract logits
-         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
++        if (logits.data && t_logits && n_outputs > 0 && !dflash_reduced_consumed && needs_raw_logits(ubatch, sampling.samplers)) {
              ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
-@@ -2034,6 +2182,18 @@ void llama_context::output_reorder() {
+             GGML_ASSERT(backend_res != nullptr);
+             GGML_ASSERT(logits.data != nullptr);
+@@ -2034,6 +2190,18 @@ void llama_context::output_reorder() {
              }
          }
  
@@ -744,7 +910,7 @@ index debcf0b..75a3931 100644
          if (!sampling.samplers.empty()) {
              assert(sampling.logits.size > 0);
              assert(sampling.probs.size > 0);
-@@ -2916,8 +3076,10 @@ llama_context_params llama_context_default_params() {
+@@ -2916,8 +3084,10 @@ llama_context_params llama_context_default_params() {
          /*.op_offload                  =*/ true,
          /*.swa_full                    =*/ true,
          /*.kv_unified                  =*/ false,
@@ -757,12 +923,16 @@ index debcf0b..75a3931 100644
      };
  
      return result;
-@@ -3108,6 +3270,14 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
+@@ -3108,6 +3278,18 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
      ctx->set_warmup(warmup);
  }
  
 +void llama_set_dflash_verify_logits(llama_context * ctx, bool enabled, int top_k) {
 +    ctx->set_dflash_verify_logits(enabled, top_k);
++}
++
++void llama_set_dflash_consume_reduced(llama_context * ctx, bool enabled) {
++    ctx->set_dflash_consume_reduced(enabled);
 +}
 +
 +void llama_set_dflash_n_slots(llama_context * ctx, int n) {
@@ -772,7 +942,7 @@ index debcf0b..75a3931 100644
  void llama_synchronize(llama_context * ctx) {
      ctx->synchronize();
  }
-@@ -3132,6 +3302,42 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+@@ -3132,6 +3314,42 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
      return res;
  }
  
@@ -816,7 +986,7 @@ index debcf0b..75a3931 100644
      ctx->synchronize();
  
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 53c705e..5e56c64 100644
+index 53c705e..88ff29f 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -64,6 +64,12 @@ struct llama_context {
@@ -832,16 +1002,17 @@ index 53c705e..5e56c64 100644
  
      float * get_embeddings();
      float * get_embeddings_ith(int32_t i);
-@@ -94,6 +100,8 @@ struct llama_context {
+@@ -94,6 +100,9 @@ struct llama_context {
      void set_embeddings (bool value);
      void set_causal_attn(bool value);
      void set_warmup(bool value);
 +    void set_dflash_verify_logits(bool enabled, int top_k);
++    void set_dflash_consume_reduced(bool enabled);
 +    void set_dflash_n_slots(int n);
  
      void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
  
-@@ -258,6 +266,12 @@ private:
+@@ -258,6 +267,12 @@ private:
      // decode output (2-dimensional array: [n_outputs][n_vocab])
      buffer_view<float> logits = {nullptr, 0};
  
@@ -855,10 +1026,10 @@ index 53c705e..5e56c64 100644
      // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
      buffer_view<float> embd = {nullptr, 0};
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
-index 9d35947..adf5550 100644
+index 9d35947..c9ab6be 100644
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
-@@ -40,6 +40,17 @@ struct llama_cparams {
+@@ -40,6 +40,18 @@ struct llama_cparams {
      bool kv_unified;
      bool pipeline_parallel;
  
@@ -872,6 +1043,7 @@ index 9d35947..adf5550 100644
 +    // DFlash target verifier: gate compact reduced-logit graph variants.
 +    bool dflash_verify_logits = false;
 +    int  dflash_verify_topk = 1;
++    bool dflash_reduced_consumer_active = false;
 +
      enum llama_pooling_type pooling_type;
  
@@ -1124,10 +1296,217 @@ index 7dc6a23..54b1504 100644
  }
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fb86317..2c9deed 100644
+index fb86317..80bfd9e 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -795,6 +795,12 @@ private:
+@@ -60,6 +60,127 @@ static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int i
+     return cur;
+ }
+ 
++struct dflash_reduced_verify_plan {
++    bool enabled = false;
++    int top_k = 1;
++    const char * reason = "disabled";
++};
++
++static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(
++        const common_params_sampling    & sampling,
++        const common_params_speculative & speculative) {
++    dflash_reduced_verify_plan plan;
++
++    if (sampling.n_probs > 0) {
++        plan.reason = "prob-reporting";
++        return plan;
++    }
++    if (!sampling.grammar.empty() || sampling.grammar_lazy || !sampling.grammar_triggers.empty()) {
++        plan.reason = "grammar";
++        return plan;
++    }
++    if (sampling.has_logit_bias() || sampling.ignore_eos) {
++        plan.reason = "logit-bias";
++        return plan;
++    }
++    if (!(sampling.penalty_repeat == 1.0f && sampling.penalty_freq == 0.0f && sampling.penalty_present == 0.0f)) {
++        plan.reason = "penalties";
++        return plan;
++    }
++    if (sampling.dry_multiplier != 0.0f && sampling.dry_penalty_last_n != 0) {
++        plan.reason = "dry";
++        return plan;
++    }
++    if (sampling.top_n_sigma >= 0.0f) {
++        plan.reason = "top-n-sigma";
++        return plan;
++    }
++    if (sampling.xtc_probability > 0.0f) {
++        plan.reason = "xtc";
++        return plan;
++    }
++    if (sampling.mirostat != 0) {
++        plan.reason = "mirostat";
++        return plan;
++    }
++    if (sampling.adaptive_target >= 0.0f) {
++        plan.reason = "adaptive";
++        return plan;
++    }
++    if (sampling.dynatemp_range > 0.0f) {
++        plan.reason = "dynamic-temp";
++        return plan;
++    }
++    if (sampling.reasoning_budget_tokens >= 0) {
++        plan.reason = "finite-reasoning-budget";
++        return plan;
++    }
++    if (speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
++        plan.reason = "not-dflash";
++        return plan;
++    }
++
++    if (sampling.temp <= 0.0f) {
++        plan.enabled = true;
++        plan.top_k = 1;
++        plan.reason = "greedy";
++        return plan;
++    }
++
++    if (sampling.top_k <= 0) {
++        plan.reason = "unbounded-top-k";
++        return plan;
++    }
++    if (sampling.top_k > 64) {
++        plan.reason = "top-k-too-large";
++        return plan;
++    }
++
++    plan.enabled = true;
++    plan.top_k = std::max(1, sampling.top_k);
++    plan.reason = "top-k";
++    return plan;
++}
++
++static std::vector<llama_token> dflash_sample_reduced_verify(
++        struct common_sampler * smpl,
++        struct llama_context  * ctx,
++        const std::vector<int> & idxs,
++        const llama_tokens    & draft,
++        int                     top_k) {
++    if ((int) idxs.size() != (int) draft.size() + 1 || top_k <= 0) {
++        return {};
++    }
++
++    const int32_t n_rows = llama_get_logits_argmax_n(ctx);
++    if (llama_get_logits_argmax_k(ctx) != top_k || n_rows < (int32_t) idxs.size()) {
++        return {};
++    }
++
++    std::vector<llama_token> candidate_ids((size_t) idxs.size() * (size_t) top_k);
++    std::vector<float> candidate_logits((size_t) idxs.size() * (size_t) top_k);
++
++    for (size_t row = 0; row < idxs.size(); ++row) {
++        if (idxs[row] < 0 || idxs[row] >= n_rows) {
++            return {};
++        }
++
++        const int32_t * ids = llama_get_logits_argmax_ith(ctx, idxs[row]);
++        const float * logits = llama_get_logits_argmax_probs_ith(ctx, idxs[row]);
++        if (!ids || !logits) {
++            return {};
++        }
++
++        for (int k = 0; k < top_k; ++k) {
++            candidate_ids[row * (size_t) top_k + (size_t) k] = (llama_token) ids[k];
++            candidate_logits[row * (size_t) top_k + (size_t) k] = logits[k];
++        }
++    }
++
++    return common_sampler_sample_reduced_and_accept_n(
++            smpl, candidate_ids.data(), candidate_logits.data(), (int32_t) idxs.size(), top_k, draft);
++}
++
+ // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
+ enum slot_state {
+     SLOT_STATE_IDLE,
+@@ -562,6 +683,78 @@ struct server_slot {
+     }
+ };
+ 
++static bool dflash_batch_view_is_reduced_verify(
++        const std::vector<server_slot> & slots,
++        int32_t                          view_start,
++        int32_t                          view_n_tokens,
++        const char                    ** reason) {
++    auto reject = [&](const char * why) {
++        if (reason) {
++            *reason = why;
++        }
++        return false;
++    };
++
++    if (view_n_tokens <= 0) {
++        return reject("empty-view");
++    }
++
++    std::vector<uint8_t> covered((size_t) view_n_tokens, 0);
++    int covered_count = 0;
++    bool saw_speculative = false;
++
++    auto cover_index = [&](int idx) {
++        if (idx < view_start || idx >= view_start + view_n_tokens) {
++            return false;
++        }
++
++        const int rel = idx - view_start;
++        if (covered[(size_t) rel] != 0) {
++            return false;
++        }
++
++        covered[(size_t) rel] = 1;
++        covered_count++;
++        return true;
++    };
++
++    for (const auto & slot : slots) {
++        if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
++            continue;
++        }
++
++        saw_speculative = true;
++
++        if (!common_sampler_supports_reduced(slot.smpl.get())) {
++            return reject("sampler");
++        }
++        if (slot.spec_i_batch.size() != slot.spec_draft.size() + 1) {
++            return reject("spec-index-count");
++        }
++
++        for (int idx : slot.spec_i_batch) {
++            if (!cover_index(idx)) {
++                return reject(idx < view_start || idx >= view_start + view_n_tokens
++                        ? "spec-index-outside-view" : "duplicate-index");
++            }
++        }
++    }
++
++    if (!saw_speculative) {
++        return reject("no-speculative");
++    }
++
++    if (covered_count != view_n_tokens ||
++            !std::all_of(covered.begin(), covered.end(), [](uint8_t v) { return v != 0; })) {
++        return reject("coverage");
++    }
++
++    if (reason) {
++        *reason = "eligible";
++    }
++    return true;
++}
++
+ 
+ 
+ //
+@@ -795,6 +988,12 @@ private:
                  return false;
              }
  
@@ -1140,3 +1519,95 @@ index fb86317..2c9deed 100644
              params_base.speculative.model_dft = model_dft.get();
              params_base.speculative.cparams_dft = common_context_params_to_llama(params_dft);
          }
+@@ -2764,6 +2963,21 @@ private:
+             n_empty_consecutive = 0;
+         }
+ 
++        const dflash_reduced_verify_plan dflash_verify_plan =
++            dflash_select_reduced_verify_plan(params_base.sampling, params_base.speculative);
++        bool dflash_verify_graph_enabled = false;
++        if (dflash_verify_plan.enabled) {
++            for (int32_t j = 0; j < batch.n_tokens; j += std::min(n_batch, batch.n_tokens - j)) {
++                const int32_t n_tokens_probe = std::min(n_batch, batch.n_tokens - j);
++                const char * dflash_reduce_reason_probe = dflash_verify_plan.reason;
++                if (dflash_batch_view_is_reduced_verify(slots, j, n_tokens_probe, &dflash_reduce_reason_probe)) {
++                    dflash_verify_graph_enabled = true;
++                    break;
++                }
++            }
++        }
++        llama_set_dflash_verify_logits(ctx, dflash_verify_graph_enabled, dflash_verify_plan.top_k);
++
+         int32_t i_next = 0;
+ 
+         // process the created batch of tokens
+@@ -2780,8 +2994,23 @@ private:
+                 batch.logits   + i,
+             };
+ 
++            const char * dflash_reduce_reason = dflash_verify_plan.reason;
++            bool dflash_reduce_this_view = false;
++            if (dflash_verify_plan.enabled) {
++                dflash_reduce_this_view = dflash_batch_view_is_reduced_verify(slots, i, n_tokens, &dflash_reduce_reason);
++            }
++            llama_set_dflash_consume_reduced(ctx, dflash_reduce_this_view);
++
+             const int ret = llama_decode(ctx, batch_view);
+ 
++            bool dflash_reduced_verify_ready = false;
++            if (ret == 0 && dflash_reduce_this_view &&
++                    llama_get_logits_argmax(ctx) != nullptr &&
++                    llama_get_logits_argmax_k(ctx) == dflash_verify_plan.top_k &&
++                    llama_get_logits_argmax_n(ctx) >= n_tokens) {
++                dflash_reduced_verify_ready = true;
++            }
++
+             metrics.on_decoded(slots);
+ 
+             if (ret != 0) {
+@@ -2963,7 +3192,35 @@ private:
+                     common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+ 
+                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
++
++                    std::vector<llama_token> accepted;
++                    bool used_reduced_verify = false;
++                    if (dflash_reduced_verify_ready && dflash_verify_plan.enabled) {
++                        std::vector<int> reduced_idxs = slot.spec_i_batch;
++                        bool reduced_idxs_in_view = true;
++
++                        for (int & idx : reduced_idxs) {
++                            idx -= i;
++                            if (idx < 0 || idx >= n_tokens) {
++                                reduced_idxs_in_view = false;
++                                break;
++                            }
++                        }
++
++                        if (reduced_idxs_in_view) {
++                            accepted = dflash_sample_reduced_verify(
++                                    slot.smpl.get(), slot.ctx, reduced_idxs, slot.spec_draft, dflash_verify_plan.top_k);
++                            used_reduced_verify = true;
++                            if (accepted.empty()) {
++                                GGML_ABORT("DFlash reduced verifier output missing; raw logits were not copied for this decode view\n");
++                            }
++                        }
++                    }
++
++                    if (!used_reduced_verify) {
++                        accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
++                    }
++
+                     slot.spec_i_batch.clear();
+ 
+                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
+@@ -3046,6 +3303,8 @@ private:
+             }
+         }
+ 
++        llama_set_dflash_consume_reduced(ctx, false);
++
+         SRV_DBG("%s", "run slots completed\n");
+     }
+ 
