@@ -7,6 +7,7 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -1645,6 +1646,85 @@ class SnapshotSwapTests(unittest.TestCase):
             swap.discard(key)
             self.assertFalse(ram_path.exists())
             self.assertFalse(disk_path.exists())
+
+    def test_discard_cancels_pending_disk_mirror_before_publish(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"a" * 16
+            src = Path(td) / "source.dfsn"
+            src.write_text("snapshot\n")
+            started = threading.Event()
+            release = threading.Event()
+
+            def blocked_copy(_src, _dst):
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                Path(_dst).write_bytes(Path(_src).read_bytes())
+
+            async def run():
+                with patch("grimoire.dflash.snapshot_swap.shutil.copy2", side_effect=blocked_copy):
+                    swap.bind_loop(asyncio.get_running_loop())
+                    swap._queue_mirror(src, swap.disk_path(key), key, target="disk")
+                    self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                    swap.discard(key)
+                    release.set()
+                    await swap.flush_pending()
+
+            asyncio.run(run())
+            self.assertNotIn(key, swap.disk)
+            self.assertFalse(swap.disk_path(key).exists())
+
+    def test_clear_invalidates_queued_mirrors_before_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"b" * 16
+            src = Path(td) / "source.dfsn"
+            src.write_text("snapshot\n")
+
+            async def run():
+                token = swap._mirror_token(key)
+                swap.clear()
+                await swap._mirror_async(src, swap.disk_path(key), key, target="disk", token=token)
+
+            asyncio.run(run())
+            self.assertNotIn(key, swap.disk)
+            self.assertFalse(swap.disk_path(key).exists())
+
+    def test_flush_pending_waits_for_queued_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+
+            async def release_spawn():
+                await asyncio.sleep(0.05)
+                with swap._state_lock:
+                    swap._pending_spawns = 0
+
+            async def run():
+                with swap._state_lock:
+                    swap._pending_spawns = 1
+                asyncio.create_task(release_spawn())
+                started_at = time.monotonic()
+                await swap.flush_pending()
+                self.assertGreaterEqual(time.monotonic() - started_at, 0.04)
+
+            asyncio.run(run())
+
+    def test_cleanup_disk_removes_untracked_snapshot_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            tracked_key = b"c" * 16
+            tracked_path = swap.disk_path(tracked_key)
+            tracked_path.parent.mkdir(parents=True, exist_ok=True)
+            tracked_path.write_text("tracked\n")
+            swap.disk[tracked_key] = str(tracked_path)
+
+            stray_path = Path(td) / "disk" / "swap-deadbeefdeadbeef.dfsn"
+            stray_path.write_text("stray\n")
+
+            swap._cleanup_disk()
+
+            self.assertTrue(tracked_path.exists())
+            self.assertFalse(stray_path.exists())
 
 
 class PrefixCachePersistenceTests(unittest.TestCase):

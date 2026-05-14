@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import subprocess
+from pathlib import Path
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Optional
@@ -304,6 +305,8 @@ class ActiveModel:
             "snapshot-disk-dir",
             f"/var/lib/grimoire/snapshot_swap/{self.name}",
         )
+        snapshot_ram_root = Path(self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"))
+        snapshot_ram_dir = snapshot_ram_root / self.name
         session_cap = max(0, int(self.cfg.get("session-kv-slots", 2)))
         self.session_kv = SessionKV(
             cap=session_cap,
@@ -312,7 +315,7 @@ class ActiveModel:
 
         self.snapshot_staging_slot = int(self.cfg.get("snapshot-staging-slot", 7))
         self.snapshot_swap = SnapshotSwap(
-            ram_dir=self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"),
+            ram_dir=str(snapshot_ram_dir),
             disk_dir=snapshot_disk_dir,
             ram_budget_gb=self.cfg.get("snapshot-ram-budget-gb", 20.0),
             disk_budget_gb=self.cfg.get("snapshot-disk-budget-gb", 100.0),
@@ -434,6 +437,11 @@ class ActiveModel:
 
     def _stop_dflash(self):
         """Stop the dflash daemon and save prefix cache."""
+        if self.snapshot_swap:
+            try:
+                self.snapshot_swap.flush_pending_sync(timeout=30)
+            except Exception as e:
+                logger.warning("snapshot flush failed during %s shutdown: %s", self.name, e)
         if self.prefix_cache:
             self.prefix_cache.save()
             self.prefix_cache.cleanup(self.dflash_daemon)

@@ -239,6 +239,72 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertNotIn(mm_module.config.DFLASH_HOME, ld_library_path)
         self.assertEqual(captured["env"].get("LD_PRELOAD"), mm_module.config.PFLASH_SHIM_PATH)
 
+    def test_dflash_start_uses_model_scoped_snapshot_ram_dir(self):
+        captured = {}
+
+        class FakeDaemon:
+            def __init__(self, **kwargs):
+                captured["daemon_kwargs"] = kwargs
+                self.proc = object()
+
+            def spawn(self, timeout=None):
+                captured["spawn_timeout"] = timeout
+
+        class FakePrefixCache:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+            def load(self):
+                captured["prefix_cache_loaded"] = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = {
+                "backend": "dflash",
+                "target": "target.gguf",
+                "draft": "draft.safetensors",
+                "drafter": "drafter.gguf",
+                "snapshot-ram-dir": f"{tmp}/ram-root",
+                "snapshot-disk-dir": f"{tmp}/disk-root",
+            }
+            with patch.object(mm_module, "resolve_path", side_effect=lambda cfg, key: f"/tmp/{key}"), \
+                 patch.object(mm_module, "DflashDaemon", FakeDaemon), \
+                 patch.object(mm_module, "PrefixCache", FakePrefixCache):
+                active = mm_module.ActiveModel("dflash-model", cfg, port=None, gpu=0)
+                active._start_dflash()
+
+            self.assertEqual(active.snapshot_swap.ram_dir, Path(tmp) / "ram-root" / "dflash-model")
+            self.assertEqual(active.snapshot_swap.disk_dir, Path(tmp) / "disk-root")
+
+    def test_stop_dflash_flushes_pending_mirrors_before_shutdown(self):
+        order = []
+
+        class FakeSnapshotSwap:
+            def flush_pending_sync(self, timeout=None):
+                order.append(("flush", timeout))
+
+        class FakePrefixCache:
+            def save(self):
+                order.append(("save", None))
+
+            def cleanup(self, daemon=None):
+                order.append(("cleanup", daemon))
+
+        class FakeDaemon:
+            def stop(self):
+                order.append(("stop", None))
+
+        active = mm_module.ActiveModel("dflash-model", {"backend": "dflash"}, port=None, gpu=0)
+        active.snapshot_swap = FakeSnapshotSwap()
+        active.prefix_cache = FakePrefixCache()
+        active.dflash_daemon = FakeDaemon()
+
+        active._stop_dflash()
+
+        self.assertEqual(order[0], ("flush", 30))
+        self.assertEqual(order[1][0], "save")
+        self.assertEqual(order[2][0], "cleanup")
+        self.assertEqual(order[3], ("stop", None))
+
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:
             def get_conversation(self, user_hash, conversation_id):
