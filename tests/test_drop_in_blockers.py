@@ -334,6 +334,10 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("--spec-draft-model", content)
         self.assertIn("--spec-dflash-cross-ctx", content)
         self.assertIn('COMMON_SPECULATIVE_TYPE_DFLASH', content)
+        self.assertIn('LLM_ARCH_DFLASH_DRAFT', content)
+        self.assertIn('"dflash-draft"', content)
+        self.assertIn('LLM_KV_DFLASH_BLOCK_SIZE', content)
+        self.assertIn('auto-detected DFlash drafter architecture', content)
 
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("COPY patches/spec-dflash-contract.patch /app/patches/", dockerfile)
