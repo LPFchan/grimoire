@@ -90,6 +90,24 @@ class DropInBlockerTests(unittest.TestCase):
             cmd = entrypoint.build_cmd({"file": model_file.name}, port=8001)
         self.assertEqual(cmd[cmd.index("--host") + 1], "127.0.0.1")
 
+    def test_build_cmd_emits_native_dflash_canary_flags(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, tempfile.NamedTemporaryFile(suffix=".gguf") as draft_file:
+            cmd = entrypoint.build_cmd(
+                {
+                    "file": model_file.name,
+                    "draft": draft_file.name,
+                    "speculative-type": "dflash",
+                    "spec-dflash-cross-ctx": 1024,
+                },
+                port=8001,
+            )
+        self.assertIn("--spec-type", cmd)
+        self.assertEqual(cmd[cmd.index("--spec-type") + 1], "dflash")
+        self.assertIn("--spec-draft-model", cmd)
+        self.assertEqual(cmd[cmd.index("--spec-draft-model") + 1], draft_file.name)
+        self.assertIn("--spec-dflash-cross-ctx", cmd)
+        self.assertEqual(cmd[cmd.index("--spec-dflash-cross-ctx") + 1], "1024")
+
     def test_proxy_headers_strip_credentials_and_hop_by_hop_headers(self):
         headers = entrypoint._backend_request_headers({
             "authorization": "Bearer secret",
@@ -301,6 +319,13 @@ class DropInBlockerTests(unittest.TestCase):
         dockerignore = (ROOT / ".dockerignore").read_text()
         self.assertIn("build/", dockerignore)
         self.assertIn("*.egg-info/", dockerignore)
+
+    def test_models_json_contains_dormant_native_dflash_canary(self):
+        data = json.loads((ROOT / "etc" / "models.json").read_text())
+        cfg = data["models"]["dflash-native-qwen3.6-27B-canary"]
+        self.assertEqual(cfg["speculative-type"], "dflash")
+        self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
+        self.assertEqual(cfg["draft"], "gguf/Qwen3-0.6B-BF16.gguf")
 
     def test_webui_history_patch_is_well_formed(self):
         patch_path = ROOT / "patches" / "grimoire-webui-history.patch"

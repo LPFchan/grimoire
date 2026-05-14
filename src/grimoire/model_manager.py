@@ -53,6 +53,25 @@ def _extend_optional_arg(cmd, cfg, key, flag=None):
         cmd.extend([flag or f"--{key}", str(value)])
 
 
+def _append_native_dflash_args(cmd, cfg):
+    if cfg.get("backend", BACKEND_LLAMA) != BACKEND_LLAMA:
+        return
+    if cfg.get("speculative-type") != "dflash":
+        return
+
+    draft_model = _resolve_config_path(cfg.get("spec-draft-model") or cfg.get("draft"))
+    if not draft_model:
+        raise FileNotFoundError("Native DFlash requires a GGUF draft model path")
+    if not os.path.exists(draft_model):
+        raise FileNotFoundError(f"Native DFlash draft model not found at {draft_model}")
+
+    cmd.extend(["--spec-type", "dflash", "--spec-draft-model", draft_model])
+
+    cross_ctx = cfg.get("spec-dflash-cross-ctx")
+    if cross_ctx is not None:
+        cmd.extend(["--spec-dflash-cross-ctx", str(cross_ctx)])
+
+
 def _prepend_library_paths(env, paths, exclude_prefixes=()):
     existing = []
     for path in env.get("LD_LIBRARY_PATH", "").split(":"):
@@ -116,6 +135,7 @@ def build_cmd(cfg, port, alias=None):
 
     _extend_optional_arg(cmd, cfg, "image-min-tokens")
     _extend_optional_arg(cmd, cfg, "image-max-tokens")
+    _append_native_dflash_args(cmd, cfg)
 
     for bias in cfg.get("logit-bias", []) or []:
         cmd.extend(["--logit-bias", str(bias)])

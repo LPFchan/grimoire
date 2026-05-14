@@ -145,6 +145,28 @@
       "prefill-tail-budget": 16000,
       "prefill-compression": "auto"
     },
+    "dflash-native-qwen3.6-27B-canary": {
+      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
+      "draft": "gguf/Qwen3-0.6B-BF16.gguf",
+      "spec-draft-model": "gguf/Qwen3-0.6B-BF16.gguf",
+      "speculative-type": "dflash",
+      "spec-dflash-cross-ctx": 1024,
+      "tokenizer": "tokenizers/qwen3.6-27B",
+      "tokenizer-trust-remote-code": true,
+      "family": "qwen",
+      "capabilities": [
+        "completion"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25
+      },
+      "ctx-size": 60000,
+      "predict": 16384,
+      "parallel": 1,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0"
+    },
     "pflash-qwen3.6-27B": {
       "pflash": true,
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",

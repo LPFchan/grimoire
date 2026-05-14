@@ -324,6 +324,12 @@ class ModelRegistry:
             model_path = os.path.join(MODELS_DIR, cfg["file"])
             if not os.path.exists(model_path):
                 return False, f"Model file not found at {model_path}"
+            if cfg.get("speculative-type") == "dflash":
+                draft = resolve_path(cfg, "spec-draft-model") or resolve_path(cfg, "draft")
+                if not draft or not os.path.exists(draft):
+                    return False, f"Native DFlash draft model not found at {draft}"
+                if not str(draft).lower().endswith(".gguf"):
+                    return False, f"Native DFlash draft model must be GGUF: {draft}"
         elif backend == BACKEND_DFLASH:
             target = resolve_path(cfg, "target")
             if not target or not os.path.exists(target):
