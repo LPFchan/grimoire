@@ -128,6 +128,36 @@ index 20e38be..0cafad7 100644
          // In a more complex implementation we could use the same implementation but with different parameters.
          // This was initially used in PR-18471 but removed to simplify the code.
          if (has_ngram_simple) {
+diff --git a/include/llama.h b/include/llama.h
+index 49bd8e7..92f6935 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -604,6 +604,14 @@ extern "C" {
+     // Returns the total number of parameters in the model
+     LLAMA_API uint64_t llama_model_n_params(const struct llama_model * model);
+ 
++    // DFlash drafter model hyperparameters
++    LLAMA_API int32_t llama_model_dflash_block_size       (const struct llama_model * model);
++    LLAMA_API int32_t llama_model_dflash_mask_token_id    (const struct llama_model * model);
++    LLAMA_API int32_t llama_model_dflash_n_target_layers  (const struct llama_model * model);
++    LLAMA_API int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
++    // fills layer_ids[0..n-1], returns n (capped by capacity)
++    LLAMA_API int32_t llama_model_dflash_target_layer_ids (const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
++
+     // Returns true if the model contains an encoder that requires llama_encode() call
+     LLAMA_API bool llama_model_has_encoder(const struct llama_model * model);
+ 
+@@ -629,6 +637,10 @@ extern "C" {
+             const char * fname_out,
+             const llama_model_quantize_params * params);
+ 
++    // DFlash: share tok_embd and output tensors from src model to dst model
++    // Used to avoid duplicating embedding/lm_head weights between target and drafter
++    LLAMA_API void llama_model_share_tensors(struct llama_model * dst, const struct llama_model * src);
++
+     //
+     // Adapters
+     //
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
 index 6904b9c..b04f85a 100644
 --- a/src/llama-arch.cpp
@@ -222,7 +252,7 @@ index c2000c7..258cd1e 100644
      std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index f77b2e9..7ffc6b3 100644
+index f77b2e9..4760154 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -2948,6 +2948,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
@@ -301,6 +331,49 @@ index f77b2e9..7ffc6b3 100644
              return LLAMA_ROPE_TYPE_NEOX;
  
          case LLM_ARCH_QWEN2VL:
+@@ -9416,6 +9471,42 @@ uint64_t llama_model_n_params(const llama_model * model) {
+     return model->n_elements();
+ }
+ 
++void llama_model_share_tensors(llama_model * dst, const llama_model * src) {
++    dst->tok_embd = src->tok_embd;
++    dst->output   = src->output;
++}
++
++int32_t llama_model_dflash_block_size(const llama_model * model) {
++    return model->arch == LLM_ARCH_DFLASH_DRAFT ? (int32_t) model->hparams.dflash_block_size : 0;
++}
++
++int32_t llama_model_dflash_mask_token_id(const llama_model * model) {
++    return model->arch == LLM_ARCH_DFLASH_DRAFT ? (int32_t) model->hparams.dflash_mask_token_id : 0;
++}
++
++int32_t llama_model_dflash_n_target_layers(const llama_model * model) {
++    return model->arch == LLM_ARCH_DFLASH_DRAFT ? (int32_t) model->hparams.dflash_n_target_layers : 0;
++}
++
++int32_t llama_model_dflash_n_target_features(const llama_model * model) {
++    return model->arch == LLM_ARCH_DFLASH_DRAFT ? (int32_t) model->hparams.dflash_n_target_features : 0;
++}
++
++int32_t llama_model_dflash_target_layer_ids(const llama_model * model, int32_t * layer_ids, int32_t capacity) {
++    if (model->arch != LLM_ARCH_DFLASH_DRAFT || capacity <= 0) {
++        return 0;
++    }
++
++    int32_t n = (int32_t) model->hparams.dflash_n_target_layers;
++    if (n > capacity) {
++        n = capacity;
++    }
++    for (int32_t i = 0; i < n; ++i) {
++        layer_ids[i] = (int32_t) model->hparams.dflash_target_layer_ids[i];
++    }
++    return n;
++}
++
+ bool llama_model_has_encoder(const llama_model * model) {
+     switch (model->arch) {
+         case LLM_ARCH_T5:        return true;
 diff --git a/src/llama-model.h b/src/llama-model.h
 index 5f101bd..6708b1d 100644
 --- a/src/llama-model.h
@@ -317,19 +390,17 @@ index 5f101bd..6708b1d 100644
      struct ggml_tensor * cls       = nullptr;
      struct ggml_tensor * cls_b     = nullptr;
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index fb86317..bf89d44 100644
+index fb86317..2c9deed 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
-@@ -795,6 +795,14 @@ private:
+@@ -795,6 +795,12 @@ private:
                  return false;
              }
  
-+            char draft_arch[64] = {};
-+            if (llama_model_meta_val_str(model_dft.get(), "general.architecture", draft_arch, sizeof(draft_arch)) > 0 &&
-+                std::string(draft_arch) == "dflash-draft" &&
++            if (llama_model_dflash_block_size(model_dft.get()) > 0 &&
 +                params_base.speculative.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
 +                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_DFLASH;
-+                SRV_INF("auto-detected DFlash drafter architecture '%s'\n", draft_arch);
++                SRV_INF("auto-detected DFlash drafter (block_size=%d)\n", llama_model_dflash_block_size(model_dft.get()));
 +            }
 +
              params_base.speculative.model_dft = model_dft.get();
