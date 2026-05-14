@@ -72,9 +72,28 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 model_cfg=model_cfg, active=active,
             )
             if len(prompt_ids) > pcfg.threshold:
+                # Park llama-server before compression if park-unpark enabled
+                park_ok = False
+                if model_cfg.get("park-unpark"):
+                    try:
+                        park_ok = active._park_llama()
+                        if park_ok:
+                            log.warning("pflash park: llama parked")
+                    except Exception as e:
+                        log.warning(f"pflash park: failed ({e}) — continuing without park")
+
                 compressed_ids, fired, blocks = await maybe_compress(
                     prompt_ids, daemon, pcfg, blocks=prompt_blocks,
                 )
+
+                # Unpark llama-server after compression
+                if park_ok:
+                    try:
+                        if active._unpark_llama():
+                            log.warning("pflash park: llama unparked")
+                    except Exception as e:
+                        log.warning(f"pflash park: unpark failed ({e})")
+
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
                     # Reconstruct messages preserving roles and tool call metadata.

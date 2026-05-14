@@ -163,11 +163,47 @@ class ActiveModel:
             p for p in existing.split(":") if p and p != turboquant_libs and not p.startswith("/opt/dflash")
         )
 
+        # LD_PRELOAD the park/unpark shim for park models
+        if self.cfg.get("park-unpark"):
+            existing_pre = env.get("LD_PRELOAD", "")
+            shim_path = "/opt/dflash/pflash_shim.so"
+            env["LD_PRELOAD"] = f"{shim_path}:" + existing_pre if existing_pre else shim_path
+            logger.info(f"park-unpark enabled, LD_PRELOAD={env['LD_PRELOAD']}")
+
         logger.info(f"Starting {self.name} (llama) on GPU {self.gpu}, port {self.port}")
         logger.info(f"Command: {' '.join(cmd)}")
 
         self.process = subprocess.Popen(cmd, env=env, preexec_fn=_spawn_child_preexec)
         return self.process
+
+    def _park_llama(self):
+        """Park llama-server weights to host shadow buffer via shim FIFO."""
+        try:
+            ctl = "/tmp/pflash_shim.ctl"
+            with open(ctl, "w") as f:
+                f.write("park\n")
+            ack = "/tmp/pflash_shim.ack"
+            import select, os
+            with open(ack, "r") as f:
+                resp = f.read().strip()
+            return resp == "ok"
+        except Exception as e:
+            logger.warning(f"park failed: {e}")
+            return False
+
+    def _unpark_llama(self):
+        """Unpark llama-server weights from host shadow buffer via shim FIFO."""
+        try:
+            ctl = "/tmp/pflash_shim.ctl"
+            with open(ctl, "w") as f:
+                f.write("unpark\n")
+            ack = "/tmp/pflash_shim.ack"
+            with open(ack, "r") as f:
+                resp = f.read().strip()
+            return resp == "ok"
+        except Exception as e:
+            logger.warning(f"unpark failed: {e}")
+            return False
 
     def _start_pflash_daemon(self):
         """Start the PFlash compression daemon on the same GPU."""
