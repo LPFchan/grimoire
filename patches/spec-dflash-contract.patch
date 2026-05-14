@@ -128,6 +128,122 @@ index 20e38be..0cafad7 100644
          // In a more complex implementation we could use the same implementation but with different parameters.
          // This was initially used in PR-18471 but removed to simplify the code.
          if (has_ngram_simple) {
+diff --git a/convert_hf_to_gguf.py b/convert_hf_to_gguf.py
+index 5b4fb79..5dee3ff 100755
+--- a/convert_hf_to_gguf.py
++++ b/convert_hf_to_gguf.py
+@@ -4743,6 +4743,56 @@ class Qwen3Model(Qwen2Model):
+         yield from super().modify_tensors(data_torch, name, bid)
+ 
+ 
++@ModelBase.register("DFlashDraftModel")
++class DFlashDraftModel(TextModel):
++    model_arch = gguf.MODEL_ARCH.DFLASH_DRAFT
++
++    def set_vocab(self):
++        try:
++            self._set_vocab_sentencepiece()
++        except FileNotFoundError:
++            self._set_vocab_gpt2()
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++
++        self.gguf_writer.add_causal_attention(False)
++
++        head_dim = self.hparams.get("head_dim", 128)
++        self.gguf_writer.add_rope_dimension_count(head_dim)
++
++        arch = self.gguf_writer.arch
++        block_size = self.hparams.get("block_size", 16)
++        self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", block_size)
++
++        # newer drafters nest dflash-specific fields under "dflash_config"; fall back to top-level for older ones
++        dflash_cfg = self.hparams.get("dflash_config", {})
++
++        mask_token_id = dflash_cfg.get("mask_token_id", self.hparams.get("mask_token_id", 248070))
++        self.gguf_writer.add_uint32(f"{arch}.dflash.mask_token_id", mask_token_id)
++
++        target_layer_ids = dflash_cfg.get("target_layer_ids",
++                                          self.hparams.get("target_layer_ids", [1, 16, 31, 46, 61]))
++        self.gguf_writer.add_array(f"{arch}.dflash.target_layer_ids", target_layer_ids)
++
++        n_embd = self.hparams.get("hidden_size", 5120)
++        n_target_features = n_embd * len(target_layer_ids)
++        self.gguf_writer.add_uint32(f"{arch}.dflash.n_target_features", n_target_features)
++
++        if self.hparams.get("use_sliding_window") and self.hparams.get("sliding_window"):
++            self.gguf_writer.add_sliding_window(self.hparams["sliding_window"])
++            layer_types = self.hparams.get("layer_types", [])
++            pattern = [t == "sliding_attention" for t in layer_types]
++            if pattern:
++                self.gguf_writer.add_sliding_window_pattern(pattern)
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # strip "model." prefix if present
++        if name.startswith("model."):
++            name = name[len("model."):]
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
+ @ModelBase.register("Qwen3MoeForCausalLM")
+ class Qwen3MoeModel(Qwen2MoeModel):
+     model_arch = gguf.MODEL_ARCH.QWEN3MOE
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 997744f..2adb032 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -494,6 +494,7 @@ class MODEL_ARCH(IntEnum):
+     LLAMA_EMBED      = auto()
+     MAINCODER        = auto()
+     KIMI_LINEAR      = auto()
++    DFLASH_DRAFT     = auto()
+ 
+ 
+ class VISION_PROJECTOR_TYPE(IntEnum):
+@@ -790,6 +791,8 @@ class MODEL_TENSOR(IntEnum):
+     V_SAM_NET_3          = auto() # Deepseek-OCR
+     V_ENC_EMBD_IMGNL     = auto() # Deepseek-OCR
+     V_ENC_EMBD_VSEP      = auto() # Deepseek-OCR
++    DFLASH_FC            = auto() # DFlash drafter fusion
++    DFLASH_HIDDEN_NORM   = auto() # DFlash drafter fusion norm
+ 
+     # audio (mtmd)
+     A_ENC_EMBD_POS        = auto()
+@@ -980,6 +983,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.LLAMA_EMBED:      "llama-embed",
+     MODEL_ARCH.MAINCODER:        "maincoder",
+     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
++    MODEL_ARCH.DFLASH_DRAFT:     "dflash-draft",
+ }
+ 
+ VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
+@@ -1167,6 +1171,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.CONVNEXT_NORM:             "convnext.{bid}.norm",
+     MODEL_TENSOR.CONVNEXT_PW1:              "convnext.{bid}.pw1",
+     MODEL_TENSOR.CONVNEXT_PW2:              "convnext.{bid}.pw2",
++    MODEL_TENSOR.DFLASH_FC:                 "dflash_fc",
++    MODEL_TENSOR.DFLASH_HIDDEN_NORM:        "dflash_hidden_norm",
+     MODEL_TENSOR.CONVNEXT_GAMMA:            "convnext.{bid}.gamma",
+     MODEL_TENSOR.POSNET_CONV1:              "posnet.{bid}.conv1",
+     MODEL_TENSOR.POSNET_CONV2:              "posnet.{bid}.conv2",
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index 01a9b23..25ab1f7 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -158,6 +158,12 @@ class TensorNameMap:
+         MODEL_TENSOR.V_ENC_MSFA_NORM: (
+             "model.vision_tower.timm_model.msfa.norm", # gemma3n
+         ),
++        MODEL_TENSOR.DFLASH_FC: (
++            "fc",                  # dflash drafter
++        ),
++        MODEL_TENSOR.DFLASH_HIDDEN_NORM: (
++            "hidden_norm",         # dflash drafter
++        ),
+     }
+ 
+     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
 diff --git a/include/llama.h b/include/llama.h
 index 49bd8e7..92f6935 100644
 --- a/include/llama.h

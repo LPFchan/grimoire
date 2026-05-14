@@ -344,6 +344,13 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn('dst->tok_embd = src->tok_embd;', content)
         self.assertIn('if (llama_model_dflash_block_size(model_dft.get()) > 0 &&', content)
         self.assertIn('auto-detected DFlash drafter (block_size=%d)', content)
+        self.assertIn('@ModelBase.register("DFlashDraftModel")', content)
+        self.assertIn('model_arch = gguf.MODEL_ARCH.DFLASH_DRAFT', content)
+        self.assertIn('self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", block_size)', content)
+        self.assertIn('self.gguf_writer.add_array(f"{arch}.dflash.target_layer_ids", target_layer_ids)', content)
+        self.assertIn('MODEL_ARCH.DFLASH_DRAFT:     "dflash-draft"', content)
+        self.assertIn('MODEL_TENSOR.DFLASH_FC:                 "dflash_fc"', content)
+        self.assertIn('"fc",                  # dflash drafter', content)
 
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("COPY patches/spec-dflash-contract.patch /app/patches/", dockerfile)
