@@ -57,29 +57,58 @@ static void vmm_init(void) {
 }
 
 static CUdeviceptr vmm_alloc(size_t sz) {
+    // Chunk large allocations into 128 MB pieces to respect per-alloc limits
+    const size_t CHUNK = 128ULL * 1024 * 1024;  // 128 MB per VMM create
     size_t al = (sz + VMM_G - 1) & ~(VMM_G - 1);
-    if (va_next + al > va_base + va_cap) { LOG("VMM OOM"); return 0; }
-    CUmemAllocationProp pr = {};
-    pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    pr.location.id = dv;
-    CUmemGenericAllocationHandle h;
-    CUresult r = cuMemCreate(&h, al, &pr, 0);
-    if (r != CUDA_SUCCESS) { LOG("cuMemCreate(%zu) fail %d", al, r); return 0; }
-    r = cuMemMap(va_next, al, 0, h, 0); cuMemRelease(h);
-    if (r != CUDA_SUCCESS) { LOG("cuMemMap(%zu) fail %d", al, r); return 0; }
-    CUmemAccessDesc ac = {};
-    ac.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ac.location.id = dv;
-    ac.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    cuMemSetAccess(va_next, al, &ac, 1);
+    if (va_next + al > va_base + va_cap) { LOG("VMM OOM: need %zu, cap %zu", al, va_cap); return 0; }
+
+    size_t remaining = al;
+    CUdeviceptr current = va_next;
+
+    while (remaining > 0) {
+        size_t chunk = (remaining < CHUNK) ? remaining : CHUNK;
+        chunk = (chunk + VMM_G - 1) & ~(VMM_G - 1);  // align to VMM granularity
+
+        CUmemAllocationProp pr = {};
+        pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        pr.location.id = dv;
+
+        CUmemGenericAllocationHandle h;
+        CUresult r = cuMemCreate(&h, chunk, &pr, 0);
+        if (r != CUDA_SUCCESS) { LOG("cuMemCreate(%zu) fail %d at offset %zu", chunk, r, al - remaining); return 0; }
+
+        r = cuMemMap(current, chunk, 0, h, 0);
+        cuMemRelease(h);
+        if (r != CUDA_SUCCESS) { LOG("cuMemMap(%zu) fail %d", chunk, r); return 0; }
+
+        CUmemAccessDesc ac = {};
+        ac.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        ac.location.id = dv;
+        ac.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        cuMemSetAccess(current, chunk, &ac, 1);
+
+        current += chunk;
+        remaining -= chunk;
+    }
+
     CUdeviceptr ret = va_next;
-    va_next += al;
+    va_next = current;
     return ret;
 }
 
 static void vmm_free(CUdeviceptr p, size_t sz) {
-    size_t al = (sz + VMM_G - 1) & ~(VMM_G - 1);
-    cuMemUnmap(p, al);
+    // Chunked unmap (though cuMemUnmap handles large ranges, chunked for consistency)
+    const size_t CHUNK = 128ULL * 1024 * 1024;
+    size_t remaining = (sz + VMM_G - 1) & ~(VMM_G - 1);
+    CUdeviceptr current = p;
+    while (remaining > 0) {
+        size_t chunk = (remaining < CHUNK) ? remaining : CHUNK;
+        chunk = (chunk + VMM_G - 1) & ~(VMM_G - 1);
+        cuMemUnmap(current, chunk);
+        current += chunk;
+        remaining -= chunk;
+    }
 }
 
 cudaError_t cudaMalloc(void **p, size_t sz) {
@@ -140,20 +169,36 @@ static int unpark(void) {
     cuCtxSetCurrent(cx);
     pthread_mutex_lock(&lk);
     size_t off = 0; int n = 0;
+
+    const size_t CHUNK = 128ULL * 1024 * 1024;
+
     for (int i = 0; i < ne; i++) {
         CUdeviceptr dp = (CUdeviceptr)(uintptr_t)es[i].p;
         size_t s = es[i].sz, al = (s + VMM_G - 1) & ~(VMM_G - 1);
-        CUmemAllocationProp pr = {};
-        pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-        pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = dv;
-        CUmemGenericAllocationHandle h;
-        CUresult r = cuMemCreate(&h, al, &pr, 0);
-        if (r != CUDA_SUCCESS) { LOG("  cuMemCreate[%d] fail %d", i, r); continue; }
-        cuMemMap(dp, al, 0, h, 0); cuMemRelease(h);
-        CUmemAccessDesc ac = {};
-        ac.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ac.location.id = dv;
-        ac.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        cuMemSetAccess(dp, al, &ac, 1);
+
+        // Chunked VMM re-creation at the same VA (supports large 15 GB allocations)
+        size_t remaining = al;
+        CUdeviceptr current = dp;
+        int ok = 1;
+        while (remaining > 0) {
+            size_t chunk = (remaining < CHUNK) ? remaining : CHUNK;
+            chunk = (chunk + VMM_G - 1) & ~(VMM_G - 1);
+
+            CUmemAllocationProp pr = {};
+            pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = dv;
+            CUmemGenericAllocationHandle h;
+            CUresult r = cuMemCreate(&h, chunk, &pr, 0);
+            if (r != CUDA_SUCCESS) { LOG("  cuMemCreate[%d] chunk fail %d", i, r); ok = 0; break; }
+            cuMemMap(current, chunk, 0, h, 0); cuMemRelease(h);
+            CUmemAccessDesc ac = {};
+            ac.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ac.location.id = dv;
+            ac.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            cuMemSetAccess(current, chunk, &ac, 1);
+            current += chunk; remaining -= chunk;
+        }
+        if (!ok) continue;
+
         cuMemcpyHtoD(dp, sh + off, s); off += s; n++;
         LOG("  remap[%d]: %p <- host (%zu MB)", i, es[i].p, s>>20);
     }
