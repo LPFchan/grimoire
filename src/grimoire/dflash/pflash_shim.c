@@ -1,343 +1,227 @@
-// pflash_shim.c — LD_PRELOAD library that parks/unparks llama-server GPU allocations
-//
-// Intercepts cuMemAlloc_v2 / cuMemFree_v2 to track all GPU allocations.
-// On "park": saves all live allocations to a host-side malloc buffer,
-// unmaps GPU physical pages via CUDA VMM (preserving virtual addresses).
-// On "unpark": remaps GPU physical pages at the same VAs, restores data.
-//
-// No allocation-size heuristics — parks EVERYTHING (weights, KV, scratch).
-// VMM coalescing groups adjacent small allocations into 2 MB-aligned regions.
-// Thread safety via mutex around all intercepted calls.
-//
-// Protocol: named pipe /tmp/pflash_shim.ctl (write), .ack (read)
-//   "park" → "ok" or "error:..."
-//   "unpark" → "ok" or "error:..."
-
 #define _GNU_SOURCE
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-// ── Constants ─────────────────────────────────────────────────────────
-#define MAX_ALLOCS      16384
-#define ALIGN_2MB       0x200000ULL
-#define MAX_CTL_LINE    256
-#define VMM_GRANULARITY 0x200000ULL  // 2 MB — minimum for cuMemMap
-#define PID_BUF_SIZE    64
+#define MAX_A 16384
+#define VMM_G 0x200000ULL
+#define LOG(fmt, ...) do { fprintf(stderr,"[pflash_shim] "fmt"\n",##__VA_ARGS__); fflush(stderr); } while(0)
 
-// ── Registry entry ─────────────────────────────────────────────────────
-typedef struct {
-    CUdeviceptr ptr;
-    size_t      size;
-    int         active;  // 1 = live, 0 = freed
-} AllocEntry;
+typedef struct { CUdeviceptr p; size_t s; int a; } E;
+static E es[MAX_A];
+static int ne;
+static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
 
-static AllocEntry  g_allocs[MAX_ALLOCS];
-static int         g_n_allocs;
-static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char *sh;
+static size_t sh_sz, sh_used;
+static CUcontext cx;
+static CUdevice dv;
+static int vmm;
+static CUdeviceptr va;
+static size_t vc;
 
-// ── Host shadow buffer ────────────────────────────────────────────────
-// Plain malloc (not pinned — avoids RLIMIT_MEMLOCK issues)
-static unsigned char *g_shadow    = NULL;
-static size_t         g_shadow_sz = 0;
-static size_t         g_shadow_used = 0;
+static int cf=-1, af=-1;
+static pthread_t th;
+static volatile int thr;
 
-// ── CUDA VMM state ────────────────────────────────────────────────────
-static CUdevice     g_dev         = 0;
-static CUcontext    g_ctx         = NULL;
-static int          g_vmm_inited  = 0;
-static CUdeviceptr  g_va_base     = 0;
-static size_t       g_va_capacity = 0;  // total reserved VA space in bytes
-static size_t       g_va_used     = 0;  // allocated within VA range
+__attribute__((constructor)) static void init(void);
+__attribute__((destructor))  static void fini(void);
 
-// ── Park state ────────────────────────────────────────────────────────
-static volatile int g_parked = 0;
-static int          g_ctl_fd = -1;
-static int          g_ack_fd = -1;
-
-// ── Thread for FIFO listener ──────────────────────────────────────────
-static pthread_t    g_listener;
-static volatile int g_listener_running = 0;
-
-// ── DSO constructor/destructor ────────────────────────────────────────
-static void shim_init(void)  __attribute__((constructor));
-static void shim_fini(void)  __attribute__((destructor));
-
-// ── Forward declarations ──────────────────────────────────────────────
-static void vmm_init(void);
-static int  vmm_park(void);
-static int  vmm_unpark(void);
-static void registry_add(CUdeviceptr ptr, size_t size);
-static void registry_remove(CUdeviceptr ptr);
-static void ctl_listener_loop(void);
-
-// ── dlsym helpers ─────────────────────────────────────────────────────
-static void *resolve(const char *name) {
-    static void *handle = NULL;
-    if (!handle) handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
-    return handle ? dlsym(handle, name) : NULL;
+static void *sym(const char *n) {
+    void *h;
+    if ((h = dlopen("libcuda.so.1", RTLD_LAZY|RTLD_NOLOAD))) { void *p = dlsym(h,n); if(p) return p; }
+    if ((h = dlopen("libcudart.so", RTLD_LAZY|RTLD_NOLOAD))) { void *p = dlsym(h,n); if(p) return p; }
+    if ((h = dlopen("libcudart.so.12", RTLD_LAZY|RTLD_NOLOAD))) { void *p = dlsym(h,n); if(p) return p; }
+    if ((h = dlopen("libggml-cuda.so.0", RTLD_LAZY|RTLD_NOLOAD))) { void *p = dlsym(h,n); if(p) return p; }
+    return NULL;
 }
 
-typedef CUresult (*cuMemAlloc_v2_fn)(CUdeviceptr *, size_t);
-typedef CUresult (*cuMemFree_v2_fn)(CUdeviceptr);
-typedef CUresult (*cuMemGetInfo_v2_fn)(size_t *, size_t *);
-typedef CUresult (*cuCtxSynchronize_fn)(void);
-
-static cuMemAlloc_v2_fn    real_cuMemAlloc_v2    = NULL;
-static cuMemFree_v2_fn     real_cuMemFree_v2     = NULL;
-static cuMemGetInfo_v2_fn  real_cuMemGetInfo_v2  = NULL;
-static cuCtxSynchronize_fn real_cuCtxSynchronize = NULL;
-
-// ── Intercepted CUDA Driver API calls ─────────────────────────────────
-CUresult cuMemAlloc_v2(CUdeviceptr *dptr, size_t bytesize) {
-    if (!real_cuMemAlloc_v2) real_cuMemAlloc_v2 = resolve("cuMemAlloc_v2");
-    CUresult r = real_cuMemAlloc_v2(dptr, bytesize);
-    if (r == CUDA_SUCCESS) {
-        pthread_mutex_lock(&g_lock);
-        registry_add(*dptr, bytesize);
-        if (!g_vmm_inited) vmm_init();
-        pthread_mutex_unlock(&g_lock);
+static void reg(CUdeviceptr p, size_t s) {
+    pthread_mutex_lock(&lk);
+    if (ne < MAX_A) { es[ne].p = p; es[ne].s = s; es[ne].a = 1; ne++; }
+    LOG("reg[%d]: 0x%lx sz=%zu total=%d", ne-1, (unsigned long)p, s, ne);
+    if (!vmm && p) {
+        cuCtxGetCurrent(&cx);
+        if (cx) {
+            cuCtxGetDevice(&dv);
+            size_t fr, tt; cuMemGetInfo_v2(&fr, &tt);
+            vc = (tt * 9 / 10) & ~(VMM_G - 1);
+            if (vc < 2ULL<<30) vc = 2ULL<<30;
+            if (vc > 22ULL<<30) vc = 22ULL<<30;
+            CUresult r = cuMemAddressReserve(&va, vc, 0, 0, 0);
+            LOG("VMM: reserve(%zu MB) → %d va=0x%lx", vc>>20, r, (unsigned long)va);
+            vmm = (r == CUDA_SUCCESS);
+        }
     }
+    pthread_mutex_unlock(&lk);
+}
+
+static void unreg(CUdeviceptr p) {
+    pthread_mutex_lock(&lk);
+    for (int i = 0; i < ne; i++) if (es[i].a && es[i].p == p) { es[i].a = 0; break; }
+    pthread_mutex_unlock(&lk);
+}
+
+// ── Intercept ALL possible CUDA allocators ──────────────────────────
+
+// CUDA Runtime API
+cudaError_t cudaMalloc(void **p, size_t s) {
+    static cudaError_t (*real)(void**,size_t);
+    if (!real) real = sym("cudaMalloc");
+    cudaError_t r = real(p,s);
+    if (r==cudaSuccess && p && *p) reg((CUdeviceptr)(uintptr_t)*p, s);
+    else LOG("cudaMalloc(%zu) → %d", s, r);
     return r;
 }
 
-CUresult cuMemFree_v2(CUdeviceptr dptr) {
-    if (!real_cuMemFree_v2) real_cuMemFree_v2 = resolve("cuMemFree_v2");
-    pthread_mutex_lock(&g_lock);
-    registry_remove(dptr);
-    pthread_mutex_unlock(&g_lock);
-    return real_cuMemFree_v2(dptr);
+cudaError_t cudaFree(void *p) {
+    static cudaError_t (*real)(void*);
+    if (!real) real = sym("cudaFree");
+    if (p) unreg((CUdeviceptr)(uintptr_t)p);
+    return real(p);
 }
 
-CUresult cuMemGetInfo_v2(size_t *free, size_t *total) {
-    if (!real_cuMemGetInfo_v2) real_cuMemGetInfo_v2 = resolve("cuMemGetInfo_v2");
-    return real_cuMemGetInfo_v2(free, total);
+// CUDA Driver API — undefine macros that alias cuMemAlloc -> cuMemAlloc_v2
+// We define our own cuMemAlloc and cuMemAlloc_v2 that both route through reg()
+#pragma push_macro("cuMemAlloc")
+#pragma push_macro("cuMemFree")
+#undef cuMemAlloc
+#undef cuMemFree
+
+CUresult cuMemAlloc(CUdeviceptr *p, size_t s) {
+    static CUresult (*real)(CUdeviceptr*,size_t);
+    if (!real) real = sym("cuMemAlloc");
+    CUresult r = real(p,s);
+    if (r==CUDA_SUCCESS && p && *p) reg(*p, s);
+    else LOG("cuMemAlloc(%zu) → %d", s, r);
+    return r;
 }
 
-// ── Registry ──────────────────────────────────────────────────────────
-static int registry_find(CUdeviceptr ptr) {
-    for (int i = 0; i < g_n_allocs; i++)
-        if (g_allocs[i].active && g_allocs[i].ptr == ptr) return i;
-    return -1;
+CUresult cuMemAlloc_v2(CUdeviceptr *p, size_t s) {
+    static CUresult (*real)(CUdeviceptr*,size_t);
+    if (!real) real = sym("cuMemAlloc_v2");
+    CUresult r = real(p,s);
+    if (r==CUDA_SUCCESS && p && *p) reg(*p, s);
+    else LOG("cuMemAlloc_v2(%zu) → %d", s, r);
+    return r;
 }
 
-static void registry_add(CUdeviceptr ptr, size_t size) {
-    int idx = registry_find(ptr);
-    if (idx >= 0) { g_allocs[idx].size = size; return; }
-    if (g_n_allocs >= MAX_ALLOCS) { fprintf(stderr, "[pflash_shim] registry full\n"); return; }
-    g_allocs[g_n_allocs].ptr    = ptr;
-    g_allocs[g_n_allocs].size   = size;
-    g_allocs[g_n_allocs].active = 1;
-    g_n_allocs++;
-    g_va_used += (size + VMM_GRANULARITY - 1) & ~(VMM_GRANULARITY - 1);
+CUresult cuMemFree(CUdeviceptr p) {
+    static CUresult (*real)(CUdeviceptr);
+    if (!real) real = sym("cuMemFree");
+    unreg(p);
+    return real(p);
 }
 
-static void registry_remove(CUdeviceptr ptr) {
-    int idx = registry_find(ptr);
-    if (idx >= 0) { g_allocs[idx].active = 0; }
+CUresult cuMemFree_v2(CUdeviceptr p) {
+    static CUresult (*real)(CUdeviceptr);
+    if (!real) real = sym("cuMemFree_v2");
+    unreg(p);
+    return real(p);
 }
 
-// ── VMM Init ──────────────────────────────────────────────────────────
-static void vmm_init(void) {
-    // Get current CUDA context
-    cuCtxGetCurrent(&g_ctx);
-    if (!g_ctx) return;
-    cuCtxGetDevice(&g_dev);
+#pragma pop_macro("cuMemAlloc")
+#pragma pop_macro("cuMemFree")
 
-    // Query free memory to estimate VA space needed
-    size_t free_mem = 0, total_mem = 0;
-    cuMemGetInfo_v2(&free_mem, &total_mem);
-    // Reserve 90% of total VRAM as VA space
-    g_va_capacity = (total_mem * 9 / 10) & ~(VMM_GRANULARITY - 1);
-    if (g_va_capacity < 2ULL * 1024 * 1024 * 1024)
-        g_va_capacity = 2ULL * 1024 * 1024 * 1024;  // at least 2 GB
-    if (g_va_capacity > 22ULL * 1024 * 1024 * 1024)
-        g_va_capacity = 22ULL * 1024 * 1024 * 1024;  // at most 22 GB
-
-    CUresult r = cuMemAddressReserve(&g_va_base, g_va_capacity, 0, 0, 0);
-    if (r != CUDA_SUCCESS) {
-        fprintf(stderr, "[pflash_shim] cuMemAddressReserve failed: %d\n", r);
-        g_va_capacity = 0;
-        return;
+// ── Park ────────────────────────────────────────────────────────────
+static int park(void) {
+    LOG("park (vmm=%d ne=%d)", vmm, ne);
+    if (!vmm) return -1;
+    cuCtxSetCurrent(cx);
+    pthread_mutex_lock(&lk);
+    size_t t = 0; int n = 0;
+    for (int i = 0; i < ne; i++) { if (es[i].a) { n++; t += es[i].s; } }
+    LOG("park: %d active, %.0f MB", n, (double)t/(1<<20));
+    unsigned char *b = malloc(t);
+    if (!b) { pthread_mutex_unlock(&lk); return -1; }
+    sh = b; sh_sz = t; sh_used = 0;
+    for (int i = 0; i < ne; i++) {
+        if (!es[i].a) continue;
+        size_t al = (es[i].s + VMM_G - 1) & ~(VMM_G - 1);
+        LOG("  save[%d]: %zu bytes to off %zu", i, es[i].s, sh_used);
+        cuMemcpyDtoH(b + sh_used, es[i].p, es[i].s);
+        sh_used += es[i].s;
+        if (es[i].p >= va && es[i].p < va + vc) cuMemUnmap(es[i].p, al);
     }
-    g_vmm_inited = 1;
-    fprintf(stderr, "[pflash_shim] VMM inited: VA=0x%lx capacity=%zu MB\n",
-            (unsigned long)g_va_base, g_va_capacity >> 20);
-}
-
-// ── Park: save all allocations to host shadow, unmap GPU pages ───────
-static int vmm_park(void) {
-    if (!g_vmm_inited || !g_va_capacity) return -1;
-
-    // Synchronize — no in-flight kernels during unmap
-    if (!real_cuCtxSynchronize) real_cuCtxSynchronize = resolve("cuCtxSynchronize");
-    if (real_cuCtxSynchronize) real_cuCtxSynchronize();
-
-    // Calculate total shadow size
-    size_t total = 0;
-    pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_n_allocs; i++) {
-        if (g_allocs[i].active) total += g_allocs[i].size;
-    }
-
-    // Allocate host shadow buffer
-    unsigned char *buf = (unsigned char *)malloc(total);
-    if (!buf) { pthread_mutex_unlock(&g_lock); return -1; }
-    g_shadow = buf;
-    g_shadow_sz = total;
-    g_shadow_used = 0;
-
-    // Save each allocation to shadow, then unmap
-    for (int i = 0; i < g_n_allocs; i++) {
-        if (!g_allocs[i].active) continue;
-        CUdeviceptr ptr = g_allocs[i].ptr;
-        size_t sz = g_allocs[i].size;
-        size_t aligned = (sz + VMM_GRANULARITY - 1) & ~(VMM_GRANULARITY - 1);
-
-        // Copy GPU → host
-        cuMemcpyDtoH(buf + g_shadow_used, ptr, sz);
-        g_shadow_used += sz;
-
-        // Unmap VMM region (if within our VA range)
-        if (ptr >= g_va_base && ptr < g_va_base + g_va_capacity) {
-            cuMemUnmap(ptr, aligned);
-        }
-    }
-    pthread_mutex_unlock(&g_lock);
-
-    g_parked = 1;
-    fprintf(stderr, "[pflash_shim] parked: %d allocations, %zu MB shadow\n",
-            g_n_allocs, total >> 20);
+    pthread_mutex_unlock(&lk);
+    LOG("park done: %.1f MB", (double)t/(1<<20));
     return 0;
 }
 
-// ── Unpark: remap GPU pages, restore data from host shadow ───────────
-static int vmm_unpark(void) {
-    if (!g_vmm_inited || !g_va_capacity || !g_shadow) return -1;
-
-    pthread_mutex_lock(&g_lock);
-    size_t offset = 0;
-    for (int i = 0; i < g_n_allocs; i++) {
-        if (!g_allocs[i].active) continue;
-        CUdeviceptr ptr = g_allocs[i].ptr;
-        size_t sz = g_allocs[i].size;
-        size_t aligned = (sz + VMM_GRANULARITY - 1) & ~(VMM_GRANULARITY - 1);
-
-        if (ptr >= g_va_base && ptr < g_va_base + g_va_capacity) {
-            CUmemAllocationProp prop = {};
-            prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-            prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            prop.location.id = g_dev;
-
-            CUmemGenericAllocationHandle handle;
-            CUresult r = cuMemCreate(&handle, aligned, &prop, 0);
-            if (r != CUDA_SUCCESS) {
-                fprintf(stderr, "[pflash_shim] cuMemCreate failed at offset %zu: %d\n", offset, r);
-                pthread_mutex_unlock(&g_lock);
-                return -1;
-            }
-
-            r = cuMemMap(ptr, aligned, 0, handle, 0);
-            cuMemRelease(handle);
-            if (r != CUDA_SUCCESS) {
-                fprintf(stderr, "[pflash_shim] cuMemMap failed at offset %zu: %d\n", offset, r);
-                pthread_mutex_unlock(&g_lock);
-                return -1;
-            }
-
-            CUmemAccessDesc access = {};
-            access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-            access.location.id = g_dev;
-            access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            cuMemSetAccess(ptr, aligned, &access, 1);
+// ── Unpark ──────────────────────────────────────────────────────────
+static int unpark(void) {
+    LOG("unpark (vmm=%d sh=%p)", vmm, (void*)sh);
+    if (!vmm || !sh) return -1;
+    cuCtxSetCurrent(cx);
+    pthread_mutex_lock(&lk);
+    size_t off = 0; int n = 0;
+    for (int i = 0; i < ne; i++) {
+        if (!es[i].a) continue;
+        size_t al = (es[i].s + VMM_G - 1) & ~(VMM_G - 1);
+        n++;
+        if (es[i].p >= va && es[i].p < va + vc) {
+            CUmemAllocationProp pr = {}; pr.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+            pr.location.type = CU_MEM_LOCATION_TYPE_DEVICE; pr.location.id = dv;
+            CUmemGenericAllocationHandle h;
+            if (cuMemCreate(&h, al, &pr, 0) != CUDA_SUCCESS) continue;
+            cuMemMap(es[i].p, al, 0, h, 0); cuMemRelease(h);
+            CUmemAccessDesc ac = {};
+            ac.location.type = CU_MEM_LOCATION_TYPE_DEVICE; ac.location.id = dv;
+            ac.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            cuMemSetAccess(es[i].p, al, &ac, 1);
         }
-
-        // Copy host → GPU
-        cuMemcpyHtoD(ptr, g_shadow + offset, sz);
-        offset += sz;
+        cuMemcpyHtoD(es[i].p, sh + off, es[i].s);
+        off += es[i].s;
     }
-    pthread_mutex_unlock(&g_lock);
-
-    free(g_shadow); g_shadow = NULL; g_shadow_sz = 0;
-    g_parked = 0;
-    fprintf(stderr, "[pflash_shim] unparked\n");
+    pthread_mutex_unlock(&lk);
+    free(sh); sh = NULL; sh_sz = 0;
+    LOG("unpark done: %d entries", n);
     return 0;
 }
 
-// ── FIFO listener ─────────────────────────────────────────────────────
-static void ctl_listener_loop(void) {
-    // Open existing FIFOs (created synchronously in shim_init)
-    g_ctl_fd = open("/tmp/pflash_shim.ctl", O_RDONLY);
-    if (g_ctl_fd < 0) { perror("[pflash_shim] open .ctl"); return; }
-
-    // Open ack write end (non-blocking to avoid deadlock with proxy)
-    g_ack_fd = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);
-    if (g_ack_fd < 0) { perror("[pflash_shim] open .ack"); return; }
-
-    fprintf(stderr, "[pflash_shim] listener ready\n");
-    fflush(stderr);
-
-    char line[MAX_CTL_LINE];
-    while (g_listener_running) {
-        int n = read(g_ctl_fd, line, sizeof(line) - 1);
+// ── FIFO ────────────────────────────────────────────────────────────
+static void loop(void) {
+    cf = open("/tmp/pflash_shim.ctl", O_RDONLY);
+    if (cf < 0) return;
+    af = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);
+    if (af < 0) return;
+    LOG("listener ready");
+    char buf[256];
+    while (thr) {
+        int n = read(cf, buf, sizeof(buf)-1);
         if (n <= 0) { usleep(10000); continue; }
-        line[n] = '\0';
-        // Trim whitespace
-        while (n > 0 && (line[n-1] == '\n' || line[n-1] == ' ')) line[--n] = '\0';
-
-        const char *response = "error: unknown command\n";
-        if (strcmp(line, "park") == 0) {
-            response = (vmm_park() == 0) ? "ok\n" : "error: park failed\n";
-        } else if (strcmp(line, "unpark") == 0) {
-            response = (vmm_unpark() == 0) ? "ok\n" : "error: unpark failed\n";
-        } else if (strcmp(line, "quit") == 0) {
-            break;
-        }
-        write(g_ack_fd, response, strlen(response));
-        fsync(g_ack_fd);
+        buf[n] = 0;
+        while (n>0 && (buf[n-1]=='\n'||buf[n-1]==' ')) buf[--n]=0;
+        const char *r = "error\n";
+        if (!strcmp(buf,"park"))    { int ok = park();    r = ok==0?"ok\n":"err:park\n"; }
+        else if (!strcmp(buf,"unpark")) { int ok = unpark(); r = ok==0?"ok\n":"err:unpark\n"; }
+        else if (!strcmp(buf,"quit")) break;
+        write(af, r, strlen(r)); fsync(af);
     }
-
-    close(g_ctl_fd); g_ctl_fd = -1;
-    close(g_ack_fd); g_ack_fd = -1;
-    unlink("/tmp/pflash_shim.ctl");
-    unlink("/tmp/pflash_shim.ack");
+    close(cf); close(af);
+    unlink("/tmp/pflash_shim.ctl"); unlink("/tmp/pflash_shim.ack");
 }
 
-// ── Constructor / Destructor ──────────────────────────────────────────
-static void shim_init(void) {
-    fprintf(stderr, "[pflash_shim] loaded\n");
-
-    // Create FIFOs synchronously so they exist before any park/unpark call
-    unlink("/tmp/pflash_shim.ctl");
-    if (mkfifo("/tmp/pflash_shim.ctl", 0666) < 0) {
-        perror("[pflash_shim] mkfifo .ctl");
-        return;
-    }
-    unlink("/tmp/pflash_shim.ack");
-    if (mkfifo("/tmp/pflash_shim.ack", 0666) < 0) {
-        perror("[pflash_shim] mkfifo .ack");
-        return;
-    }
-
-    // Start listener thread (opens FIFOs, enters read loop)
-    g_listener_running = 1;
-    pthread_create(&g_listener, NULL, (void *(*)(void *))ctl_listener_loop, NULL);
-    pthread_detach(g_listener);
+static void init(void) {
+    LOG("loading");
+    unlink("/tmp/pflash_shim.ctl"); mkfifo("/tmp/pflash_shim.ctl",0666);
+    unlink("/tmp/pflash_shim.ack"); mkfifo("/tmp/pflash_shim.ack",0666);
+    thr = 1;
+    pthread_create(&th, NULL, (void*(*)(void*))loop, NULL);
+    pthread_detach(th);
+    LOG("loaded");
 }
 
-static void shim_fini(void) {
-    g_listener_running = 0;
-    if (g_ctl_fd >= 0) { close(g_ctl_fd); g_ctl_fd = -1; }
-    if (g_ack_fd >= 0) { close(g_ack_fd); g_ack_fd = -1; }
-    unlink("/tmp/pflash_shim.ctl");
-    unlink("/tmp/pflash_shim.ack");
+static void fini(void) {
+    thr = 0;
+    if (cf>=0) close(cf); if (af>=0) close(af);
+    unlink("/tmp/pflash_shim.ctl"); unlink("/tmp/pflash_shim.ack");
 }

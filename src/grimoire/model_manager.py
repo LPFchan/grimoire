@@ -183,6 +183,8 @@ class ActiveModel:
             fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
             os.write(fd, b"park\n")
             os.close(fd)
+            # Open .ack BLOCKING — waits for shim listener to open it for writing.
+            # This avoids race: prox writes .ctl → shim unblocks → opens .ack → prox .ack returns.
             import select
             with open("/tmp/pflash_shim.ack", "r") as f:
                 poll = select.poll()

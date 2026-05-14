@@ -74,9 +74,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             if len(prompt_ids) > pcfg.threshold:
                 # Park llama-server before compression if park-unpark enabled
                 park_ok = False
-                pu = model_cfg.get("park-unpark")
-                log.warning(f"pflash park: checking park-unpark={pu!r} type={type(pu).__name__}")
-                if pu:
+                if model_cfg.get("park-unpark"):
                     try:
                         park_ok = active._park_llama()
                         if park_ok:
