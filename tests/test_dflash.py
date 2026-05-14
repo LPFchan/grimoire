@@ -487,6 +487,9 @@ class DflashRegistryValidationTests(unittest.TestCase):
             "drafter": "drafter.gguf",
             "tokenizer": "hf:Qwen/Qwen3.6-27B",
             "ctx-size": 1024,
+            "snapshot-mode": "compact-full",
+            "snapshot-staging-slot": 7,
+            "session-kv-slots": 2,
         }
         cfg.update(overrides)
         self.reg.add(name, cfg)
@@ -509,6 +512,30 @@ class DflashRegistryValidationTests(unittest.TestCase):
         valid, reason = self.reg.validate("nodraft")
         self.assertFalse(valid)
         self.assertIn("Draft model not found", reason)
+
+    def test_missing_compact_full_snapshot_mode_fails(self):
+        self._add("no_snapshot_mode", **{"snapshot-mode": None})
+        valid, reason = self.reg.validate("no_snapshot_mode")
+        self.assertFalse(valid)
+        self.assertIn("snapshot-mode", reason)
+
+    def test_missing_snapshot_staging_slot_fails(self):
+        self._add("no_staging_slot", **{"snapshot-staging-slot": None})
+        valid, reason = self.reg.validate("no_staging_slot")
+        self.assertFalse(valid)
+        self.assertIn("snapshot-staging-slot", reason)
+
+    def test_invalid_snapshot_staging_slot_fails(self):
+        self._add("bad_staging_slot", **{"snapshot-staging-slot": 8})
+        valid, reason = self.reg.validate("bad_staging_slot")
+        self.assertFalse(valid)
+        self.assertIn("range 0-7", reason)
+
+    def test_negative_session_kv_slots_fail(self):
+        self._add("bad_session_cap", **{"session-kv-slots": -1})
+        valid, reason = self.reg.validate("bad_session_cap")
+        self.assertFalse(valid)
+        self.assertIn("session-kv-slots", reason)
 
     def test_missing_drafter_optional_unless_set(self):
         os.unlink(self.models_dir / "drafter.gguf")
@@ -1474,6 +1501,17 @@ class SessionKVTests(unittest.TestCase):
         sk = SessionKV(cap=0)
         self.assertIsNone(sk.evict_lru_if_full("a"))
 
+    def test_cap_zero_disables_updates_and_lookup(self):
+        sk = SessionKV(cap=0)
+        self.assertIsNone(sk.update("a", 10, self.PROMPT))
+        self.assertFalse(sk.has_session("a"))
+        self.assertIsNone(sk.get_session("a", self.PROMPT))
+
+    def test_all_keys_returns_stable_key_for_evicted_conversation(self):
+        sk = SessionKV(cap=2)
+        expected = sk.swap_key("gone")
+        self.assertEqual(sk.all_keys("gone"), [expected])
+
     def test_get_session_accepts_extended_prompt(self):
         sk = SessionKV(cap=2)
         cached = list(range(100))
@@ -1622,6 +1660,24 @@ class PrefixCachePersistenceTests(unittest.TestCase):
             smaller = PrefixCache(cap=2, cache_dir=td)
             smaller.load()
             self.assertEqual(list(smaller.entries.values()), [snap_key])
+
+    def test_load_clamps_entries_back_to_runtime_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = PrefixCache(cap=4, cache_dir=td)
+            key_a = cache.hash_prefix([1])
+            key_b = cache.hash_prefix([1, 2])
+            snap_a = cache.snapshot_key(key_a)
+            snap_b = cache.snapshot_key(key_b)
+            Path(td, "index.json").write_text(json.dumps({
+                "entries": [
+                    {"key_hex": key_a.hex(), "snapshot_key_hex": snap_a.hex()},
+                    {"key_hex": key_b.hex(), "snapshot_key_hex": snap_b.hex()},
+                ],
+            }))
+
+            smaller = PrefixCache(cap=1, cache_dir=td)
+            smaller.load()
+            self.assertEqual(list(smaller.entries.values()), [snap_b])
 
     def test_cleanup_clears_saved_index_on_disk(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1979,6 +2035,137 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         snapshot_key, prefix_len = active.session_kv.get_session(conv_id, prompt_ids)
         self.assertEqual(snapshot_key, active.session_kv.swap_key(conv_id))
         self.assertEqual(prefix_len, len(prompt_ids))
+
+    def test_session_lru_eviction_discards_old_snapshot_from_store(self):
+        active, daemon = self._install_fake_active([ord("a"), 0])
+        active.session_kv = SessionKV(cap=1)
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        conv_a = self.client.post(
+            "/history",
+            json={"title": "conv a", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        ).json()["id"]
+        first = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_a,
+                "messages": [{"role": "user", "content": "first"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(first.status_code, 200)
+        key_a = active.session_kv.swap_key(conv_a)
+        self.assertTrue(active.snapshot_swap.ram_path(key_a).exists())
+
+        daemon._tokens = [ord("b"), 0]
+        conv_b = self.client.post(
+            "/history",
+            json={"title": "conv b", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        ).json()["id"]
+        second = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_b,
+                "messages": [{"role": "user", "content": "second"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(second.status_code, 200)
+
+        self.assertFalse(active.session_kv.has_session(conv_a))
+        self.assertFalse(active.snapshot_swap.ram_path(key_a).exists())
+
+    def test_missing_prefix_snapshot_discards_stale_cache_entry(self):
+        active, daemon = self._install_fake_active([ord("o"), 0])
+        active.prefix_cache = PrefixCache(cap=2, cache_dir=tempfile.mkdtemp())
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        prompt_ids = [ord(c) for c in "[user]ping[/user][assistant]"]
+        boundary = len(prompt_ids)
+        prepared = active.prefix_cache.prepare_inline_snap(prompt_ids, boundary)
+        self.assertIsNotNone(prepared)
+        prefix_key, prefix_len = prepared
+        active.prefix_cache.confirm_inline_snap(prefix_key, prefix_len, prompt_ids)
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(active.prefix_cache.lookup(prompt_ids, boundaries=[boundary]))
+
+    def test_zero_token_failure_discards_unconfirmed_prefix_snapshot(self):
+        active, daemon = self._install_fake_active([0])
+        active.prefix_cache = PrefixCache(cap=2, cache_dir=tempfile.mkdtemp())
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("zero tokens", response.text)
+        self.assertFalse(any(active.snapshot_swap.ram_dir.glob("swap-*.dfsn")))
+        self.assertEqual(list(active.prefix_cache.entries.values()), [])
+
+    def test_hash_mismatch_evicts_stale_session_snapshot_from_store(self):
+        active, daemon = self._install_fake_active([ord("a"), 0])
+        active.session_kv = SessionKV(cap=2)
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        hist = self.client.post(
+            "/history",
+            json={"title": "stale session", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        )
+        conv_id = hist.json()["id"]
+
+        first = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(first.status_code, 200)
+        session_key = active.session_kv.swap_key(conv_id)
+        self.assertTrue(active.snapshot_swap.ram_path(session_key).exists())
+
+        daemon._tokens = [0]
+        second = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_id,
+                "messages": [{"role": "user", "content": "different"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(active.session_kv.has_session(conv_id))
+        self.assertFalse(active.snapshot_swap.ram_path(session_key).exists())
 
     def test_real_session_passes_obsidian_protected_blocks_to_compression(self):
         active, _ = self._install_fake_active(

@@ -40,7 +40,15 @@ class SessionKV:
         self._load()
 
     def _load(self) -> None:
-        if self.path is None or not self.path.exists():
+        if self.path is None:
+            return
+        if self.cap <= 0:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        if not self.path.exists():
             return
         try:
             with open(self.path) as f:
@@ -73,6 +81,12 @@ class SessionKV:
     def _save(self) -> None:
         if self.path is None:
             return
+        if self.cap <= 0:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
         payload = {
             "sessions": [
                 {
@@ -97,10 +111,14 @@ class SessionKV:
 
     def has_session(self, conversation_id: str) -> bool:
         """Return True if a conversation currently has session metadata."""
+        if self.cap <= 0:
+            return False
         return conversation_id in self.sessions
 
     def get_session(self, conversation_id: str, prompt_ids: list) -> Optional[tuple[bytes, int]]:
         """Return (snapshot_key, prefix_len) if the prompt prefix matches."""
+        if self.cap <= 0:
+            return None
         if conversation_id not in self.sessions:
             return None
         self.sessions.move_to_end(conversation_id)
@@ -133,8 +151,12 @@ class SessionKV:
         self._save()
         return old_id
 
-    def update(self, conversation_id: str, prefix_len: int, prompt_ids: list) -> bytes:
+    def update(self, conversation_id: str, prefix_len: int, prompt_ids: list) -> Optional[bytes]:
         """Record or update the compact full snapshot for a conversation."""
+        if self.cap <= 0:
+            self.sessions.pop(conversation_id, None)
+            self._save()
+            return None
         snapshot_key = self.swap_key(conversation_id)
         prefix_hash = _prefix_hash(prompt_ids[:prefix_len])
         self.sessions[conversation_id] = (snapshot_key, int(prefix_len), prefix_hash)
@@ -146,10 +168,12 @@ class SessionKV:
 
     def all_keys(self, conversation_id: str) -> list[bytes]:
         """Return persisted snapshot keys for a conversation."""
-        entry = self.sessions.get(conversation_id)
-        if entry is None:
+        if self.cap <= 0 or not conversation_id:
             return []
-        return [entry[0]]
+        entry = self.sessions.get(conversation_id)
+        if entry is not None:
+            return [entry[0]]
+        return [self.swap_key(conversation_id)]
 
     def evict(self, conversation_id: str) -> None:
         """Remove a session (e.g., on new conversation or error)."""

@@ -177,7 +177,11 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     return (staging_slot, prefix_len)
 
                 if conversation_id and sk and store:
+                    prior_session_keys = sk.all_keys(conversation_id) if sk.has_session(conversation_id) else []
                     session_hit = sk.get_session(conversation_id, effective_ids)
+                    if session_hit is None and prior_session_keys and not sk.has_session(conversation_id):
+                        for key in prior_session_keys:
+                            await asyncio.to_thread(store.discard, key)
                     if session_hit is not None:
                         had_session = True
                         session_key, session_prefix_len = session_hit
@@ -186,6 +190,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             loaded_staging = True
                         except KeyError:
                             logger.warning("session snapshot missing from store; evicting session")
+                            await asyncio.to_thread(store.discard, session_key)
                             sk.evict(conversation_id)
 
                 if prefix_hit is None and pc and not pc.disabled and store:
@@ -197,6 +202,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             loaded_staging = True
                         except KeyError:
                             logger.warning("prefix snapshot missing from store; dropping cache entry")
+                            await asyncio.to_thread(store.discard, prefix_key)
+                            pc.discard(prefix_key)
 
                 restored_prefix_len = prefix_hit[1] if prefix_hit else 0
                 if pc and not pc.disabled and store and effective_boundaries:
@@ -349,7 +356,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                 for key in sk.all_keys(evicted_id):
                                     await asyncio.to_thread(store.discard, key)
                             session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
-                            await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
+                            if session_key is not None:
+                                await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
 
                         if prepared_prefix is not None:
                             if prefix_snapshot_written and prefix_snapshot_key is not None and prefix_snapshot_len is not None:
@@ -365,13 +373,20 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                 pc.abort_inline_snap(prefix_snapshot_key)
                 except Exception as e:
                     logger.warning(f"snapshot save failed: {e}")
+                    if store and prefix_snapshot_written and prefix_snapshot_key is not None:
+                        await asyncio.to_thread(store.discard, prefix_snapshot_key)
                     if pc and prepared_prefix is not None and prefix_snapshot_key is not None:
                         pc.abort_inline_snap(prefix_snapshot_key)
                     if conversation_id and sk:
+                        if store:
+                            for key in sk.all_keys(conversation_id):
+                                await asyncio.to_thread(store.discard, key)
                         sk.evict(conversation_id)
 
                 # Detect silent failures where no tokens were emitted.
                 if not tokens_emitted and max_tokens > 0:
+                    if store and prefix_snapshot_written and prefix_snapshot_key is not None:
+                        await asyncio.to_thread(store.discard, prefix_snapshot_key)
                     yield _sse_error_frames(
                         completion_id, created,
                         "DFlash generation failed: model produced zero tokens. "

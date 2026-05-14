@@ -334,6 +334,26 @@ class ModelRegistry:
             target = resolve_path(cfg, "target")
             if not target or not os.path.exists(target):
                 return False, f"Target model not found at {target}"
+            if cfg.get("snapshot-mode") != "compact-full":
+                return False, "DFlash models must set 'snapshot-mode' to 'compact-full'"
+            staging_slot = cfg.get("snapshot-staging-slot")
+            if staging_slot is None:
+                return False, "DFlash models must set 'snapshot-staging-slot'"
+            try:
+                staging_slot = int(staging_slot)
+            except (TypeError, ValueError):
+                return False, f"Invalid snapshot staging slot: {staging_slot}"
+            if not 0 <= staging_slot < 8:
+                return False, f"Snapshot staging slot must be in range 0-7: {staging_slot}"
+            session_cap = cfg.get("session-kv-slots")
+            if session_cap is None:
+                return False, "DFlash models must set 'session-kv-slots'"
+            try:
+                session_cap = int(session_cap)
+            except (TypeError, ValueError):
+                return False, f"Invalid session-kv-slots value: {session_cap}"
+            if session_cap < 0:
+                return False, f"session-kv-slots must be non-negative: {session_cap}"
             use_dflash = cfg.get("dflash", True)
             if use_dflash:
                 draft = resolve_path(cfg, "draft")
