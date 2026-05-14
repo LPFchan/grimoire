@@ -12,15 +12,22 @@ import tempfile
 import time
 from typing import Optional
 
+from grimoire import config
+
 logger = logging.getLogger(__name__)
 
-DFLASH_BIN = "/opt/dflash/dflash"
+DFLASH_BIN = os.path.join(config.DFLASH_HOME, "dflash")
 
 # VRAM delta (MiB) above the pre-spawn baseline that signals the daemon
 # has loaded weights. Target+draft for a 27B model is ~18 GB; we use a
 # conservative threshold so other processes on the same GPU can't satisfy
 # it.
 LOADED_VRAM_DELTA_MIB = 12000
+
+
+def _prepend_library_dir(env: dict[str, str], path: str) -> None:
+    existing = [p for p in env.get("LD_LIBRARY_PATH", "").split(":") if p and p != path]
+    env["LD_LIBRARY_PATH"] = ":".join([path, *existing]) if path else ":".join(existing)
 
 
 class DflashDaemon:
@@ -107,6 +114,7 @@ class DflashDaemon:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        _prepend_library_dir(env, config.DFLASH_HOME)
         env["DFLASH27B_KV_K"] = self.kv_k_type
         env["DFLASH27B_KV_V"] = self.kv_v_type
         env["DFLASH27B_FA_WINDOW"] = str(self.fa_window)
@@ -526,7 +534,7 @@ class PflashDaemon:
     compressed token IDs via a stream fd.
     """
 
-    PFLASH_BIN = "/opt/dflash/pflash_daemon"
+    PFLASH_BIN = os.path.join(config.DFLASH_HOME, "pflash_daemon")
 
     def __init__(self, drafter_path: str, gpu_id: int = 0):
         self.drafter_path = drafter_path
@@ -548,6 +556,7 @@ class PflashDaemon:
         ]
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        _prepend_library_dir(env, config.DFLASH_HOME)
 
         logger.info(f"Starting pflash daemon on GPU {self.gpu_id}")
         logger.info(f"Command: {' '.join(cmd)}")

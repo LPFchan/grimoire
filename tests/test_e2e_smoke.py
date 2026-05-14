@@ -186,7 +186,7 @@ class E2ESmokeTestCase(unittest.TestCase):
 class DFlashSmokeTests(E2ESmokeTestCase):
     """Smoke tests for the DFlash speculative-decoding backend."""
 
-    MODEL = "dflash-pflash-qwen-27B"
+    MODEL = "dflash-pflash-qwen3.6-27B"
 
     def test_01_basic_chat_completion(self):
         """Single-turn chat with real fixture data returns a valid, timed response."""

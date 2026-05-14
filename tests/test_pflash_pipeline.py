@@ -2,10 +2,10 @@
 """Test the full PFlash compression pipeline end-to-end.
 
 Usage:
-    MODEL=pflash-llama-qwen3.6-27B python tests/test_pflash_pipeline.py
+    MODEL=pflash-qwen3.6-27B python tests/test_pflash_pipeline.py
 
 Environment:
-    MODEL       Model name (default: pflash-llama-qwen3.6-27B)
+    MODEL       Model name (default: pflash-qwen3.6-27B)
     BASE_URL    Gateway URL (default: http://localhost:9001)
     API_KEY     Auth key
     MAX_TOKENS  Output tokens (default: 30)
@@ -27,7 +27,7 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("pflash_test")
 
-MODEL = os.environ.get("MODEL", "pflash-llama-qwen3.6-27B")
+MODEL = os.environ.get("MODEL", "pflash-qwen3.6-27B")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:9001")
 API_KEY = os.environ.get("API_KEY", "7JcW7xX82ypTQPlsYle6XdjlBSWfG3NwbtYSRSXZQ88")
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "30"))

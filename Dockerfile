@@ -147,7 +147,8 @@ RUN --mount=type=cache,target=/root/.ccache \
     cp /app/.cache/dflash-build/build/pflash_daemon /opt/dflash/pflash_daemon; \
     # Copy dflash's own ggml shared libs so the binary resolves symbols
     # against its build-time llama.cpp, not the independently-built one.
-    ccache --clear -q 2>/dev/null || rm -rf /root/.ccache/* 2>/dev/null; \n    find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
+    ccache --clear -q 2>/dev/null || rm -rf /root/.ccache/* 2>/dev/null; \
+    find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
     ls -la /opt/dflash/
 
 # Compile the park/unpark LD_PRELOAD shim
@@ -226,7 +227,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GRIMOIRE_MODELS_DIR=/models \
     GRIMOIRE_REGISTRY_PATH=/var/lib/grimoire/models.json \
     GRIMOIRE_REGISTRY_SEED_PATH=/etc/grimoire/models.json \
-    LD_LIBRARY_PATH=/opt/dflash:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
+    LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
     PATH=/opt/grimoire-venv/bin:$PATH
 
 RUN apt-get update \

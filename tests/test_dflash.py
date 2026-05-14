@@ -1431,6 +1431,17 @@ class SessionKVTests(unittest.TestCase):
         sk.update("a", 100, list(range(200)))
         self.assertIsNone(sk.get_session("a", list(range(50))))
 
+    def test_persisted_sessions_reload_from_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "session-kv.json"
+            original = SessionKV(cap=2, path=str(path))
+            original.update("a", 50, self.PROMPT)
+            original.update("b", 60, self.PROMPT)
+
+            restored = SessionKV(cap=2, path=str(path))
+            self.assertEqual(restored.get_session("a", self.PROMPT), (restored.swap_key("a"), 50))
+            self.assertEqual(restored.get_session("b", self.PROMPT), (restored.swap_key("b"), 60))
+
 
 class SnapshotSwapTests(unittest.TestCase):
     """SnapshotSwap persists compact snapshots to RAM first, then disk."""

@@ -153,8 +153,7 @@
       "tokenizer-trust-remote-code": true,
       "family": "qwen",
       "capabilities": [
-        "completion",
-        "multimodal"
+        "completion"
       ],
       "cost": {
         "input": 0.33,
@@ -164,15 +163,12 @@
       "max-effective-context": 65000,
       "predict": 16384,
       "parallel": 1,
-      "image-min-tokens": 1024,
-      "image-max-tokens": 1024,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
       "prefill-threshold": 36000,
       "prefill-keep-ratio": 0.1,
       "prefill-tail-budget": 16000,
-      "park-unpark": false,
-      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf"
+      "park-unpark": false
     },
     "pflash-park-qwen3.6-27B": {
       "pflash": true,

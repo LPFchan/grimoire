@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -169,6 +170,57 @@ class DropInBlockerTests(unittest.TestCase):
         finally:
             mm_module.registry = old_registry
 
+    def test_normal_llama_start_keeps_opt_dflash_out_of_library_path(self):
+        captured = {}
+
+        class FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, env=None, preexec_fn=None):
+            captured["cmd"] = cmd
+            captured["env"] = dict(env or {})
+            captured["preexec_fn"] = preexec_fn
+            return FakeProc()
+
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(mm_module.subprocess, "Popen", side_effect=fake_popen):
+            active = mm_module.ActiveModel("qwen-3.6-27B", {"file": model_file.name}, port=8001, gpu=0)
+            active._start_llama()
+
+        ld_library_path = captured["env"].get("LD_LIBRARY_PATH", "")
+        self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
+        self.assertNotIn(mm_module.config.DFLASH_HOME, ld_library_path)
+        self.assertNotIn("LD_PRELOAD", captured["env"])
+
+    def test_park_model_still_uses_shim_without_global_opt_dflash_path(self):
+        captured = {}
+
+        class FakeProc:
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, env=None, preexec_fn=None):
+            captured["env"] = dict(env or {})
+            return FakeProc()
+
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(mm_module.subprocess, "Popen", side_effect=fake_popen):
+            active = mm_module.ActiveModel(
+                "pflash-park-qwen3.6-27B",
+                {"file": model_file.name, "park-unpark": True},
+                port=8001,
+                gpu=0,
+            )
+            active._start_llama()
+
+        ld_library_path = captured["env"].get("LD_LIBRARY_PATH", "")
+        self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
+        self.assertNotIn(mm_module.config.DFLASH_HOME, ld_library_path)
+        self.assertEqual(captured["env"].get("LD_PRELOAD"), mm_module.config.PFLASH_SHIM_PATH)
+
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:
             def get_conversation(self, user_hash, conversation_id):
@@ -262,13 +314,15 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("/src/patches/grimoire-webui-*.patch", dockerfile)
         self.assertIn("grimoire-webui-*", dockerfile)
 
-    def test_dflash_runtime_uses_test_dflash_binary(self):
+    def test_dflash_runtime_scopes_opt_dflash_to_preserved_components(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("-DDFLASH27B_TESTS=ON", dockerfile)
         self.assertIn("--target test_dflash", dockerfile)
+        self.assertIn("--target pflash_daemon", dockerfile)
         self.assertIn("/app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash", dockerfile)
-        self.assertNotIn("--target pflash_daemon", dockerfile)
-        self.assertNotIn("/app/.cache/dflash-build/build/pflash_daemon /opt/dflash/dflash", dockerfile)
+        self.assertIn("/app/.cache/dflash-build/build/pflash_daemon /opt/dflash/pflash_daemon", dockerfile)
+        self.assertIn("LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64", dockerfile)
+        self.assertNotIn("LD_LIBRARY_PATH=/opt/dflash:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64", dockerfile)
 
 
 if __name__ == "__main__":

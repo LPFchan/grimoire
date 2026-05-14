@@ -53,6 +53,25 @@ def _extend_optional_arg(cmd, cfg, key, flag=None):
         cmd.extend([flag or f"--{key}", str(value)])
 
 
+def _prepend_library_paths(env, paths, exclude_prefixes=()):
+    existing = []
+    for path in env.get("LD_LIBRARY_PATH", "").split(":"):
+        if not path:
+            continue
+        if any(path == prefix or path.startswith(f"{prefix}/") for prefix in exclude_prefixes):
+            continue
+        existing.append(path)
+
+    merged = []
+    for path in [*(paths or []), *existing]:
+        if path and path not in merged:
+            merged.append(path)
+    if merged:
+        env["LD_LIBRARY_PATH"] = ":".join(merged)
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+
+
 def build_cmd(cfg, port, alias=None):
     """Build llama-server command from model config."""
     model_path = _resolve_config_path(cfg["file"])
@@ -157,16 +176,16 @@ class ActiveModel:
         # Put turboquant ggml libraries first so llama-server doesn't
         # accidentally load dflash's (older) ggml-cuda which lacks the
         # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
-        turboquant_libs = "/opt/grimoire-llama-cpp/lib"
-        existing = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = f"{turboquant_libs}:/opt/dflash:" + ":".join(
-            p for p in existing.split(":") if p and p != turboquant_libs and not p.startswith("/opt/dflash")
+        _prepend_library_paths(
+            env,
+            [config.TURBOQUANT_LIB_DIR, config.TURBOQUANT_LIB64_DIR],
+            exclude_prefixes=(config.DFLASH_HOME,),
         )
 
         # LD_PRELOAD the park/unpark shim for park models
         if self.cfg.get("park-unpark"):
             existing_pre = env.get("LD_PRELOAD", "")
-            shim_path = "/opt/dflash/pflash_shim.so"
+            shim_path = config.PFLASH_SHIM_PATH
             env["LD_PRELOAD"] = f"{shim_path}:" + existing_pre if existing_pre else shim_path
             logger.info(f"park-unpark enabled, LD_PRELOAD={env['LD_PRELOAD']}")
 
@@ -262,18 +281,20 @@ class ActiveModel:
             tail_budget=self.cfg.get("prefill-tail-budget", 12288),
         )
 
+        snapshot_disk_dir = self.cfg.get(
+            "snapshot-disk-dir",
+            f"/var/lib/grimoire/snapshot_swap/{self.name}",
+        )
         session_cap = max(0, int(self.cfg.get("session-kv-slots", 2)))
         self.session_kv = SessionKV(
             cap=session_cap,
+            path=os.path.join(snapshot_disk_dir, "session-kv.json"),
         )
 
         self.snapshot_staging_slot = int(self.cfg.get("snapshot-staging-slot", 7))
         self.snapshot_swap = SnapshotSwap(
             ram_dir=self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"),
-            disk_dir=self.cfg.get(
-                "snapshot-disk-dir",
-                f"/var/lib/grimoire/snapshot_swap/{self.name}",
-            ),
+            disk_dir=snapshot_disk_dir,
             ram_budget_gb=self.cfg.get("snapshot-ram-budget-gb", 20.0),
             disk_budget_gb=self.cfg.get("snapshot-disk-budget-gb", 100.0),
             disk_ttl_hours=self.cfg.get("snapshot-disk-ttl-hours", 24.0),
@@ -397,8 +418,6 @@ class ActiveModel:
         if self.prefix_cache:
             self.prefix_cache.save()
             self.prefix_cache.cleanup(self.dflash_daemon)
-        if self.session_kv:
-            self.session_kv.clear()
         if self.dflash_daemon:
             self.dflash_daemon.stop()
         self.process = None
