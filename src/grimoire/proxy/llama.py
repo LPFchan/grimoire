@@ -12,7 +12,7 @@ from grimoire import config
 from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
 from grimoire.prompt.generic import _prompt_layout_from_messages
-from grimoire.registry import BACKEND_DFLASH
+from grimoire.registry import BACKEND_DFLASH, resolve_path
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,15 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             log.warning("pflash park: pf daemon stopped")
                         if active._unpark_llama():
                             log.warning("pflash park: llama unparked")
+                        # Restart PF daemon for next request
+                        from grimoire.registry import resolve_path as _resolve_path
+                        drafter_path = _resolve_path(active.cfg, "drafter")
+                        if drafter_path:
+                            from grimoire.dflash.daemon import PflashDaemon
+                            new_daemon = PflashDaemon(drafter_path=drafter_path, gpu_id=active.gpu)
+                            new_daemon.start()
+                            active.pflash_daemon = new_daemon
+                            log.warning("pflash park: pf daemon restarted")
                     except Exception as e:
                         log.warning(f"pflash park: unpark failed ({e})")
 
