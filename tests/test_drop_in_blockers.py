@@ -399,6 +399,41 @@ class DropInBlockerTests(unittest.TestCase):
         finally:
             mm_module.registry = old_registry
 
+    def test_llama_registry_validation_requires_pflash_drafter_and_park_shim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "models.json"
+            model_path = Path(tmp) / "target.gguf"
+            model_path.write_text("x")
+            registry = ModelRegistry(path=str(state_path), seed_path=None)
+            registry.add(
+                "pflash-test",
+                {
+                    "file": model_path.name,
+                    "pflash": True,
+                    "drafter": "missing-drafter.gguf",
+                },
+            )
+
+            import grimoire.registry as registry_mod
+            old_models_dir = registry_mod.MODELS_DIR
+            old_shim = config.PFLASH_SHIM_PATH
+            try:
+                registry_mod.MODELS_DIR = tmp
+                valid, reason = registry.validate("pflash-test")
+                self.assertFalse(valid)
+                self.assertIn("PFlash drafter", reason)
+
+                drafter = Path(tmp) / "drafter.gguf"
+                drafter.write_text("x")
+                registry.update("pflash-test", {"drafter": drafter.name, "park-unpark": True})
+                config.PFLASH_SHIM_PATH = str(Path(tmp) / "missing-shim.so")
+                valid, reason = registry.validate("pflash-test")
+                self.assertFalse(valid)
+                self.assertIn("park-unpark shim", reason)
+            finally:
+                registry_mod.MODELS_DIR = old_models_dir
+                config.PFLASH_SHIM_PATH = old_shim
+
     def test_native_dflash_patch_is_copied_and_build_patches_reapply_on_fresh_clone(self):
         patch_path = ROOT / "patches" / "spec-dflash-contract.patch"
         self.assertTrue(patch_path.exists(), "native dflash contract patch file is missing")

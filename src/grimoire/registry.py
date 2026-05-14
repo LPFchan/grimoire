@@ -10,6 +10,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Optional
 
+from grimoire import config
+
 logger = logging.getLogger(__name__)
 
 MODELS_DIR = os.environ.get("GRIMOIRE_MODELS_DIR", "/models")
@@ -324,6 +326,12 @@ class ModelRegistry:
             model_path = os.path.join(MODELS_DIR, cfg["file"])
             if not os.path.exists(model_path):
                 return False, f"Model file not found at {model_path}"
+            if cfg.get("pflash"):
+                drafter = resolve_path(cfg, "drafter")
+                if not drafter or not os.path.exists(drafter):
+                    return False, f"PFlash drafter not found at {drafter}"
+            if cfg.get("park-unpark") and not os.path.exists(config.PFLASH_SHIM_PATH):
+                return False, f"park-unpark shim not found at {config.PFLASH_SHIM_PATH}"
             if cfg.get("speculative-type") == "dflash":
                 draft = resolve_path(cfg, "spec-draft-model") or resolve_path(cfg, "draft")
                 if not draft or not os.path.exists(draft):

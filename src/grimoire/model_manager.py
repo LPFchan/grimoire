@@ -257,8 +257,7 @@ class ActiveModel:
         """Start the PFlash compression daemon on the same GPU."""
         drafter_path = resolve_path(self.cfg, "drafter")
         if not drafter_path:
-            logger.warning(f"pflash requested but no drafter configured for {self.name}")
-            return
+            raise RuntimeError(f"pflash requested but no drafter configured for {self.name}")
 
         # Pre-build PrefillConfig from model config
         self.prefill_config = PrefillConfig(
