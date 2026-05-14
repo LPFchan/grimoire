@@ -100,60 +100,114 @@ def _qwen_prompt_block_specs(messages, add_generation_prompt=False):
                 reasoning_content = content.split("</think>")[0].rstrip("\n").split("<think>")[-1].lstrip("\n")
                 content = content.split("</think>")[-1].lstrip("\n")
             reasoning_content = reasoning_content.strip()
-            if index > last_query_index:
-                block = f"<|im_start|>assistant\n<think>\n{reasoning_content}\n</think>\n\n{content}"
-            else:
-                block = f"<|im_start|>assistant\n{content}"
 
             tool_calls = message.get("tool_calls") or []
             if isinstance(tool_calls, dict):
                 tool_calls = []
-            tool_names = []
-            for i, tool_call in enumerate(tool_calls):
-                if not isinstance(tool_call, dict):
-                    continue
-                fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else tool_call
-                if not isinstance(fn, dict):
-                    continue
-                name = fn.get("name")
-                if not isinstance(name, str) or not name:
-                    continue
-                tc_id = tool_call.get("id")
-                if isinstance(tc_id, str):
-                    tool_call_names[tc_id] = name
-                tool_names.append(name)
-                if i == 0:
-                    if content:
-                        block += f"\n\n<tool_call>\n<function={name}>\n"
-                    else:
-                        block += f"<tool_call>\n<function={name}>\n"
-                else:
-                    block += f"\n<tool_call>\n<function={name}>\n"
-                arguments = fn.get("arguments")
-                if isinstance(arguments, dict):
-                    for arg_name, arg_value in arguments.items():
-                        block += f"<parameter={arg_name}>\n"
-                        if isinstance(arg_value, str):
-                            rendered_value = arg_value
-                        else:
-                            rendered_value = json.dumps(arg_value, ensure_ascii=False)
-                        block += f"{rendered_value}\n</parameter>\n"
-                block += "</function>\n</tool_call>"
 
-            block += "<|im_end|>\n"
-            specs.append({
-                "text": block,
-                "role": "assistant",
-                "kind": "assistant",
-                "message_start": index,
-                "message_end": index + 1,
-                "protected": False,
-                "metadata": {
-                    "message_index": index,
-                    "reasoning": bool(reasoning_content),
-                    "tool_names": tool_names,
-                },
-            })
+            has_reasoning = bool(reasoning_content) and (index > last_query_index)
+            has_content = bool(content)
+            has_tcs = bool(tool_calls)
+
+            sub_specs = []
+            header_used = False
+
+            if not has_reasoning and not has_tcs:
+                block = f"<|im_start|>assistant\n{content}<|im_end|>\n"
+                sub_specs.append({
+                    "text": block,
+                    "role": "assistant",
+                    "kind": "assistant",
+                    "message_start": index,
+                    "message_end": index + 1,
+                    "protected": False,
+                    "metadata": {"message_index": index},
+                })
+            else:
+                if has_reasoning:
+                    text = f"<|im_start|>assistant\n<think>\n{reasoning_content}\n</think>\n\n"
+                    if not has_content and not has_tcs:
+                        text += "<|im_end|>\n"
+                    header_used = True
+                    sub_specs.append({
+                        "text": text,
+                        "role": "assistant",
+                        "kind": "thinking",
+                        "message_start": index,
+                        "message_end": index + 1,
+                        "protected": False,
+                        "metadata": {"message_index": index, "reasoning": True},
+                    })
+
+                if has_content:
+                    text = ""
+                    if not header_used:
+                        text = f"<|im_start|>assistant\n"
+                        header_used = True
+                    text += content
+                    if not has_tcs:
+                        text += "<|im_end|>\n"
+                    sub_specs.append({
+                        "text": text,
+                        "role": "assistant",
+                        "kind": "assistant_text",
+                        "message_start": index,
+                        "message_end": index + 1,
+                        "protected": False,
+                        "metadata": {"message_index": index},
+                    })
+
+                for i, tool_call in enumerate(tool_calls):
+                    if not isinstance(tool_call, dict):
+                        continue
+                    fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else tool_call
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+                    tc_id = tool_call.get("id")
+                    if isinstance(tc_id, str):
+                        tool_call_names[tc_id] = name
+
+                    text = ""
+                    if not header_used:
+                        text = f"<|im_start|>assistant\n"
+                        header_used = True
+                    elif has_content and i == 0:
+                        text = "\n\n"
+                    elif i > 0:
+                        text = "\n"
+
+                    text += f"<tool_call>\n<function={name}>\n"
+                    arguments = fn.get("arguments")
+                    if isinstance(arguments, dict):
+                        for arg_name, arg_value in arguments.items():
+                            text += f"<parameter={arg_name}>\n"
+                            if isinstance(arg_value, str):
+                                rendered_value = arg_value
+                            else:
+                                rendered_value = json.dumps(arg_value, ensure_ascii=False)
+                            text += f"{rendered_value}\n</parameter>\n"
+                    text += "</function>\n</tool_call>"
+
+                    if i == len(tool_calls) - 1:
+                        text += "<|im_end|>\n"
+
+                    sub_specs.append({
+                        "text": text,
+                        "role": "assistant",
+                        "kind": "tool_call",
+                        "message_start": index,
+                        "message_end": index + 1,
+                        "protected": False,
+                        "metadata": {
+                            "message_index": index,
+                            "tool_name": name,
+                        },
+                    })
+
+            specs.extend(sub_specs)
             index += 1
             continue
         if role == "tool":

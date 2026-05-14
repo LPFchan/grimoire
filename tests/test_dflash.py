@@ -1079,6 +1079,119 @@ class OpenCodeSessionFixtureTests(unittest.TestCase):
         self.assertEqual(protected, [])
 
 
+class QwenSubBlockTests(unittest.TestCase):
+    """_qwen_prompt_block_specs must split assistant messages into sub-blocks."""
+
+    def test_simple_assistant_no_sub_blocks(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        assistant_specs = [s for s in specs if s["role"] == "assistant" and s["kind"] == "assistant"]
+        self.assertEqual(len(assistant_specs), 1)
+
+    def test_assistant_with_reasoning_creates_thinking_sub_block(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "short answer", "reasoning_content": "let me think step by step"},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        thinking_blocks = [s for s in specs if s["kind"] == "thinking"]
+        text_blocks = [s for s in specs if s["kind"] == "assistant_text"]
+        self.assertEqual(len(thinking_blocks), 1)
+        self.assertEqual(len(text_blocks), 1)
+        self.assertIn("<think>", thinking_blocks[0]["text"])
+        self.assertIn("let me think step by step", thinking_blocks[0]["text"])
+
+    def test_assistant_with_tool_calls_creates_tool_call_sub_blocks(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "read files"},
+            {"role": "assistant", "content": "I'll read those",
+             "tool_calls": [
+                 {"id": "c1", "type": "function", "function": {"name": "read", "arguments": {"path": "a.txt"}}},
+                 {"id": "c2", "type": "function", "function": {"name": "read", "arguments": {"path": "b.txt"}}},
+             ]},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        tc_blocks = [s for s in specs if s["kind"] == "tool_call"]
+        text_blocks = [s for s in specs if s["kind"] == "assistant_text"]
+        self.assertEqual(len(tc_blocks), 2)
+        self.assertEqual(len(text_blocks), 1)
+        self.assertIn("read", tc_blocks[0]["metadata"]["tool_name"])
+        self.assertIn("a.txt", tc_blocks[0]["text"])
+        self.assertIn("b.txt", tc_blocks[1]["text"])
+
+    def test_assistant_no_content_only_tool_calls(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [
+                 {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": {"cmd": "ls"}}},
+             ]},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        tc_blocks = [s for s in specs if s["kind"] == "tool_call"]
+        self.assertEqual(len(tc_blocks), 1)
+
+    def test_assistant_with_reasoning_and_tool_calls_creates_multiple_sub_blocks(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "research"},
+            {"role": "assistant", "content": "Let me search",
+             "reasoning_content": "I need to look up facts",
+             "tool_calls": [
+                 {"id": "c1", "type": "function", "function": {"name": "web_search", "arguments": {"q": "python"}}},
+             ]},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        kinds = [s["kind"] for s in specs if s["role"] == "assistant"]
+        self.assertEqual(kinds, ["thinking", "assistant_text", "tool_call"])
+
+    def test_sub_blocks_from_same_message_share_message_start_end(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "do work"},
+            {"role": "assistant", "content": "working",
+             "reasoning_content": "planning",
+             "tool_calls": [
+                 {"id": "c1", "type": "function", "function": {"name": "read", "arguments": {"path": "x"}}},
+             ]},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        assistant_specs = [s for s in specs if s["role"] == "assistant"]
+        for spec in assistant_specs:
+            self.assertEqual(spec["message_start"], 2)
+            self.assertEqual(spec["message_end"], 3)
+
+    def test_sub_block_texts_concatenate_correctly(self):
+        from grimoire.prompt.qwen import _qwen_prompt_block_specs
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "search"},
+            {"role": "assistant", "content": "ok searching",
+             "reasoning_content": "thinking...",
+             "tool_calls": [
+                 {"id": "c1", "type": "function", "function": {"name": "search", "arguments": {"q": "x"}}},
+             ]},
+        ]
+        specs = _qwen_prompt_block_specs(msgs, add_generation_prompt=False)
+        assistant_specs = [s for s in specs if s["role"] == "assistant"]
+        concatenated = "".join(s["text"] for s in assistant_specs)
+        expected = "<|im_start|>assistant\n<think>\nthinking...\n</think>\n\nok searching\n\n<tool_call>\n<function=search>\n<parameter=q>\nx\n</parameter>\n</function>\n</tool_call><|im_end|>\n"
+        self.assertEqual(concatenated, expected)
+
+
 class MaybeCompressHeadTailTests(unittest.TestCase):
     """maybe_compress must protect head + tail and only compress middle blocks."""
 

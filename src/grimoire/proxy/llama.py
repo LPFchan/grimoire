@@ -139,10 +139,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
-                    # Reconstruct messages preserving roles and tool call metadata.
-                    # Group compressed block tokens by original message boundary,
-                    # decode each message's tokens once (avoids BPE boundary artifacts
-                    # from per-block decode), then emit messages in original order.
                     msg_groups: dict[int, dict] = {}
                     for block in blocks:
                         if block.kind == "generation_prompt":
@@ -152,21 +148,38 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             msg_groups[key] = {
                                 "role": block.role,
                                 "token_ids": [],
-                                "metadata": block.metadata or {},
+                                "metadata": {},
+                                "has_tool_calls": False,
+                                "has_reasoning": False,
+                                "tool_calls": [],
                             }
                         msg_groups[key]["token_ids"].extend(
                             compressed_ids[block.start:block.end]
                         )
+                        meta = block.metadata or {}
+                        if meta.get("reasoning"):
+                            msg_groups[key]["has_reasoning"] = True
+                        if block.kind == "tool_call":
+                            msg_groups[key]["has_tool_calls"] = True
+                            tool_name = meta.get("tool_name")
+                            if tool_name:
+                                msg_groups[key]["tool_calls"].append({
+                                    "name": tool_name,
+                                })
+                        msg_groups[key]["metadata"].update(meta)
                     new_messages = []
                     for key in sorted(msg_groups):
                         m = msg_groups[key]
                         text = tokenizer.decode(m["token_ids"])
                         entry: dict = {"role": m["role"], "content": text}
-                        # Propagate tool_call/reasoning metadata from block metadata
-                        for md_key in ("tool_calls", "reasoning_content", "tool_call_id",
-                                       "name", "tool_names", "message_indexes"):
+                        for md_key in ("reasoning_content", "tool_call_id",
+                                       "tool_names", "message_indexes"):
                             if md_key in m["metadata"]:
                                 entry[md_key] = m["metadata"][md_key]
+                        if m["has_reasoning"]:
+                            entry["reasoning_content"] = text
+                        if m["has_tool_calls"]:
+                            entry["tool_calls"] = m["tool_calls"]
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
