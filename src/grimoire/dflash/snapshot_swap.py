@@ -98,6 +98,7 @@ class SnapshotStore:
         }
         tmp = mp.with_suffix(".tmp")
         try:
+            mp.parent.mkdir(parents=True, exist_ok=True)
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(str(tmp), str(mp))
@@ -182,6 +183,7 @@ class SnapshotStore:
             logger.info("snapshot store evicted RAM entry %s", lru_key.hex()[:8])
 
     def _cleanup_disk(self) -> None:
+        self.disk_dir.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc)
 
         for key, path in list(self.disk.items()):

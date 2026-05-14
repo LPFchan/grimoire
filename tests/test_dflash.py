@@ -568,6 +568,34 @@ class DflashRegistryValidationTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("must be GGUF", reason)
 
+    def test_llama_native_dflash_entry_accepts_explicit_spec_draft_model(self):
+        self.reg.add(
+            "native-explicit-draft",
+            {
+                "file": "target.gguf",
+                "draft": "draft.safetensors",
+                "spec-draft-model": "drafter.gguf",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-explicit-draft")
+        self.assertTrue(valid, reason)
+
+    def test_llama_native_dflash_entry_rejects_missing_explicit_spec_draft_model(self):
+        os.unlink(self.models_dir / "drafter.gguf")
+        self.reg.add(
+            "native-missing-explicit-draft",
+            {
+                "file": "target.gguf",
+                "draft": "target.gguf",
+                "spec-draft-model": "drafter.gguf",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-missing-explicit-draft")
+        self.assertFalse(valid)
+        self.assertIn("Native DFlash draft model not found", reason)
+
 
 class PrefixCacheBoundaryTests(unittest.TestCase):
     """The lookup() probe must check supplied boundaries, not just the full prompt."""
