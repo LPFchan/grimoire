@@ -74,9 +74,23 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             if len(prompt_ids) > pcfg.threshold:
                 # Park llama-server before compression if park-unpark enabled
                 park_ok = False
+                _park_ctl_fd = None
+                _park_ack_fd = None
                 if model_cfg.get("park-unpark"):
                     try:
-                        park_ok = active._park_llama()
+                        import os, select
+                        # Keep .ctl fd open across park+unpark so the FIFO reader
+                        # (shim listener) doesn't see EOF between commands.
+                        _park_ctl_fd = os.open("/tmp/pflash_shim.ctl",
+                                               os.O_WRONLY | os.O_NONBLOCK)
+                        os.write(_park_ctl_fd, b"park\n")
+                        _park_ack_fd = os.open("/tmp/pflash_shim.ack",
+                                               os.O_RDONLY | os.O_NONBLOCK)
+                        poll = select.poll()
+                        poll.register(_park_ack_fd, select.POLLIN)
+                        if poll.poll(30000):
+                            resp = os.read(_park_ack_fd, 64).decode().strip()
+                            park_ok = (resp == "ok")
                         if park_ok:
                             log.warning("pflash park: llama parked")
                     except Exception as e:
@@ -86,13 +100,22 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     prompt_ids, daemon, pcfg, blocks=prompt_blocks,
                 )
 
-                # Unpark llama-server after compression
-                if park_ok:
+                # Unpark llama-server after compression (reuse same .ctl fd)
+                if park_ok and _park_ctl_fd is not None:
                     try:
-                        if active._unpark_llama():
-                            log.warning("pflash park: llama unparked")
+                        import os, select
+                        os.write(_park_ctl_fd, b"unpark\n")
+                        poll = select.poll()
+                        poll.register(_park_ack_fd, select.POLLIN)
+                        if poll.poll(30000):
+                            resp = os.read(_park_ack_fd, 64).decode().strip()
+                            if resp == "ok":
+                                log.warning("pflash park: llama unparked")
                     except Exception as e:
                         log.warning(f"pflash park: unpark failed ({e})")
+                    finally:
+                        if _park_ctl_fd is not None: os.close(_park_ctl_fd)
+                        if _park_ack_fd is not None: os.close(_park_ack_fd)
 
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
