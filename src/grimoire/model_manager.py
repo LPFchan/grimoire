@@ -177,41 +177,38 @@ class ActiveModel:
         return self.process
 
     def _park_llama(self):
-        """Park llama-server: SIGTERM to free VRAM. Weights stay in OS page cache."""
+        """Park llama-server GPU memory via shim FIFO (VMM unmap + host save)."""
         try:
-            import signal, subprocess
-            if self.process and self.process.poll() is None:
-                import signal
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                try:
-                    self.process.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                    self.process.wait()
-                logger.info("park: llama-server stopped (weights in page cache)")
-                return True
+            import os, select
+            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, b"park\n")
+            os.close(fd)
+            with open("/tmp/pflash_shim.ack", "r") as f:
+                poll = select.poll()
+                poll.register(f, select.POLLIN)
+                if poll.poll(30000):
+                    resp = f.read().strip()
+                    return resp == "ok"
+            logger.warning("park: ack timeout")
             return False
         except Exception as e:
             logger.warning(f"park failed: {e}")
             return False
 
     def _unpark_llama(self):
-        """Unpark llama-server: restart with compressed prompt. Fast reload from page cache."""
+        """Unpark llama-server GPU memory via shim FIFO (VMM remap + host restore)."""
         try:
-            import time, urllib.request
-            self.process = self._start_llama()
-            if self.process:
-                import urllib.request
-                for _ in range(60):
-                    try:
-                        r = urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=2)
-                        if r.status == 200:
-                            logger.info("unpark: llama-server restarted")
-                            return True
-                    except Exception:
-                        pass
-                    time.sleep(1)
-                logger.warning("unpark: health check timeout")
+            import os, select
+            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, b"unpark\n")
+            os.close(fd)
+            with open("/tmp/pflash_shim.ack", "r") as f:
+                poll = select.poll()
+                poll.register(f, select.POLLIN)
+                if poll.poll(30000):
+                    resp = f.read().strip()
+                    return resp == "ok"
+            logger.warning("unpark: ack timeout")
             return False
         except Exception as e:
             logger.warning(f"unpark failed: {e}")
