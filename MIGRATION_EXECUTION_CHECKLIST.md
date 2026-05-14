@@ -6,7 +6,7 @@
 - Lucebox retirement is blocked until decode, DFlash `compact-full` persistence, and the preserved llama-side PFlash path are all green.
 
 ## Inputs To Pin Before Coding
-- Canonical target repo: working fork of `TheTom/llama-cpp-turboquant` using `tmp/spec-analysis/thetom-shallow/` as the local snapshot. Current local SHA: `5aeb2fdbe26cd4c534c6fa15de73cb5749bd0403`.
+- Canonical target repo: working fork of `TheTom/llama-cpp-turboquant` using `tmp/spec-analysis/thetom-shallow/` as the local snapshot. Current local SHA used for patch generation and Docker build verification: `69d8e4be47243e83b3d0d71e932bc7aa61c644dc`.
 - DFlash source refs: `tmp/spec-analysis/buun-shallow/`, `tmp/spec-analysis/bee-shallow/`, and `tmp/spec-analysis/ggml-pr22105/`. Current local SHAs: `buun-shallow=853eebdd02c2db4baf7bf781adadee6e7ce1d44e`, `bee-shallow=633cd34fb6df72ad88a74e9320dad03ddd788fb1`, and `ggml-pr22105=320a6a44a5b1de6a074ba781e65f5fd79fb4051a`.
 - PFlash upstream baseline: `tmp/spec-analysis/lucebox-hub/` pinned to the `de31881` file baseline for `pflash_daemon`, `qwen3_drafter`, and `SPEC_PREFILL`. Current local SHA: `e5347801719ad7d45a3d7bd096e9e57778ce23ea`.
 - Local native source of truth today: `lucebox/dflash/`.
@@ -107,7 +107,7 @@ Canonical DFlash Decode MVP
 - Repos: canonical `TheTom` fork as the target, with `tmp/spec-analysis/buun-shallow/`, `tmp/spec-analysis/bee-shallow/`, and `tmp/spec-analysis/ggml-pr22105/` as source refs.
 - Primary native target files: `include/llama.h`, `src/llama-context.cpp`, `src/llama-context.h`, `src/llama-model.cpp`, `src/llama-arch.cpp`, `src/llama-arch.h`, `src/models/dflash.cpp`, `src/models/qwen35.cpp`, `src/models/qwen35moe.cpp`, `common/speculative.cpp`, `tools/server/server-context.cpp`, `convert_hf_to_gguf.py`, `gguf-py/gguf/tensor_mapping.py`.
 - Primary Grimoire files: `src/grimoire/proxy/dflash.py`, `src/grimoire/dflash/prefill.py`, `src/grimoire/prompt/generic.py`, `etc/models.json`.
-- Current Grimoire checkpoint scope before native cutover: a dormant llama-server canary launch contract exists for `dflash-native-qwen3.6-27B-canary`, using Bee-style `--spec-type dflash`, `--spec-draft-model`, and `--spec-dflash-cross-ctx` flags. The local TheTom patch set now recognizes those launch flags, but this remains control-plane scaffolding only and does not count as decode parity.
+- Current Grimoire checkpoint scope before native cutover: a dormant llama-server canary launch contract exists for `dflash-native-qwen3.6-27B-canary`, using Bee-style `--spec-type dflash`, `--spec-draft-model`, and `--spec-dflash-cross-ctx` flags. The local TheTom patch set now recognizes those launch flags, and the canonical `docker build --target build` path succeeds with that patch set at the pinned SHA, but this remains control-plane scaffolding only and does not count as decode parity.
 - Deliverables: buun DFlash core port, canonical decode path for the target Qwen models, GGUF DFlash draft load/convert path, and a Grimoire route that no longer depends on Lucebox for decode.
 - Deliverables: prompt-layout and metadata fidelity across compression and reconstruction, including tool-call metadata, reasoning content, message boundaries, and protected blocks.
 - Verification: `tests/test_dflash.py` passes for prompt/block behavior and replay-style semantics, plus end-to-end text-only speculative decode with `parallel=1`.
