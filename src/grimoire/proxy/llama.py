@@ -89,6 +89,10 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 # Unpark llama-server after compression
                 if park_ok:
                     try:
+                        # Stop PF daemon to free VRAM for llama-server reload
+                        if daemon and daemon.is_running():
+                            daemon.stop()
+                            log.warning("pflash park: pf daemon stopped")
                         if active._unpark_llama():
                             log.warning("pflash park: llama unparked")
                     except Exception as e:
