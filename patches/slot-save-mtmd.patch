@@ -1,0 +1,33 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index e134b3c..fabee90 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1829,10 +1829,6 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_SAVE:
+                 {
+-                    if (!check_no_mtmd(task.id)) {
+-                        break;
+-                    }
+-
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+@@ -1870,7 +1866,6 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_RESTORE:
+                 {
+-                    if (!check_no_mtmd(task.id)) break;
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {
+@@ -1917,9 +1912,6 @@ private:
+                 } break;
+             case SERVER_TASK_TYPE_SLOT_ERASE:
+                 {
+-                    if (!check_no_mtmd(task.id)) {
+-                        break;
+-                    }
+                     const int id_slot = task.slot_action.id_slot;
+                     server_slot * slot = get_slot_by_id(id_slot);
+                     if (slot == nullptr) {

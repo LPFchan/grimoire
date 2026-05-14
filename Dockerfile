@@ -9,7 +9,7 @@ ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature-turboquant-kv-cache-b9079-69d8e4b
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=4
+ARG CACHE_BUST=5
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -52,6 +52,7 @@ ENV CCACHE_DIR=/root/.ccache \
 # Copy only non-webui patches for the build stage
 RUN mkdir -p /app/patches
 COPY patches/prefill-thinking-fix.patch /app/patches/
+COPY patches/slot-save-mtmd.patch /app/patches/
 
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/llama-cpp-src \
