@@ -150,6 +150,11 @@ RUN --mount=type=cache,target=/root/.ccache \
     find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
     ls -la /opt/dflash/
 
+# Compile the park/unpark LD_PRELOAD shim
+COPY src/grimoire/dflash/pflash_shim.c /app/pflash_shim.c
+RUN gcc -shared -o /opt/dflash/pflash_shim.so -fPIC -I/usr/local/cuda/include \
+    /app/pflash_shim.c -lcuda -ldl -Wall -Wextra 2>&1
+
 
 # =============================================================================
 # WebUI stage: Build the stock llama.cpp SvelteKit chat UI

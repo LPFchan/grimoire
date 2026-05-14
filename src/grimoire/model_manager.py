@@ -179,14 +179,19 @@ class ActiveModel:
     def _park_llama(self):
         """Park llama-server weights to host shadow buffer via shim FIFO."""
         try:
-            ctl = "/tmp/pflash_shim.ctl"
-            with open(ctl, "w") as f:
-                f.write("park\n")
-            ack = "/tmp/pflash_shim.ack"
-            import select, os
-            with open(ack, "r") as f:
-                resp = f.read().strip()
-            return resp == "ok"
+            import os
+            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, b"park\n")
+            os.close(fd)
+            import select
+            with open("/tmp/pflash_shim.ack", "r") as f:
+                poll = select.poll()
+                poll.register(f, select.POLLIN)
+                if poll.poll(5000):
+                    resp = f.read().strip()
+                    return resp == "ok"
+            logger.warning("park: ack timeout")
+            return False
         except Exception as e:
             logger.warning(f"park failed: {e}")
             return False
@@ -194,13 +199,19 @@ class ActiveModel:
     def _unpark_llama(self):
         """Unpark llama-server weights from host shadow buffer via shim FIFO."""
         try:
-            ctl = "/tmp/pflash_shim.ctl"
-            with open(ctl, "w") as f:
-                f.write("unpark\n")
-            ack = "/tmp/pflash_shim.ack"
-            with open(ack, "r") as f:
-                resp = f.read().strip()
-            return resp == "ok"
+            import os
+            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            os.write(fd, b"unpark\n")
+            os.close(fd)
+            import select
+            with open("/tmp/pflash_shim.ack", "r") as f:
+                poll = select.poll()
+                poll.register(f, select.POLLIN)
+                if poll.poll(5000):
+                    resp = f.read().strip()
+                    return resp == "ok"
+            logger.warning("unpark: ack timeout")
+            return False
         except Exception as e:
             logger.warning(f"unpark failed: {e}")
             return False

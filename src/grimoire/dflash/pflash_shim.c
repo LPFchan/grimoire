@@ -275,24 +275,15 @@ static int vmm_unpark(void) {
 
 // ── FIFO listener ─────────────────────────────────────────────────────
 static void ctl_listener_loop(void) {
-    char path[PID_BUF_SIZE];
-    snprintf(path, sizeof(path), "/tmp/pflash_shim.ctl");
+    // Open existing FIFOs (created synchronously in shim_init)
+    g_ctl_fd = open("/tmp/pflash_shim.ctl", O_RDONLY);
+    if (g_ctl_fd < 0) { perror("[pflash_shim] open .ctl"); return; }
 
-    // Create FIFO
-    unlink(path);
-    if (mkfifo(path, 0666) < 0) { perror("mkfifo .ctl"); return; }
-    g_ctl_fd = open(path, O_RDONLY);
-    if (g_ctl_fd < 0) { perror("open .ctl"); return; }
+    // Open ack write end (non-blocking to avoid deadlock with proxy)
+    g_ack_fd = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);
+    if (g_ack_fd < 0) { perror("[pflash_shim] open .ack"); return; }
 
-    char ack_path[PID_BUF_SIZE];
-    snprintf(ack_path, sizeof(ack_path), "/tmp/pflash_shim.ack");
-    unlink(ack_path);
-    if (mkfifo(ack_path, 0666) < 0) { perror("mkfifo .ack"); return; }
-    // Open write end (non-blocking to avoid deadlock)
-    g_ack_fd = open(ack_path, O_WRONLY | O_NONBLOCK);
-    if (g_ack_fd < 0) { perror("open .ack"); return; }
-
-    fprintf(stderr, "[pflash_shim] listener ready on %s\n", path);
+    fprintf(stderr, "[pflash_shim] listener ready\n");
     fflush(stderr);
 
     char line[MAX_CTL_LINE];
@@ -317,14 +308,27 @@ static void ctl_listener_loop(void) {
 
     close(g_ctl_fd); g_ctl_fd = -1;
     close(g_ack_fd); g_ack_fd = -1;
-    unlink(path);
+    unlink("/tmp/pflash_shim.ctl");
+    unlink("/tmp/pflash_shim.ack");
 }
 
 // ── Constructor / Destructor ──────────────────────────────────────────
 static void shim_init(void) {
     fprintf(stderr, "[pflash_shim] loaded\n");
 
-    // Start listener thread
+    // Create FIFOs synchronously so they exist before any park/unpark call
+    unlink("/tmp/pflash_shim.ctl");
+    if (mkfifo("/tmp/pflash_shim.ctl", 0666) < 0) {
+        perror("[pflash_shim] mkfifo .ctl");
+        return;
+    }
+    unlink("/tmp/pflash_shim.ack");
+    if (mkfifo("/tmp/pflash_shim.ack", 0666) < 0) {
+        perror("[pflash_shim] mkfifo .ack");
+        return;
+    }
+
+    // Start listener thread (opens FIFOs, enters read loop)
     g_listener_running = 1;
     pthread_create(&g_listener, NULL, (void *(*)(void *))ctl_listener_loop, NULL);
     pthread_detach(g_listener);
