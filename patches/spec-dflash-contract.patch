@@ -202,6 +202,91 @@ index 5b4fb79..5dee3ff 100755
  @ModelBase.register("Qwen3MoeForCausalLM")
  class Qwen3MoeModel(Qwen2MoeModel):
      model_arch = gguf.MODEL_ARCH.QWEN3MOE
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index c3cd1c7..81c6fae 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1051,6 +1051,24 @@ extern "C" {
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a);
+ 
++    // argmax with temperature scaling and optional Gumbel sampling metadata.
++    // when temp == 0 or seed == 0: equivalent to regular argmax.
++    // output: [2*nrows] I32 where the second half stores float log-prob bits.
++    GGML_API struct ggml_tensor * ggml_argmax_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            float                 temp,
++            uint64_t              seed);
++
++    // top-K with temperature scaling and optional Gumbel sampling metadata.
++    // output: [2*K*nrows] I32 where the second half stores float log-prob bits.
++    GGML_API struct ggml_tensor * ggml_topk_ext(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   k,
++            float                 temp,
++            uint64_t              seed);
++
+     // count number of equal elements in a and b
+     GGML_API struct ggml_tensor * ggml_count_equal(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 7234d7f..804dd66 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -2546,6 +2546,51 @@ struct ggml_tensor * ggml_argmax(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_argmax_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        float                 temp,
++        uint64_t              seed) {
++    GGML_ASSERT(ggml_is_matrix(a));
++    GGML_ASSERT(a->ne[0] <= INT32_MAX);
++
++    // Keep the reserved output shape stable for future reduced-logit consumers.
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * a->ne[1]);
++
++    result->op     = GGML_OP_ARGMAX;
++    result->src[0] = a;
++
++    ggml_set_op_params_f32(result, 0, temp);
++    ggml_set_op_params_i32(result, 1, (int32_t) (seed & 0xFFFFFFFF));
++    ggml_set_op_params_i32(result, 2, (int32_t) (seed >> 32));
++
++    return result;
++}
++
++struct ggml_tensor * ggml_topk_ext(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        int                   k,
++        float                 temp,
++        uint64_t              seed) {
++    GGML_ASSERT(ggml_is_matrix(a));
++    GGML_ASSERT(a->ne[0] <= INT32_MAX);
++    GGML_ASSERT(k >= 1 && k <= 64);
++
++    // Keep the reserved output shape stable for future reduced-logit consumers.
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * k * a->ne[1]);
++
++    result->op     = GGML_OP_ARGMAX;
++    result->src[0] = a;
++
++    ggml_set_op_params_f32(result, 0, temp);
++    ggml_set_op_params_i32(result, 1, (int32_t) (seed & 0xFFFFFFFF));
++    ggml_set_op_params_i32(result, 2, (int32_t) (seed >> 32));
++    ggml_set_op_params_i32(result, 3, (int32_t) k);
++
++    return result;
++}
++
+ // ggml_count_equal
+ 
+ struct ggml_tensor * ggml_count_equal(
 diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
 index 997744f..2adb032 100644
 --- a/gguf-py/gguf/constants.py
