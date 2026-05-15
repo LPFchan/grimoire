@@ -503,6 +503,45 @@ class DflashRegistryValidationTests(unittest.TestCase):
 
         path.write_bytes(b"".join(body))
 
+    @staticmethod
+    def _native_draft_metadata(**overrides):
+        metadata = {
+            "general.architecture": "dflash-draft",
+            "dflash-draft.embedding_length": 5120,
+            "dflash-draft.block_count": 5,
+            "dflash-draft.feed_forward_length": 17408,
+            "dflash-draft.attention.head_count": 32,
+            "dflash-draft.attention.head_count_kv": 8,
+            "dflash-draft.attention.key_length": 128,
+            "dflash-draft.dflash.block_size": 16,
+            "dflash-draft.dflash.n_target_layers": 5,
+            "dflash-draft.dflash.target_layer_ids": [1, 16, 31, 46, 61],
+            "dflash-draft.dflash.n_target_features": 25600,
+        }
+        metadata.update(overrides)
+        return metadata
+
+    @staticmethod
+    def _native_draft_tensors(layer_count: int = 5):
+        tensors = ["dflash_fc.weight", "dflash_hidden_norm.weight", "output_norm.weight"]
+        for layer_idx in range(layer_count):
+            tensors.extend(
+                [
+                    f"blk.{layer_idx}.attn_norm.weight",
+                    f"blk.{layer_idx}.ffn_norm.weight",
+                    f"blk.{layer_idx}.attn_q.weight",
+                    f"blk.{layer_idx}.attn_k.weight",
+                    f"blk.{layer_idx}.attn_v.weight",
+                    f"blk.{layer_idx}.attn_output.weight",
+                    f"blk.{layer_idx}.attn_q_norm.weight",
+                    f"blk.{layer_idx}.attn_k_norm.weight",
+                    f"blk.{layer_idx}.ffn_gate.weight",
+                    f"blk.{layer_idx}.ffn_up.weight",
+                    f"blk.{layer_idx}.ffn_down.weight",
+                ]
+            )
+        return tensors
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -515,13 +554,8 @@ class DflashRegistryValidationTests(unittest.TestCase):
         (self.models_dir / "draft.safetensors").write_bytes(b"x")
         self._write_gguf(
             self.models_dir / "drafter.gguf",
-            {
-                "general.architecture": "dflash-draft",
-                "dflash-draft.dflash.block_size": 16,
-                "dflash-draft.dflash.target_layer_ids": [1, 16, 31, 46, 61],
-                "dflash-draft.dflash.n_target_features": 25600,
-            },
-            ["dflash_fc.weight", "dflash_hidden_norm.weight", "output_norm.weight"],
+            self._native_draft_metadata(),
+            self._native_draft_tensors(),
         )
 
         self.registry_path = self.models_dir / "registry.json"
