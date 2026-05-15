@@ -549,6 +549,17 @@ class ModelManager:
         await active.wait_ready(timeout=self._startup_timeout(active.cfg))
         active.status = config.MODEL_STATUS_LOADED
 
+    async def _stop_active_model(self, name: str, active: ActiveModel, drop_on_success: bool = True):
+        """Stop a tracked model, but retain failed cleanup in manager state."""
+        try:
+            await asyncio.to_thread(active.stop)
+        except Exception as e:
+            active.status = config.MODEL_STATUS_FAILED
+            self.active[name] = active
+            raise RuntimeError(f"failed to stop {name}: {e}") from e
+        if drop_on_success and self.active.get(name) is active:
+            self.active.pop(name, None)
+
     async def _restore_incumbents(self, incumbents):
         """Best-effort restart of incumbents evicted during failed replacement startup."""
         errors = []
@@ -558,12 +569,10 @@ class ModelManager:
             except Exception as e:
                 incumbent.status = config.MODEL_STATUS_FAILED
                 try:
-                    await asyncio.to_thread(incumbent.stop)
-                except Exception:
-                    pass
-                if self.active.get(name) is incumbent:
-                    self.active.pop(name, None)
-                errors.append(f"{name}: {e}")
+                    await self._stop_active_model(name, incumbent)
+                    errors.append(f"{name}: {e}")
+                except Exception as stop_error:
+                    errors.append(f"{name}: {e}; {stop_error}")
         return errors
 
     async def start_model(self, model_name):
@@ -623,10 +632,9 @@ class ModelManager:
             except Exception as e:
                 active.status = config.MODEL_STATUS_FAILED
                 try:
-                    await asyncio.to_thread(active.stop)
-                except Exception:
-                    pass
-                self.active.pop(model_name, None)
+                    await self._stop_active_model(model_name, active)
+                except Exception as stop_error:
+                    raise RuntimeError(f"{e}; {stop_error}") from e
                 rollback_errors = await self._restore_incumbents(incumbents)
                 if rollback_errors:
                     raise RuntimeError(
