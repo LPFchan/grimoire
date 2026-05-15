@@ -127,6 +127,12 @@ class SnapshotStore:
         with self._state_lock:
             return (self._clear_epoch, self._key_epochs.get(key, 0))
 
+    def _advance_key_epoch(self, key: bytes) -> tuple[int, int]:
+        with self._state_lock:
+            next_epoch = self._key_epochs.get(key, 0) + 1
+            self._key_epochs[key] = next_epoch
+            return (self._clear_epoch, next_epoch)
+
     def _token_is_current(self, key: bytes, token: tuple[int, int]) -> bool:
         with self._state_lock:
             return token == (self._clear_epoch, self._key_epochs.get(key, 0))
@@ -239,7 +245,7 @@ class SnapshotStore:
                 pass
 
     def _queue_mirror(self, src: Path, dst: Path, key: bytes, target: str = "disk") -> None:
-        token = self._mirror_token(key)
+        token = self._advance_key_epoch(key)
         try:
             loop = asyncio.get_running_loop()
             self.bind_loop(loop)
@@ -293,10 +299,17 @@ class SnapshotStore:
         now = datetime.now(timezone.utc)
 
         with self._state_lock:
+            pending_disk_paths = {
+                self.disk_path(key)
+                for key, tasks in self._pending_mirror_keys.items()
+                if tasks
+            }
             tracked_paths = {Path(path) for path in self.disk.values()}
             disk_items = list(self.disk.items())
         for stray in self.disk_dir.glob("swap-*.dfsn"):
             if stray in tracked_paths:
+                continue
+            if stray in pending_disk_paths:
                 continue
             try:
                 stray.unlink(missing_ok=True)

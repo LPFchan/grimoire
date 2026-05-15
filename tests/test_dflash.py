@@ -462,6 +462,47 @@ def _synthetic_prompt_blocks(boundaries, prompt_len, protected_indexes=None, inc
 class DflashRegistryValidationTests(unittest.TestCase):
     """Validation guardrails for the dflash backend entries in models.json."""
 
+    @staticmethod
+    def _write_gguf(path: Path, metadata: dict, tensors: list[str]) -> None:
+        def u32(v):
+            return struct.pack("<I", v)
+
+        def u64(v):
+            return struct.pack("<Q", v)
+
+        def i32(v):
+            return struct.pack("<i", v)
+
+        def string(v: str):
+            data = v.encode("utf-8")
+            return u64(len(data)) + data
+
+        def value(v):
+            if isinstance(v, str):
+                return u32(8) + string(v)
+            if isinstance(v, bool):
+                return u32(7) + (b"\x01" if v else b"\x00")
+            if isinstance(v, int):
+                return u32(5) + i32(v)
+            if isinstance(v, list):
+                payload = b"".join(i32(int(item)) for item in v)
+                return u32(9) + u32(5) + u64(len(v)) + payload
+            raise TypeError(f"unsupported metadata value {v!r}")
+
+        body = [u32(0x46554747), u32(3), u64(len(tensors)), u64(len(metadata))]
+        for key, raw in metadata.items():
+            body.append(string(key))
+            body.append(value(raw))
+
+        for name in tensors:
+            body.append(string(name))
+            body.append(u32(1))
+            body.append(u64(1))
+            body.append(u32(0))
+            body.append(u64(0))
+
+        path.write_bytes(b"".join(body))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -472,7 +513,16 @@ class DflashRegistryValidationTests(unittest.TestCase):
         # Real files on disk for the happy path; tests can remove or shadow as needed.
         (self.models_dir / "target.gguf").write_bytes(b"x")
         (self.models_dir / "draft.safetensors").write_bytes(b"x")
-        (self.models_dir / "drafter.gguf").write_bytes(b"x")
+        self._write_gguf(
+            self.models_dir / "drafter.gguf",
+            {
+                "general.architecture": "dflash-draft",
+                "dflash-draft.dflash.block_size": 16,
+                "dflash-draft.dflash.target_layer_ids": [1, 16, 31, 46, 61],
+                "dflash-draft.dflash.n_target_features": 25600,
+            },
+            ["dflash_fc.weight", "dflash_hidden_norm.weight", "output_norm.weight"],
+        )
 
         self.registry_path = self.models_dir / "registry.json"
         self.reg = registry_mod.ModelRegistry(path=str(self.registry_path), seed_path=None)
@@ -1725,6 +1775,58 @@ class SnapshotSwapTests(unittest.TestCase):
 
             self.assertTrue(tracked_path.exists())
             self.assertFalse(stray_path.exists())
+
+    def test_newer_same_key_mirror_wins_over_older_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"d" * 16
+            src_old = Path(td) / "old.dfsn"
+            src_new = Path(td) / "new.dfsn"
+            src_old.write_text("old\n")
+            src_new.write_text("new\n")
+            release_old = threading.Event()
+            release_new = threading.Event()
+
+            def blocked_copy(_src, _dst):
+                if Path(_src) == src_old:
+                    self.assertTrue(release_old.wait(timeout=5))
+                else:
+                    self.assertTrue(release_new.wait(timeout=5))
+                Path(_dst).write_bytes(Path(_src).read_bytes())
+
+            async def run():
+                with patch("grimoire.dflash.snapshot_swap.shutil.copy2", side_effect=blocked_copy):
+                    swap.bind_loop(asyncio.get_running_loop())
+                    swap._queue_mirror(src_old, swap.disk_path(key), key, target="disk")
+                    swap._queue_mirror(src_new, swap.disk_path(key), key, target="disk")
+                    release_new.set()
+                    await asyncio.sleep(0)
+                    release_old.set()
+                    await swap.flush_pending()
+
+            asyncio.run(run())
+            self.assertEqual(swap.disk_path(key).read_text(), "new\n")
+
+    def test_cleanup_disk_keeps_pending_mirror_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"e" * 16
+            pending_path = swap.disk_path(key)
+            pending_path.parent.mkdir(parents=True, exist_ok=True)
+            pending_path.write_text("pending\n")
+
+            async def parked():
+                await asyncio.sleep(0.5)
+
+            async def run():
+                task = asyncio.create_task(parked())
+                swap._track_mirror_task(task, key)
+                swap._cleanup_disk()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            asyncio.run(run())
+            self.assertTrue(pending_path.exists())
 
 
 class PrefixCachePersistenceTests(unittest.TestCase):
