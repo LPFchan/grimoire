@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import struct
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
@@ -22,6 +23,217 @@ REGISTRY_SEED_PATH = os.environ.get("GRIMOIRE_REGISTRY_SEED_PATH", DEFAULT_REGIS
 
 BACKEND_LLAMA = "llama"
 BACKEND_DFLASH = "dflash"
+
+_GGUF_MAGIC = 0x46554747
+_GGUF_SUPPORTED_VERSIONS = {2, 3}
+
+
+def _read_gguf_metadata(path: str) -> tuple[dict[str, object], list[str]]:
+    """Read GGUF metadata keys and tensor names without external deps."""
+    with open(path, "rb") as f:
+        data = f.read()
+
+    size = len(data)
+    offset = 0
+
+    def _need(n: int) -> None:
+        if offset + n > size:
+            raise ValueError("truncated GGUF")
+
+    def _u32() -> int:
+        nonlocal offset
+        _need(4)
+        value = struct.unpack_from("<I", data, offset)[0]
+        offset += 4
+        return value
+
+    def _u64() -> int:
+        nonlocal offset
+        _need(8)
+        value = struct.unpack_from("<Q", data, offset)[0]
+        offset += 8
+        return value
+
+    def _i32() -> int:
+        nonlocal offset
+        _need(4)
+        value = struct.unpack_from("<i", data, offset)[0]
+        offset += 4
+        return value
+
+    def _bool() -> bool:
+        nonlocal offset
+        _need(1)
+        value = data[offset] != 0
+        offset += 1
+        return value
+
+    def _f32() -> float:
+        nonlocal offset
+        _need(4)
+        value = struct.unpack_from("<f", data, offset)[0]
+        offset += 4
+        return value
+
+    def _f64() -> float:
+        nonlocal offset
+        _need(8)
+        value = struct.unpack_from("<d", data, offset)[0]
+        offset += 8
+        return value
+
+    def _string() -> str:
+        nonlocal offset
+        length = _u64()
+        _need(length)
+        value = data[offset:offset + length].decode("utf-8", errors="replace")
+        offset += length
+        return value
+
+    def _u8() -> int:
+        nonlocal offset
+        _need(1)
+        value = data[offset]
+        offset += 1
+        return value
+
+    def _i8() -> int:
+        nonlocal offset
+        _need(1)
+        value = struct.unpack_from("<b", data, offset)[0]
+        offset += 1
+        return value
+
+    def _u16() -> int:
+        nonlocal offset
+        _need(2)
+        value = struct.unpack_from("<H", data, offset)[0]
+        offset += 2
+        return value
+
+    def _i16() -> int:
+        nonlocal offset
+        _need(2)
+        value = struct.unpack_from("<h", data, offset)[0]
+        offset += 2
+        return value
+
+    def _i64() -> int:
+        nonlocal offset
+        _need(8)
+        value = struct.unpack_from("<q", data, offset)[0]
+        offset += 8
+        return value
+
+    def _value(value_type: int):
+        if value_type == 8:  # STRING
+            return _string()
+        if value_type == 9:  # ARRAY
+            elem_type = _u32()
+            count = _u64()
+            values = [_value(elem_type) for _ in range(count)]
+            return values
+        if value_type == 0:
+            return _u8()
+        if value_type == 1:
+            return _i8()
+        if value_type == 2:
+            return _u16()
+        if value_type == 3:
+            return _i16()
+        if value_type == 4:
+            return _u32()
+        if value_type == 5:
+            return _i32()
+        if value_type == 6:
+            return _f32()
+        if value_type == 7:
+            return _bool()
+        if value_type == 10:
+            return _u64()
+        if value_type == 11:
+            return _i64()
+        if value_type == 12:
+            return _f64()
+        raise ValueError(f"unsupported GGUF value type {value_type}")
+
+    magic = _u32()
+    if magic != _GGUF_MAGIC:
+        raise ValueError("invalid GGUF magic")
+    version = _u32()
+    if version not in _GGUF_SUPPORTED_VERSIONS:
+        raise ValueError(f"unsupported GGUF version {version}")
+
+    tensor_count = _u64()
+    kv_count = _u64()
+
+    metadata = {}
+    for _ in range(kv_count):
+        key = _string()
+        value_type = _u32()
+        value = _value(value_type)
+        metadata[key] = value
+
+    tensor_names = []
+    for _ in range(tensor_count):
+        name = _string()
+        n_dims = _u32()
+        for _ in range(n_dims):
+            _u64()
+        _u32()
+        _u64()
+        tensor_names.append(name)
+
+    return metadata, tensor_names
+
+
+def _validate_native_dflash_draft_gguf(path: str) -> Optional[str]:
+    """Return an error string if a native DFlash draft GGUF lacks required contract data."""
+    try:
+        metadata, tensor_names = _read_gguf_metadata(path)
+    except Exception as e:
+        return f"Native DFlash draft GGUF could not be read: {e}"
+
+    arch = str(metadata.get("general.architecture") or "").lower()
+    if arch not in {"dflash-draft", "qwen35-dflash-draft"}:
+        return (
+            "Native DFlash draft GGUF has unexpected architecture "
+            f"'{metadata.get('general.architecture')}' (expected dflash-draft or qwen35-dflash-draft)"
+        )
+
+    required_keys = [
+        f"{arch}.dflash.block_size",
+        f"{arch}.dflash.target_layer_ids",
+        f"{arch}.dflash.n_target_features",
+    ]
+    missing_keys = [key for key in required_keys if key not in metadata]
+    if missing_keys:
+        return f"Native DFlash draft GGUF missing required metadata: {', '.join(missing_keys)}"
+
+    target_layer_ids = metadata.get(f"{arch}.dflash.target_layer_ids")
+    if not isinstance(target_layer_ids, list) or not target_layer_ids:
+        return "Native DFlash draft GGUF has invalid or empty dflash.target_layer_ids metadata"
+
+    block_size = metadata.get(f"{arch}.dflash.block_size")
+    if not isinstance(block_size, int) or block_size <= 0:
+        return "Native DFlash draft GGUF has invalid dflash.block_size metadata"
+
+    n_target_features = metadata.get(f"{arch}.dflash.n_target_features")
+    if not isinstance(n_target_features, int) or n_target_features <= 0:
+        return "Native DFlash draft GGUF has invalid dflash.n_target_features metadata"
+
+    if not (
+        "dflash.fc.weight" in tensor_names or "dflash_fc.weight" in tensor_names
+    ):
+        return "Native DFlash draft GGUF missing required tensor dflash.fc.weight"
+    if not (
+        "dflash.hidden_norm.weight" in tensor_names or "dflash_hidden_norm.weight" in tensor_names
+    ):
+        return "Native DFlash draft GGUF missing required tensor dflash.hidden_norm.weight"
+    if "output_norm.weight" not in tensor_names:
+        return "Native DFlash draft GGUF missing required tensor output_norm.weight"
+
+    return None
 
 
 def _get_backend(cfg: dict) -> str:
@@ -338,6 +550,9 @@ class ModelRegistry:
                     return False, f"Native DFlash draft model not found at {draft}"
                 if not str(draft).lower().endswith(".gguf"):
                     return False, f"Native DFlash draft model must be GGUF: {draft}"
+                draft_error = _validate_native_dflash_draft_gguf(draft)
+                if draft_error:
+                    return False, draft_error
         elif backend == BACKEND_DFLASH:
             target = resolve_path(cfg, "target")
             if not target or not os.path.exists(target):
