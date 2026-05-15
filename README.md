@@ -49,23 +49,26 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
-    "dflash-qwen-27B": {
+    "dflash-pflash-qwen3.6-27B": {
       "backend": "dflash",
       "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
       "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
       "tokenizer": "tokenizers/qwen3.6-27B",
-      "ctx-size": 262144,
-      "max-effective-context": 100000,
-      "budget": 22,
+      "ctx-size": 60000,
+      "max-effective-context": 60000,
+      "budget": 18,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
+      "fa-window": 2048,
       "snapshot-mode": "compact-full",
       "snapshot-ram-dir": "/dev/shm/grimoire-snapshots",
-      "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/dflash-qwen-27B",
+      "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/dflash-pflash-qwen3.6-27B",
       "snapshot-ram-budget-gb": 20,
+      "snapshot-disk-budget-gb": 30,
+      "snapshot-disk-ttl-hours": 24,
       "snapshot-staging-slot": 7,
-      "prefix-cache-slots": 2,
+      "prefix-cache-slots": 0,
       "session-kv-slots": 4,
       "prefill-threshold": 48000,
       "prefill-keep-ratio": 0.05,
@@ -76,6 +79,8 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
   "fixed": {}
 }
 ```
+
+- Current migration policy: the served DFlash alias still points at the proven `.safetensors` draft, while the native GGUF draft path is canary-only until hardware decode verification is green.
 
 - `models` — definitions, no GPU assignment
 - `fixed` — alias → GPU ID (pinned, never evicted)
@@ -146,7 +151,7 @@ Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressi
 
 When a request includes the `conversation_recall` tool, Grimoire also injects a small DFlash runtime system note. It tells the model that older middle context may be compressed on long prompts and that exact older wording should be recovered with `conversation_recall` instead of assumed to be verbatim.
 
-**Tuned values**: `max-effective-context=100000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`.
+**Tuned values**: `max-effective-context=60000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `budget=18`.
 
 ### Session KV
 

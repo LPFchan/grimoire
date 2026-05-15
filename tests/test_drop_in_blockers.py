@@ -670,6 +670,24 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
         self.assertEqual(cfg["draft"], "gguf/Qwen3-0.6B-BF16.gguf")
 
+    def test_served_dflash_alias_stays_on_safetensors_until_gguf_cutover_is_proven(self):
+        data = json.loads((ROOT / "etc" / "models.json").read_text())
+        served = data["models"]["dflash-pflash-qwen3.6-27B"]
+        self.assertEqual(served["draft"], "dflash/Qwen3.6-27B-DFlash/model.safetensors")
+        self.assertNotIn("speculative-type", served)
+
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("the served DFlash alias still points at the proven `.safetensors` draft", readme)
+        self.assertIn("the native GGUF draft path is canary-only", readme)
+        self.assertIn('"dflash-pflash-qwen3.6-27B"', readme)
+        self.assertIn('"ctx-size": 60000', readme)
+        self.assertIn('"budget": 18', readme)
+
+        checklist = (ROOT / "MIGRATION_EXECUTION_CHECKLIST.md").read_text()
+        self.assertIn("served `.safetensors` draft remains pinned on `dflash-pflash-qwen3.6-27B`", checklist)
+        self.assertIn("streaming GGUF parsing instead of full-file reads", checklist)
+        self.assertIn("per-model shim FIFO bases, model-scoped `.kv` slot filenames", checklist)
+
     def test_phase0_checklist_includes_behavior_matrix_and_inventory(self):
         checklist = (ROOT / "MIGRATION_EXECUTION_CHECKLIST.md").read_text()
         self.assertIn("## Phase 0 Status Artifacts", checklist)
