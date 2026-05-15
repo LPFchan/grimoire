@@ -208,6 +208,7 @@ class ActiveModel:
             existing_pre = env.get("LD_PRELOAD", "")
             shim_path = config.PFLASH_SHIM_PATH
             env["LD_PRELOAD"] = f"{shim_path}:" + existing_pre if existing_pre else shim_path
+            env["PFLASH_SHIM_FIFO_BASE"] = f"/tmp/pflash_shim.{self.name}"
             logger.info(f"park-unpark enabled, LD_PRELOAD={env['LD_PRELOAD']}")
 
         logger.info(f"Starting {self.name} (llama) on GPU {self.gpu}, port {self.port}")
@@ -220,10 +221,11 @@ class ActiveModel:
         """Park llama-server GPU memory via shim FIFO (VMM unmap + host save)."""
         try:
             import os, select
-            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            base = f"/tmp/pflash_shim.{self.name}"
+            fd = os.open(f"{base}.ctl", os.O_WRONLY | os.O_NONBLOCK)
             os.write(fd, b"park\n")
             os.close(fd)
-            with open("/tmp/pflash_shim.ack", "r") as f:
+            with open(f"{base}.ack", "r") as f:
                 poll = select.poll()
                 poll.register(f, select.POLLIN)
                 if poll.poll(30000):
@@ -239,10 +241,11 @@ class ActiveModel:
         """Unpark llama-server GPU memory via shim FIFO (VMM remap + host restore)."""
         try:
             import os, select
-            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            base = f"/tmp/pflash_shim.{self.name}"
+            fd = os.open(f"{base}.ctl", os.O_WRONLY | os.O_NONBLOCK)
             os.write(fd, b"unpark\n")
             os.close(fd)
-            with open("/tmp/pflash_shim.ack", "r") as f:
+            with open(f"{base}.ack", "r") as f:
                 poll = select.poll()
                 poll.register(f, select.POLLIN)
                 if poll.poll(30000):

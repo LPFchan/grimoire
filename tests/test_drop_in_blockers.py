@@ -494,6 +494,7 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
         self.assertNotIn(mm_module.config.DFLASH_HOME, ld_library_path)
         self.assertEqual(captured["env"].get("LD_PRELOAD"), mm_module.config.PFLASH_SHIM_PATH)
+        self.assertEqual(captured["env"].get("PFLASH_SHIM_FIFO_BASE"), "/tmp/pflash_shim.pflash-park-qwen3.6-27B")
 
     def test_dflash_start_uses_model_scoped_snapshot_ram_dir(self):
         captured = {}
@@ -563,10 +564,23 @@ class DropInBlockerTests(unittest.TestCase):
 
     def test_pflash_shim_listener_uses_fifo_open_pattern_compatible_with_python_client(self):
         shim = (ROOT / "src" / "grimoire" / "dflash" / "pflash_shim.c").read_text()
-        self.assertIn('cf = open("/tmp/pflash_shim.ctl", O_RDWR);', shim)
-        self.assertIn('af = open("/tmp/pflash_shim.ack", O_WRONLY);', shim)
+        self.assertIn('static char ctl_path[256] = "/tmp/pflash_shim.ctl";', shim)
+        self.assertIn('static char ack_path[256] = "/tmp/pflash_shim.ack";', shim)
+        self.assertIn('const char *base = getenv("PFLASH_SHIM_FIFO_BASE");', shim)
+        self.assertIn('snprintf(ctl_path, sizeof(ctl_path), "%s.ctl", base);', shim)
+        self.assertIn('snprintf(ack_path, sizeof(ack_path), "%s.ack", base);', shim)
+        self.assertIn('cf = open(ctl_path, O_RDWR);', shim)
+        self.assertIn('af = open(ack_path, O_WRONLY);', shim)
         self.assertIn('close(af);', shim)
-        self.assertNotIn('af = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);', shim)
+        self.assertNotIn('af = open(ack_path, O_WRONLY | O_NONBLOCK);', shim)
+
+    def test_llama_proxy_scopes_slot_files_and_serializes_slot_zero_per_model(self):
+        llama_proxy = (ROOT / "src" / "grimoire" / "proxy" / "llama.py").read_text()
+        self.assertIn('return f"pflash-{model_safe}-{conv_safe}.kv"', llama_proxy)
+        self.assertIn('lock = getattr(active, "_pflash_slot_lock", None)', llama_proxy)
+        self.assertIn('await slot_guard.acquire()', llama_proxy)
+        self.assertIn('slot_guard.release()', llama_proxy)
+        self.assertIn('kv_name = _slot_save_key(active, validated_conversation_id)', llama_proxy)
 
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:

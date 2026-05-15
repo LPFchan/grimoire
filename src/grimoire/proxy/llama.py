@@ -19,20 +19,44 @@ from grimoire.registry import BACKEND_DFLASH, resolve_path
 logger = logging.getLogger(__name__)
 
 
-def _kv_filename(conversation_id: str) -> str:
-    raw = str(conversation_id)
+def _sanitize_slot_component(value: str) -> str:
+    raw = str(value)
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
     safe = safe.strip("_-") or "conversation"
     if safe != raw or len(safe) > 96:
         digest = hashlib.sha1(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
         safe = f"{safe[:96].rstrip('_-') or 'conversation'}-{digest}"
-    return f"pflash-{safe}.kv"
+    return safe
 
 
-def _has_saved_kv(conversation_id: str) -> bool:
+def _kv_filename(model_name: str, conversation_id: str) -> str:
+    model_safe = _sanitize_slot_component(model_name)
+    conv_safe = _sanitize_slot_component(conversation_id)
+    return f"pflash-{model_safe}-{conv_safe}.kv"
+
+
+def _slot_lock(active):
+    lock = getattr(active, "_pflash_slot_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(active, "_pflash_slot_lock", lock)
+    return lock
+
+
+def _slot_save_key(active, conversation_id: str) -> str:
+    return _kv_filename(active.name, conversation_id)
+
+
+def _has_saved_kv(active, conversation_id: str) -> bool:
     if not conversation_id:
         return False
-    return os.path.isfile(f"/dev/shm/grimoire-slots/{_kv_filename(conversation_id)}")
+    return os.path.isfile(f"/dev/shm/grimoire-slots/{_slot_save_key(active, conversation_id)}")
+
+
+def _maybe_kv_save_key(active, conversation_id: str | None) -> str | None:
+    if not conversation_id:
+        return None
+    return _slot_save_key(active, conversation_id)
 
 
 def _backend_request_headers(headers):
@@ -91,8 +115,9 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 tokenizer, messages, add_generation_prompt=True,
                 model_cfg=model_cfg, active=active,
             )
+            _kv_save_key = _maybe_kv_save_key(active, validated_conversation_id)
             if len(prompt_ids) > pcfg.threshold:
-                is_warm = _has_saved_kv(validated_conversation_id)
+                is_warm = _has_saved_kv(active, validated_conversation_id)
 
                 if not is_warm:
                     # ── COLD TURN: park + full compress + unpark ────────────
@@ -158,7 +183,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
                     if validated_conversation_id:
-                        _kv_save_key = _kv_filename(validated_conversation_id)
+                        _kv_save_key = _slot_save_key(active, validated_conversation_id)
                         log.warning(f"pflash kv: will save as {_kv_save_key}")
         except Exception as e:
             _log = __import__('logging').getLogger(__name__)
@@ -166,34 +191,40 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
     client = httpx.AsyncClient(timeout=None)
     try:
-        payload = await plugin_manager.before_backend_request(
-            payload, active.name, model_cfg, backend_model_id, client, url, headers
-        )
+        slot_guard = _slot_lock(active)
+        await slot_guard.acquire()
+        try:
+            payload = await plugin_manager.before_backend_request(
+                payload, active.name, model_cfg, backend_model_id, client, url, headers
+            )
 
-        # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
-        log.warning(f"pflash kv: validated key = {validated_conversation_id}")
-        if validated_conversation_id:
-            kv_name = _kv_filename(validated_conversation_id)
-            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
-            try:
-                rr = await client.post(f"{slot_url}?action=restore",
-                    json={"filename": kv_name}, timeout=5)
-                log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
-                if rr.status_code == 200:
-                    _kv_save_key = _kv_save_key or kv_name
-                    log.warning(f"pflash kv: restored {kv_name}")
-            except Exception as e:
-                log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
+            # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
+            log.warning(f"pflash kv: validated key = {validated_conversation_id}")
+            if validated_conversation_id:
+                kv_name = _slot_save_key(active, validated_conversation_id)
+                slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+                try:
+                    rr = await client.post(f"{slot_url}?action=restore",
+                        json={"filename": kv_name}, timeout=5)
+                    log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
+                    if rr.status_code == 200:
+                        _kv_save_key = _kv_save_key or kv_name
+                        log.warning(f"pflash kv: restored {kv_name}")
+                except Exception as e:
+                    log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
 
-        upstream = await client.send(
-            client.build_request(
-                "POST",
-                url,
-                headers=headers,
-                json=payload,
-            ),
-            stream=True,
-        )
+            upstream = await client.send(
+                client.build_request(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=payload,
+                ),
+                stream=True,
+            )
+        except Exception:
+            slot_guard.release()
+            raise
     except Exception:
         await client.aclose()
         raise
@@ -247,6 +278,10 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             log.warning(f"pflash kv: saved {_kv_save_key}")
                 except Exception as e:
                     log.warning(f"pflash kv: save failed for {_kv_save_key}: {e}")
+                finally:
+                    slot_guard.release()
+            else:
+                slot_guard.release()
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")
