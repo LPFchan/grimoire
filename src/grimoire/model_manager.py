@@ -513,12 +513,58 @@ class ModelManager:
 
     def _find_available_port(self, gpu_id):
         """Find an available port for a model on a given GPU."""
+        return self._find_available_port_excluding(gpu_id)
+
+    def _find_available_port_excluding(self, gpu_id, ignore_ports=None):
+        """Find an available port for a model on a given GPU, excluding known victims."""
+        ignored = {port for port in (ignore_ports or set()) if port is not None}
         port = 8001 + gpu_id * 10
         for _ in range(100):
-            if not any(m.port == port for m in self.active.values()):
+            if port in ignored:
+                return port
+            if not any(m.port == port for m in self.active.values() if m.port not in ignored):
                 return port
             port += 1
         raise RuntimeError("No available ports found")
+
+    @staticmethod
+    def _startup_timeout(cfg):
+        startup_timeout = cfg.get("startup-timeout", config.DEFAULT_STARTUP_TIMEOUT)
+        try:
+            return float(startup_timeout)
+        except (TypeError, ValueError):
+            return float(config.DEFAULT_STARTUP_TIMEOUT)
+
+    async def _start_active_model(self, active: ActiveModel):
+        """Start an ActiveModel and wait until it is ready."""
+        active.status = config.MODEL_STATUS_LOADING
+        is_dflash = active.backend_type == BACKEND_DFLASH
+
+        logger.warning(f"pflash: cfg.pflash={active.cfg.get('pflash')}, is_dflash={is_dflash}")
+        if active.cfg.get("pflash") and not is_dflash:
+            await asyncio.to_thread(active._start_pflash_daemon)
+            logger.warning(f"pflash: daemon started for {active.name}")
+
+        await asyncio.to_thread(active.start)
+        await active.wait_ready(timeout=self._startup_timeout(active.cfg))
+        active.status = config.MODEL_STATUS_LOADED
+
+    async def _restore_incumbents(self, incumbents):
+        """Best-effort restart of incumbents evicted during failed replacement startup."""
+        errors = []
+        for name, incumbent in incumbents:
+            try:
+                await self._start_active_model(incumbent)
+            except Exception as e:
+                incumbent.status = config.MODEL_STATUS_FAILED
+                try:
+                    await asyncio.to_thread(incumbent.stop)
+                except Exception:
+                    pass
+                if self.active.get(name) is incumbent:
+                    self.active.pop(name, None)
+                errors.append(f"{name}: {e}")
+        return errors
 
     async def start_model(self, model_name):
         """Start a model with GPU allocation priority: pinned, free, oldest eviction."""
@@ -542,6 +588,7 @@ class ModelManager:
             if not valid:
                 raise RuntimeError(reason)
 
+            incumbents = []
             pinned_gpu = registry.get_fixed_gpu(model_name)
             if pinned_gpu is not None:
                 if pinned_gpu >= self.gpu_count:
@@ -552,50 +599,44 @@ class ModelManager:
                         continue
                     if registry.is_fixed(name):
                         raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {gpu}")
-                    logger.info(f"Evicting {name} from GPU {gpu} for pinned model {model_name}")
-                    await asyncio.to_thread(active.stop)
-                    del self.active[name]
+                    incumbents.append((name, active))
             else:
                 gpu = self._find_free_gpu()
                 if gpu is None:
                     victim = self._find_oldest_evictable()
                     if not victim:
                         raise RuntimeError("All GPUs occupied by pinned models")
-                    logger.info(f"Evicting {victim.name} from GPU {victim.gpu} (oldest load)")
-                    await asyncio.to_thread(victim.stop)
-                    del self.active[victim.name]
+                    incumbents.append((victim.name, victim))
                     gpu = victim.gpu
 
             is_dflash = cfg.get("backend") == BACKEND_DFLASH
-            port = None if is_dflash else self._find_available_port(gpu)
+            ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
+            port = None if is_dflash else self._find_available_port_excluding(gpu, ignored_ports)
             active = ActiveModel(model_name, cfg, port, gpu)
-            self.active[model_name] = active
 
-            # Start pflash daemon BEFORE the backend to get contiguous VRAM
-            logger.warning(f"pflash: cfg.pflash={cfg.get('pflash')}, is_dflash={is_dflash}")
-            if cfg.get("pflash") and not is_dflash:
-                try:
-                    await asyncio.to_thread(active._start_pflash_daemon)
-                    logger.warning(f"pflash: daemon started for {model_name}")
-                except Exception:
-                    self.active.pop(model_name, None)
-                    raise
-
-            await asyncio.to_thread(active.start)
             try:
-                startup_timeout = cfg.get("startup-timeout", config.DEFAULT_STARTUP_TIMEOUT)
-                try:
-                    startup_timeout = float(startup_timeout)
-                except (TypeError, ValueError):
-                    startup_timeout = config.DEFAULT_STARTUP_TIMEOUT
-                await active.wait_ready(timeout=startup_timeout)
-            except Exception:
+                for name, incumbent in incumbents:
+                    logger.info(f"Evicting {name} from GPU {gpu} for replacement model {model_name}")
+                    await asyncio.to_thread(incumbent.stop)
+                self.active[model_name] = active
+                await self._start_active_model(active)
+            except Exception as e:
                 active.status = config.MODEL_STATUS_FAILED
-                await asyncio.to_thread(active.stop)
+                try:
+                    await asyncio.to_thread(active.stop)
+                except Exception:
+                    pass
                 self.active.pop(model_name, None)
+                rollback_errors = await self._restore_incumbents(incumbents)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"{e}; rollback failed for evicted incumbents: {'; '.join(rollback_errors)}"
+                    ) from e
                 raise
 
-            active.status = config.MODEL_STATUS_LOADED
+            for name, incumbent in incumbents:
+                if self.active.get(name) is incumbent:
+                    self.active.pop(name, None)
             logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
             return active
 

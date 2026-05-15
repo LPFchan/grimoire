@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 import shutil
@@ -185,6 +186,124 @@ class DropInBlockerTests(unittest.TestCase):
             self.assertTrue(stopped)
             self.assertTrue(active.stopped)
             self.assertNotIn("canonical", manager.active)
+        finally:
+            mm_module.registry = old_registry
+
+    def test_start_model_rolls_back_oldest_eviction_when_replacement_fails(self):
+        class FakeRegistry:
+            def resolve(self, name):
+                return name
+
+            def get(self, name):
+                return {"file": "replacement.gguf"}
+
+            def validate(self, name, gpu_count=None):
+                return True, "OK"
+
+            def get_fixed_gpu(self, name):
+                return None
+
+            def is_fixed(self, name):
+                return False
+
+        class FakeIncumbent:
+            def __init__(self):
+                self.name = "incumbent"
+                self.cfg = {"file": "incumbent.gguf"}
+                self.gpu = 0
+                self.port = 8001
+                self.backend_type = "llama"
+                self.started = datetime.now(timezone.utc)
+                self.stop_calls = 0
+                self.restarted = 0
+                self.status = None
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def is_running(self):
+                return True
+
+        async def fake_start_active_model(active):
+            if active.name == "replacement":
+                raise RuntimeError("replacement boom")
+            active.restarted += 1
+
+        old_registry = mm_module.registry
+        try:
+            mm_module.registry = FakeRegistry()
+            manager = entrypoint.ModelManager(gpu_count=1)
+            incumbent = FakeIncumbent()
+            manager.active[incumbent.name] = incumbent
+
+            with patch.object(manager, "_start_active_model", side_effect=fake_start_active_model):
+                with self.assertRaises(RuntimeError) as cm:
+                    asyncio.run(manager.start_model("replacement"))
+
+            self.assertIn("replacement boom", str(cm.exception))
+            self.assertIs(manager.active.get("incumbent"), incumbent)
+            self.assertNotIn("replacement", manager.active)
+            self.assertEqual(incumbent.stop_calls, 1)
+            self.assertEqual(incumbent.restarted, 1)
+        finally:
+            mm_module.registry = old_registry
+
+    def test_start_model_rolls_back_pinned_gpu_eviction_when_replacement_fails(self):
+        class FakeRegistry:
+            def resolve(self, name):
+                return name
+
+            def get(self, name):
+                return {"file": "replacement.gguf"}
+
+            def validate(self, name, gpu_count=None):
+                return True, "OK"
+
+            def get_fixed_gpu(self, name):
+                return 0 if name == "replacement" else None
+
+            def is_fixed(self, name):
+                return False
+
+        class FakeIncumbent:
+            def __init__(self):
+                self.name = "incumbent"
+                self.cfg = {"file": "incumbent.gguf"}
+                self.gpu = 0
+                self.port = 8001
+                self.backend_type = "llama"
+                self.started = datetime.now(timezone.utc)
+                self.stop_calls = 0
+                self.restarted = 0
+                self.status = None
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def is_running(self):
+                return True
+
+        async def fake_start_active_model(active):
+            if active.name == "replacement":
+                raise RuntimeError("replacement boom")
+            active.restarted += 1
+
+        old_registry = mm_module.registry
+        try:
+            mm_module.registry = FakeRegistry()
+            manager = entrypoint.ModelManager(gpu_count=1)
+            incumbent = FakeIncumbent()
+            manager.active[incumbent.name] = incumbent
+
+            with patch.object(manager, "_start_active_model", side_effect=fake_start_active_model):
+                with self.assertRaises(RuntimeError) as cm:
+                    asyncio.run(manager.start_model("replacement"))
+
+            self.assertIn("replacement boom", str(cm.exception))
+            self.assertIs(manager.active.get("incumbent"), incumbent)
+            self.assertNotIn("replacement", manager.active)
+            self.assertEqual(incumbent.stop_calls, 1)
+            self.assertEqual(incumbent.restarted, 1)
         finally:
             mm_module.registry = old_registry
 
