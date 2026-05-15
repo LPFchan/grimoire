@@ -179,8 +179,8 @@ def _delta_sse(completion_id, created, content, index=0):
     }
 
 
-def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content, ctx_size):
-    return {
+def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content, ctx_size, cached_tokens=None):
+    payload = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
@@ -197,3 +197,6 @@ def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content
         },
         "context_window": ctx_size,
     }
+    if cached_tokens is not None:
+        payload["usage"]["cached_tokens"] = cached_tokens
+    return payload

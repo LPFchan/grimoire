@@ -8,6 +8,7 @@ import logging
 import os
 
 import httpx
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
@@ -102,12 +103,15 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
     # PFlash compression: if the model has a pflash daemon and the prompt
     # exceeds the threshold, compress before proxying to llama-server.
+    # Compression is mandatory once the threshold is hit. If the daemon is
+    # unavailable or compression fails, reject the request instead of silently
+    # bypassing the long-prompt path.
     daemon = getattr(active, 'pflash_daemon', None)
     pcfg = getattr(active, 'prefill_config', None)
     log = logging.getLogger(__name__)
     log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
 
-    if daemon and daemon.is_running() and pcfg and pcfg.enabled:
+    if pcfg and pcfg.enabled:
         try:
             tokenizer = active.get_tokenizer()
             messages = payload.get("messages", [])
@@ -116,7 +120,18 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 model_cfg=model_cfg, active=active,
             )
             _kv_save_key = _maybe_kv_save_key(active, validated_conversation_id)
-            if len(prompt_ids) > pcfg.threshold:
+            if len(prompt_ids) >= pcfg.threshold:
+                if not daemon or not daemon.is_running():
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            f"pflash compression required for {active.name} "
+                            f"(prompt={len(prompt_ids)} >= threshold={pcfg.threshold}) "
+                            "but pflash daemon is not running. Check that the drafter model "
+                            "file exists and the daemon started at model load time."
+                        ),
+                    )
+
                 is_warm = _has_saved_kv(active, validated_conversation_id)
 
                 if not is_warm:
@@ -134,6 +149,11 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         compressed_ids, fired, blocks = await maybe_compress(
                             prompt_ids, daemon, pcfg, blocks=prompt_blocks,
                         )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"pflash compression failed for {active.name}: {e}",
+                        )
                     finally:
                         if park_ok:
                             try:
@@ -145,16 +165,18 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 else:
                     # ── WARM TURN: skip park, only compress delta blocks ────
                     log.warning(f"pflash warm: KV cache exists for {validated_conversation_id}")
-                    compressed_ids, fired, blocks = await maybe_compress(
-                        prompt_ids, daemon, pcfg, blocks=prompt_blocks,
-                    )
+                    try:
+                        compressed_ids, fired, blocks = await maybe_compress(
+                            prompt_ids, daemon, pcfg, blocks=prompt_blocks,
+                        )
+                    except Exception as e:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=f"pflash compression failed for {active.name}: {e}",
+                        )
 
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
                 if fired:
-                    # Reconstruct messages preserving roles and tool call metadata.
-                    # Group compressed block tokens by original message boundary,
-                    # decode each message's tokens once (avoids BPE boundary artifacts
-                    # from per-block decode), then emit messages in original order.
                     msg_groups: dict[int, dict] = {}
                     for block in blocks:
                         if block.kind == "generation_prompt":
@@ -164,30 +186,51 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             msg_groups[key] = {
                                 "role": block.role,
                                 "token_ids": [],
-                                "metadata": block.metadata or {},
+                                "metadata": {},
+                                "has_tool_calls": False,
+                                "has_reasoning": False,
+                                "tool_calls": [],
                             }
                         msg_groups[key]["token_ids"].extend(
                             compressed_ids[block.start:block.end]
                         )
+                        meta = block.metadata or {}
+                        if meta.get("reasoning"):
+                            msg_groups[key]["has_reasoning"] = True
+                        if block.kind == "tool_call":
+                            msg_groups[key]["has_tool_calls"] = True
+                            tool_name = meta.get("tool_name")
+                            if tool_name:
+                                msg_groups[key]["tool_calls"].append({
+                                    "name": tool_name,
+                                })
+                        msg_groups[key]["metadata"].update(meta)
                     new_messages = []
                     for key in sorted(msg_groups):
                         m = msg_groups[key]
                         text = tokenizer.decode(m["token_ids"])
                         entry: dict = {"role": m["role"], "content": text}
-                        # Propagate tool_call/reasoning metadata from block metadata
-                        for md_key in ("tool_calls", "reasoning_content", "tool_call_id",
-                                       "name", "tool_names", "message_indexes"):
+                        for md_key in ("reasoning_content", "tool_call_id",
+                                       "tool_names", "message_indexes"):
                             if md_key in m["metadata"]:
                                 entry[md_key] = m["metadata"][md_key]
+                        if m["has_reasoning"]:
+                            entry["reasoning_content"] = text
+                        if m["has_tool_calls"]:
+                            entry["tool_calls"] = m["tool_calls"]
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
                     if validated_conversation_id:
                         _kv_save_key = _slot_save_key(active, validated_conversation_id)
                         log.warning(f"pflash kv: will save as {_kv_save_key}")
+        except HTTPException:
+            raise
         except Exception as e:
-            _log = __import__('logging').getLogger(__name__)
-            _log.warning(f"PFlash compression failed for {active.name}: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"pflash compression setup failed for {active.name}: {e}",
+            )
 
     client = httpx.AsyncClient(timeout=None)
     try:

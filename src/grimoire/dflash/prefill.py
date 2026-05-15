@@ -164,13 +164,21 @@ def _protected_block_indexes(blocks: list[PromptBlock], tail_budget: int) -> set
     if not content_indexes:
         return protected
 
-    head_count = 2 if len(content_indexes) >= 2 else 1
-    protected.update(content_indexes[:head_count])
+    msg_groups: dict[int, list[int]] = {}
+    for idx in content_indexes:
+        key = blocks[idx].message_start
+        msg_groups.setdefault(key, []).append(idx)
+
+    msg_keys = sorted(msg_groups)
+
+    head_count = 2 if len(msg_keys) >= 2 else 1
+    for msg_key in msg_keys[:head_count]:
+        protected.update(msg_groups[msg_key])
 
     tail_so_far = 0
-    for index in reversed(content_indexes[head_count:]):
-        protected.add(index)
-        tail_so_far += blocks[index].token_count
+    for msg_key in reversed(msg_keys[head_count:]):
+        tail_so_far += sum(blocks[idx].token_count for idx in msg_groups[msg_key])
+        protected.update(msg_groups[msg_key])
         if tail_so_far > tail_budget:
             break
 

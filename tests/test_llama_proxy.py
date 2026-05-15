@@ -2,6 +2,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from fastapi import HTTPException
 from pathlib import Path
 from unittest.mock import patch
 
@@ -124,15 +125,13 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=fake_before_backend_request), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda stream, *_: stream), \
              patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient):
-            response = await llama_proxy._proxy_chat(active.name, payload, active, user_hash=None, conversation_id="conv-1")
-            chunks = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk)
+            with self.assertRaises(HTTPException) as cm:
+                await llama_proxy._proxy_chat(active.name, payload, active, user_hash=None, conversation_id="conv-1")
 
         self.assertEqual(active._park_calls, 1)
         self.assertEqual(active._unpark_calls, 1)
-        body = b"".join(chunks).decode()
-        self.assertIn("ok", body)
+        self.assertEqual(cm.exception.status_code, 503)
+        self.assertIn("pflash compression failed", cm.exception.detail)
 
     async def test_slot_restore_and_save_use_validated_conversation_id(self):
         active = _FakeActive()
