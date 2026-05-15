@@ -936,6 +936,18 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64", dockerfile)
         self.assertNotIn("LD_LIBRARY_PATH=/opt/dflash:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64", dockerfile)
 
+    def test_preserved_dflash_binaries_and_lib_dir_are_individually_configurable(self):
+        config_src = (ROOT / "src" / "grimoire" / "config.py").read_text()
+        daemon_src = (ROOT / "src" / "grimoire" / "dflash" / "daemon.py").read_text()
+
+        self.assertIn('DFLASH_LIB_DIR = os.environ.get("GRIMOIRE_DFLASH_LIB_DIR", DFLASH_HOME)', config_src)
+        self.assertIn('DFLASH_BIN = os.environ.get("GRIMOIRE_DFLASH_BIN", os.path.join(DFLASH_HOME, "dflash"))', config_src)
+        self.assertIn('PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(DFLASH_HOME, "pflash_daemon"))', config_src)
+        self.assertIn('PFLASH_SHIM_PATH = os.environ.get("GRIMOIRE_PFLASH_SHIM_PATH", os.path.join(DFLASH_HOME, "pflash_shim.so"))', config_src)
+        self.assertIn('cmd = [config.DFLASH_BIN, self.target_path]', daemon_src)
+        self.assertIn('_prepend_library_dir(env, config.DFLASH_LIB_DIR)', daemon_src)
+        self.assertIn('config.PFLASH_DAEMON_BIN', daemon_src)
+
 
 if __name__ == "__main__":
     unittest.main()
