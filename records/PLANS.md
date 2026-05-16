@@ -6,16 +6,40 @@
 - **Outcome:** DFlash decode, compact-full persistence, and preserved PFlash all run on the canonical TheTom base; Lucebox retired
 - **Why accepted:** Single canonical llama.cpp fork, no `/opt/dflash` in served runtime, unified control plane
 - **Value:** Simpler build, smaller runtime image, reduced operational surface
-- **Preconditions:** All upstream repos pinned by SHA (done), TheTom native binary builds (pending)
+- **Preconditions:** All upstream repos pinned by SHA (done), TheTom native binary builds (done)
+
+### Port Bee's DFlash Pipeline Onto TheTom
+- **Outcome:** Native canary generates valid draft tokens and achieves speculative decode speedup
+- **Why accepted:** Our simplified DFlash patch produces garbage draft tokens. Bee's implementation is user-verified working with Buun's GGUF
+- **Root cause:** Flat `vector<float> history` capture is incorrect — Bee uses a ring buffer with incremental prefill population and a `prepare_batch_draft()` step that our port omitted
+- **Value:** Working DFlash decode on TheTom turboquant base; unlocks Phase 3-7
+- **Preconditions:** Buun's `dflash-draft-3.6-q8_0.gguf` validated (done: arch `dflash-draft`, full tokenizer, 58 tensors)
 
 ## Sequencing
 
 ### Near term
 
-- [ ] Build TheTom native binary with `patches/spec-dflash-contract.patch`
-- [ ] Launch `dflash-native-qwen3.6-27B-canary` on isolated GPU
-- [ ] Prove or disprove the native DFlash decode path on real hardware
-- [ ] Phase 2 hardware sign-off: decode, TTFT, correctness
+- [ ] Phase 1: Core DFlash decode pipeline (est. 4 days)
+  - [ ] 1.1 Port `build_cross_data()` — ring-to-cross-data assembly
+  - [ ] 1.2 Port `prepare_batch_draft()` — separate cross-data setup from decode
+  - [ ] 1.3 Fix `draft()` — proper batch sizing, cross-data usage
+  - [ ] 1.4 Port `flush_prefill()` — incremental ring population during prefill
+  - [ ] 1.5 Port `capture_target_hiddens()` — ring-based (replace flat history)
+  - [ ] 1.6 Fix server `n_draft_max` — cap to `block_size - 1`
+  - [ ] 1.7 Wire `common_speculative_draft()` return path properly
+- [ ] Phase 2: Server integration (est. 5 days)
+  - [ ] 2.1 Port `dflash_reduced_verify_plan()`
+  - [ ] 2.2 Port `dflash_sample_reduced_verify()`
+  - [ ] 2.3 Multi-slot setup — shared drafter ctx, `llama_dflash_allocate_slots()`
+  - [ ] 2.4 Verification loop — set verify flags, consume reduced logits
+  - [ ] 2.5 Accept path — `dflash_set_active_slot()`, `dflash_rollback()`, ring updates
+- [ ] Phase 3: Supporting infrastructure (est. 5.5 days)
+  - [ ] 3.1 Ring buffer data structures
+  - [ ] 3.2 `dflash_eval_callback()` — graph-level hidden capture
+  - [ ] 3.3 `set_dflash_capture()` + GPU capture variant
+  - [ ] 3.4 `llama_set_cross_data_seq()` improvements
+  - [ ] 3.5 `dflash_kv_cache_init/update/reset` — K/V projection cache (CPU first)
+- [ ] Verify: short-prompt decode with positive `#gen drafts` and speedup >1.5x
 
 ### Mid term
 
@@ -45,6 +69,10 @@
 - Exit: no served path relies on `/opt/dflash`; test defaults map to real model IDs
 
 ### Deferred
+
+**GPU ring buffer** (`cross-ring-interleave.cu`) — CPU fallback works for initial decode
+**GPU tape recording** (`dflash_tape_*`) — only needed for tree-mode DDTree verify
+**Multi-spec batched decode** (`common_speculative_draft_batch()`) — single-spec is sufficient for MVP
 
 **Phase 6 — Optional Runtime Optimizations**
 - VMM-based park/unpark (preferred only if isolated measurement proves gain)

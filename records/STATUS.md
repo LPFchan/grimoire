@@ -60,10 +60,17 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 - No trustworthy cold moderate/long-prompt restore baseline (served DFlash sessions hit GPU memory failures).
 - No final stable five-run median set (intermittent daemon/OOM failures even on short runs).
 
+## Active Blocker
+
+1. **Native canary produces garbage draft tokens** (confirmed: `dflash draft decode failed: -1` → `invalid token[1] = -1079354870`). Root cause: our simplified DFlash patch omitted Bee's `prepare_batch_draft()` and ring buffer. Plan: port Bee's pipeline (~2000 lines, estimated 14 days total over 3 phases).
+
 ## Immediate Next Steps
 
-1. ✅ Build TheTom native binary with DFlash flags (done: `tmp/thetom-bin/bin/llama-server`)
-2. ✅ Launch `dflash-native-qwen3.6-27B-canary` on GPU 1 (port 9002)
-3. ✅ Native pipeline loads both models on single 3090 and serves requests
-4. 🔴 DFlash draft decode returns `-1` — generates 0 speculative tokens, falls back to autoregressive (~40 tok/s)
-5. Debug the DFlash draft runtime: `init: invalid token[0]` and `dflash draft decode failed: -1` suggest a tensor shape mismatch in the hidden state capture path
+1. ✅ Build TheTom native binary (done: `tmp/thetom-bin/bin/llama-server`)
+2. ✅ Launch native canary on GPU 1 (port 9002)
+3. ✅ Buun's GGUF downloads and loads correctly (arch `dflash-draft`, 496K tokenizer)
+4. 🔴 Port Bee's DFlash pipeline — Phase 1: core decode (4 days)
+   - build_cross_data(), prepare_batch_draft(), fixed draft(), flush_prefill()
+5. Phase 2: server integration (5 days)
+6. Phase 3: supporting infrastructure (5.5 days)
+7. Verify: short-prompt decode with positive #gen drafts and >1.5x speedup
