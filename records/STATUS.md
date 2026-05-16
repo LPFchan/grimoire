@@ -53,7 +53,7 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 ## Active Blockers
 
 1. **Fresh-state memory wall (lucebox path):** Served DFlash OOMs on 3090 above ~319 prompt tokens on fresh-state turn-1, even after Q8_0 rollback fix. Next failure band at ~385 tokens. Hardware-gating Phase 2/3 sign-off.
-2. **Native canary untested:** The TheTom native binary has never been built and tested with the canary config on GPU. This is the primary path forward — the native TheTom code path may not have the same rollback allocation issue.
+2. **Native canary untested:** The TheTom native binary is now built at `/home/yeowool/grimoire-refactor/tmp/thetom-bin/bin/llama-server` (2026-05-16). DFlash flags confirmed (`--spec-type dflash`, `--spec-draft-model`, `--spec-dflash-cross-ctx`). Ready for GPU launch testing.
 
 ## Remaining Baseline Gaps
 
@@ -62,7 +62,7 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Immediate Next Steps
 
-1. Build TheTom native binary with `patches/spec-dflash-contract.patch`
-2. Launch `dflash-native-qwen3.6-27B-canary` on isolated GPU
+1. ✅ Build TheTom native binary with DFlash flags (done: `tmp/thetom-bin/bin/llama-server`)
+2. Launch `dflash-native-qwen3.6-27B-canary` on isolated GPU (port 9002)
 3. If native path works, begin hardware verification of the full suite
 4. If native path hits memory wall, investigate TheTom's rollback/verify allocation vs lucebox path
