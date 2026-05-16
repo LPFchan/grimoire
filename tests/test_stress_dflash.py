@@ -38,6 +38,22 @@ FIXTURES_DIR = Path(
 )
 MODEL = os.environ.get("STRESS_MODEL", "dflash-pflash-qwen3.6-27B")
 MAX_TOKENS = int(os.environ.get("STRESS_MAX_TOKENS", "64"))
+CONTAINER_NAME = os.environ.get("GRIMOIRE_SMOKE_CONTAINER", "grimoire")
+
+
+def _headers():
+    return {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
+
+def _create_conversation(model: str) -> str:
+    response = httpx.post(
+        f"{BASE_URL}/history",
+        json={"title": f"stress-{uuid.uuid4()}", "model": model, "messages": []},
+        headers=_headers(),
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    return response.json()["id"]
 
 
 def _find_largest_fixture() -> Path:
@@ -73,13 +89,14 @@ def _send_turn(model: str, messages: list[dict], conversation_id: str | None = N
     if conversation_id:
         payload["conversation_id"] = conversation_id
 
-    headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+    headers = _headers()
 
     t0 = time.monotonic()
     first_byte_at = None
     last_chunk_at = None
     text_parts = []
     usage = {"completion_tokens": 0}
+    error_message = None
 
     with httpx.stream(
         "POST",
@@ -101,6 +118,9 @@ def _send_turn(model: str, messages: list[dict], conversation_id: str | None = N
                 frame = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            error = frame.get("error") if isinstance(frame, dict) else None
+            if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+                error_message = error["message"]
             delta = frame.get("choices", [{}])[0].get("delta", {})
             if delta.get("content"):
                 text_parts.append(delta["content"])
@@ -120,14 +140,15 @@ def _send_turn(model: str, messages: list[dict], conversation_id: str | None = N
         "decode_time_ms": decode_time * 1000,
         "total_time_ms": total_time * 1000,
         "decode_tps": completion_tokens / decode_time if decode_time > 0 else 0,
+        "error": error_message,
     }
 
 
 def _snapshot_store_usage():
-    """Return (ram_mb, disk_mb) for the snapshot store inside the container."""
+    """Return (ram_mb, disk_mb) for the snapshot store inside the target container."""
     try:
         ram = subprocess.run(
-            ["docker", "exec", "grimoire", "du", "-sm", "/dev/shm/grimoire-snapshots/"],
+            ["docker", "exec", CONTAINER_NAME, "du", "-sm", "/dev/shm/grimoire-snapshots/"],
             capture_output=True, text=True,
         )
         ram_mb = int(ram.stdout.split()[0]) if ram.returncode == 0 else 0
@@ -136,7 +157,7 @@ def _snapshot_store_usage():
 
     try:
         disk = subprocess.run(
-            ["docker", "exec", "grimoire", "du", "-sm", "/var/lib/grimoire/snapshot_swap/"],
+            ["docker", "exec", CONTAINER_NAME, "du", "-sm", "/var/lib/grimoire/snapshot_swap/"],
             capture_output=True, text=True,
         )
         disk_mb = int(disk.stdout.split()[0]) if disk.returncode == 0 else 0
@@ -164,7 +185,7 @@ class DFlashStressTest(unittest.TestCase):
 
         cls.fixture_path = _find_largest_fixture()
         cls.fixture_messages = _normalize_fixture(cls.fixture_path)
-        cls.conversation_id = str(uuid.uuid4())
+        cls.conversation_id = _create_conversation(MODEL)
         cls.results = []
 
         print(f"\n{'='*60}")
@@ -223,7 +244,7 @@ class DFlashStressTest(unittest.TestCase):
                 self.assertGreater(ram_after + disk_after, 0, "No snapshot files created")
 
             # Sanity: response should not be empty
-            self.assertTrue(result["text"], f"Turn {turn_count} produced empty response")
+            self.assertTrue(result["text"], result.get("error") or f"Turn {turn_count} produced empty response")
 
             # Append assistant response to message history for next turn
             messages.append({"role": "assistant", "content": result["text"]})

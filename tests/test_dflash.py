@@ -2345,6 +2345,7 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         boundary = daemon.last_cmd_args["snap_pos"]
         self.assertEqual(daemon.last_cmd_args["snap_slot"], active.snapshot_staging_slot)
         self.assertGreater(boundary, 0)
+        self.assertEqual(daemon.snapshots, [])
         self.assertEqual(len(daemon.saved_snapshots), 1)
 
         prefix_key = active.prefix_cache.lookup(daemon.last_cmd_args["prompt_ids"], boundaries=[boundary])[0]

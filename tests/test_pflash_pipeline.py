@@ -13,6 +13,7 @@ Environment:
     THRESHOLD   Min tokens to trigger compression (default: auto from cfg)
     TURNS       Number of conversation turns (default: 0 = single)
     TIMEOUT     Request timeout seconds (default: 600)
+    GPU_INDEX   Host GPU index for VRAM sampling (default: 0)
 """
 
 import httpx
@@ -34,6 +35,7 @@ MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "30"))
 TARGET_CHARS = int(os.environ.get("TARGET_CHARS", "200000"))
 TURNS = int(os.environ.get("TURNS", "0"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "600"))
+GPU_INDEX = os.environ.get("GPU_INDEX", "0")
 FIXTURES = Path(os.environ.get("FIXTURES", "/home/yeowool/opencode_splits"))
 H = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
 
@@ -121,7 +123,7 @@ def build_multi_turn_prompt(chars, turns):
 
 def vram_mb():
     out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", "0"],
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits", "-i", GPU_INDEX],
         capture_output=True, text=True,
     )
     return int(out.stdout.strip() or 0)

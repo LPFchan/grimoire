@@ -335,38 +335,31 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 tps = len(tokens_emitted) / elapsed
 
-                # Save snapshot before the zero-token guard so existing sessions
-                # always persist even when no new tokens are generated (e.g. a
-                # stop-token-only follow-up turn).
+                # Save snapshots before the zero-token guard so existing sessions
+                # still persist even when no new tokens are generated (e.g. a
+                # stop-token-only follow-up turn). One-off requests must not
+                # take an unsaved staging snapshot, or slot 7 remains resident.
                 try:
                     prefix_snapshot_written = False
+                    need_session_snapshot = bool(
+                        conversation_id and sk and store and (tokens_emitted or had_session)
+                    )
                     if prepared_prefix is not None:
                         await asyncio.to_thread(store.save, daemon, prefix_snapshot_key, staging_slot)
                         prefix_snapshot_written = True
 
-                    if tokens_emitted or had_session:
+                    if need_session_snapshot:
                         await asyncio.to_thread(daemon.snapshot, staging_slot)
-                        if conversation_id and sk and store:
-                            evicted_id = sk.evict_lru_if_full(conversation_id)
-                            if evicted_id is not None:
-                                for key in sk.all_keys(evicted_id):
-                                    await asyncio.to_thread(store.discard, key)
-                            session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
-                            if session_key is not None:
-                                await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
+                        evicted_id = sk.evict_lru_if_full(conversation_id)
+                        if evicted_id is not None:
+                            for key in sk.all_keys(evicted_id):
+                                await asyncio.to_thread(store.discard, key)
+                        session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
+                        if session_key is not None:
+                            await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
 
-                        if prepared_prefix is not None:
-                            if prefix_snapshot_written and prefix_snapshot_key is not None and prefix_snapshot_len is not None:
-                                evicted_prefix_key = pc.confirm_inline_snap(
-                                    prefix_snapshot_key,
-                                    prefix_snapshot_len,
-                                    effective_ids,
-                                )
-                                prefix_snapshot_confirmed = True
-                                if evicted_prefix_key is not None:
-                                    await asyncio.to_thread(store.discard, evicted_prefix_key)
-                            else:
-                                pc.abort_inline_snap(prefix_snapshot_key)
+                    if prepared_prefix is not None and not prefix_snapshot_written:
+                        pc.abort_inline_snap(prefix_snapshot_key)
                 except Exception as e:
                     logger.warning(f"snapshot save failed: {e}")
                     if store and prefix_snapshot_written and prefix_snapshot_key is not None:
@@ -390,6 +383,19 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                         "exceeds available VRAM. Try reducing ctx-size or budget.",
                     )
                     return
+
+                if prepared_prefix is not None and not prefix_snapshot_confirmed:
+                    if prefix_snapshot_written and prefix_snapshot_key is not None and prefix_snapshot_len is not None:
+                        evicted_prefix_key = pc.confirm_inline_snap(
+                            prefix_snapshot_key,
+                            prefix_snapshot_len,
+                            effective_ids,
+                        )
+                        prefix_snapshot_confirmed = True
+                        if evicted_prefix_key is not None:
+                            await asyncio.to_thread(store.discard, evicted_prefix_key)
+                    else:
+                        pc.abort_inline_snap(prefix_snapshot_key)
 
                 final = _final_sse(
                     completion_id, created,
