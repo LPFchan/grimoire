@@ -147,8 +147,8 @@
     },
     "dflash-native-qwen3.6-27B-canary": {
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "draft": "gguf/Qwen3.5-0.8B-Q8_0.gguf",
-      "spec-draft-model": "gguf/Qwen3.5-0.8B-Q8_0.gguf",
+      "draft": "gguf/qwen3.6-27b-dflash-draft.gguf",
+      "spec-draft-model": "gguf/qwen3.6-27b-dflash-draft.gguf",
       "speculative-type": "dflash",
       "spec-dflash-cross-ctx": 1024,
       "tokenizer": "tokenizers/qwen3.6-27B",

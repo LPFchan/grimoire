@@ -63,6 +63,7 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 ## Immediate Next Steps
 
 1. ✅ Build TheTom native binary with DFlash flags (done: `tmp/thetom-bin/bin/llama-server`)
-2. Launch `dflash-native-qwen3.6-27B-canary` on isolated GPU (port 9002)
-3. If native path works, begin hardware verification of the full suite
-4. If native path hits memory wall, investigate TheTom's rollback/verify allocation vs lucebox path
+2. ✅ Launch `dflash-native-qwen3.6-27B-canary` on GPU 1 (port 9002)
+3. ✅ Native pipeline loads both models on single 3090 and serves requests
+4. 🔴 DFlash draft decode returns `-1` — generates 0 speculative tokens, falls back to autoregressive (~40 tok/s)
+5. Debug the DFlash draft runtime: `init: invalid token[0]` and `dflash draft decode failed: -1` suggest a tensor shape mismatch in the hidden state capture path
