@@ -13,7 +13,7 @@
 
 Before writing into an artifact directory, read its `README.md` and follow its prescriptive shape when it defines one.
 
-The canonical migration execution plan is at `MIGRATION_EXECUTION_CHECKLIST.md`. It is the single source of truth for migration scope, contracts, phases, and hardware baselines.
+Migration contracts, plans, and baselines are dissolved into `records/SPEC.md`, `records/STATUS.md`, `records/PLANS.md`, `records/decisions/`, and `records/research/`. Read those instead. The legacy `MIGRATION_EXECUTION_CHECKLIST.md` is retired.
 
 ## Skills
 

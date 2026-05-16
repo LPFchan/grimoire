@@ -1,4 +1,4 @@
-# <Project Name> Inbox
+# Grimoire Inbox
 
 Ephemeral scratch disk for untriaged capture. Not a backlog, roadmap, or project digest.
 
@@ -14,37 +14,65 @@ Ephemeral scratch disk for untriaged capture. Not a backlog, roadmap, or project
 
 ## Active Capture
 
-### IBX-YYYYMMDD-NNN
+### IBX-20260516-001
 
-- Opened: `YYYY-MM-DD HH-mm-ss KST`
-- Recorded by agent:
-- Source:
-- Source / capture ids:
-- Capture packet:
-- Received:
-- Summary:
-- Confidence: `low` | `medium` | `high`
-- Triage status: `new` | `held` | `in review` | `reflected` | `dropped`
-- Triage decision: `route` | `research` | `plan` | `discard` | `leave`
-- Suggested destination:
-- Related ids:
-- Notes:
+- Opened: `2026-05-16 14-00-00 KST`
+- Recorded by agent: opencode
+- Source: Phase 0 baseline gaps
+- Summary: No trustworthy cold moderate/long-prompt restore baseline — served DFlash session turns hit GPU memory failures on 3090. No final stable five-run median set — intermittent daemon/OOM failures even on short runs.
+- Confidence: `high`
+- Triage status: `new`
+- Triage decision: `route`
+- Suggested destination: `STATUS.md` / `research/`
+- Notes: Hardware-gated until memory wall is addressed or native TheTom path bypasses it.
 
-### IBX-YYYYMMDD-NNN
+### IBX-20260516-002
 
-- Opened:
-- Recorded by agent:
-- Source:
-- Source / capture ids:
-- Capture packet:
-- Received:
-- Summary:
-- Confidence:
-- Triage status:
-- Triage decision:
-- Suggested destination:
-- Related ids:
-- Notes:
+- Opened: `2026-05-16 14-00-00 KST`
+- Recorded by agent: opencode
+- Source: Phase 2 blocker
+- Summary: Native canary `dflash-native-qwen3.6-27B-canary` has never been launched on GPU. The TheTom patched server may not accept `qwen35` arch as a speculative draft. Build pipeline needs to be run.
+- Confidence: `high`
+- Triage status: `new`
+- Triage decision: `route`
+- Suggested destination: `STATUS.md` / near-term plan
+- Notes: This is the primary path forward. If TheTom accepts `qwen35`, the memory wall investigation may become moot.
+
+### IBX-20260516-003
+
+- Opened: `2026-05-16 14-00-00 KST`
+- Recorded by agent: opencode
+- Source: Fresh-state failure envelope
+- Summary: After Q8_0 rollback fix, fresh-state turn-1 fails above ~319 tokens. Next band at ~385 tokens. The failure is in rollback/verify cache allocation.
+- Confidence: `high`
+- Triage status: `new`
+- Triage decision: `research`
+- Suggested destination: `research/` (already seeded as RSH-20260516-002)
+- Notes: The native TheTom path uses a different code path and may not have this issue.
+
+### IBX-20260516-004
+
+- Opened: `2026-05-16 14-00-00 KST`
+- Recorded by agent: opencode
+- Source: PFlash baseline gaps
+- Summary: PFlash compression baseline recorded (1.87x on 13-message prompt). No repeated-call compressor VRAM drift measurement yet. No cold-long-prompt run on the native stack yet.
+- Confidence: `medium`
+- Triage status: `new`
+- Triage decision: `leave`
+- Suggested destination: `research/` (already seeded as RSH-20260516-003)
+- Notes: Wait for Track A hardware sign-off before addressing.
+
+### IBX-20260516-005
+
+- Opened: `2026-05-16 14-00-00 KST`
+- Recorded by agent: opencode
+- Source: TheTom native binary build
+- Summary: We need to apply `patches/spec-dflash-contract.patch` to `tmp/spec-analysis/thetom-shallow/` and build `llama-server` with CUDA. The build environment and steps need to be documented.
+- Confidence: `high`
+- Triage status: `new`
+- Triage decision: `plan`
+- Suggested destination: `PLANS.md`
+- Notes: This is the immediate next step. The build process should be captured as a decision or README.
 
 ## Daily Pressure Review Scratch
 

@@ -20,3 +20,6 @@ venv/
 .DS_Store
 Thumbs.db
 .tmp_commit_msg_*
+
+# build artifacts
+tmp/
