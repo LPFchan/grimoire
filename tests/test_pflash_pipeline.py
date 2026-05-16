@@ -20,9 +20,11 @@ import httpx
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -36,8 +38,17 @@ TARGET_CHARS = int(os.environ.get("TARGET_CHARS", "200000"))
 TURNS = int(os.environ.get("TURNS", "0"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "600"))
 GPU_INDEX = os.environ.get("GPU_INDEX", "0")
+SMOKE_CONTAINER = os.environ.get("GRIMOIRE_SMOKE_CONTAINER", "")
 FIXTURES = Path(os.environ.get("FIXTURES", "/home/yeowool/opencode_splits"))
+MODELS_JSON = Path(
+    os.environ.get(
+        "MODELS_JSON",
+        str(Path(__file__).resolve().parents[1] / "etc" / "models.json"),
+    )
+)
 H = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+
+PFLASH_DEBUG_RE = re.compile(r"pflash debug: fired=(True|False) orig=(\d+) compressed=(\d+)")
 
 
 def build_single_prompt(chars):
@@ -129,15 +140,63 @@ def vram_mb():
     return int(out.stdout.strip() or 0)
 
 
+def recent_pflash_debug(since: str):
+    if not SMOKE_CONTAINER:
+        return None
+    out = subprocess.run(
+        ["/usr/bin/docker", "logs", "--since", since, SMOKE_CONTAINER],
+        capture_output=True, text=True,
+    )
+    if out.returncode != 0:
+        return None
+    latest = None
+    for line in out.stdout.splitlines() + out.stderr.splitlines():
+        match = PFLASH_DEBUG_RE.search(line)
+        if not match:
+            continue
+        latest = {
+            "fired": match.group(1) == "True",
+            "orig_tokens": int(match.group(2)),
+            "compressed_tokens": int(match.group(3)),
+        }
+    return latest
+
+
+def model_prefill_settings():
+    try:
+        data = json.loads(MODELS_JSON.read_text())
+    except Exception:
+        return None
+
+    models = data.get("models") if isinstance(data, dict) else None
+    cfg = models.get(MODEL) if isinstance(models, dict) else None
+    if not isinstance(cfg, dict):
+        return None
+
+    threshold = cfg.get("prefill-threshold")
+    keep_ratio = cfg.get("prefill-keep-ratio")
+    tail_budget = cfg.get("prefill-tail-budget")
+    try:
+        return {
+            "threshold": int(threshold) if threshold is not None else None,
+            "keep_ratio": float(keep_ratio) if keep_ratio is not None else 0.05,
+            "tail_budget": int(tail_budget) if tail_budget is not None else 16000,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
 def main():
     chars = TARGET_CHARS
     messages = build_multi_turn_prompt(chars, TURNS) if TURNS > 0 else build_single_prompt(chars)
+    prefill_settings = model_prefill_settings()
 
     total_chars = sum(len(m.get("content", "")) for m in messages)
     log.info(f"Messages: {len(messages)}")
     log.info(f"Total chars: {total_chars:,}")
 
     vmb = vram_mb()
+    started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     t0 = time.monotonic()
     r = httpx.post(
         f"{BASE_URL}/v1/chat/completions",
@@ -171,14 +230,51 @@ def main():
     if rc:
         log.info(f"Reasoning ({len(rc)}): {rc[:200]}")
 
-    # Check if PFlash fired by looking at gateway logs
+    debug = recent_pflash_debug(started_at)
+    if debug is not None:
+        fired = debug["fired"]
+        orig = debug["orig_tokens"]
+        compressed_tokens = debug["compressed_tokens"]
+        ratio = (orig / max(compressed_tokens, 1)) if compressed_tokens > 0 else 0.0
+        log.info(
+            "PFlash debug: fired=%s raw=%s compressed=%s ratio=%.2fx",
+            fired,
+            f"{orig:,}",
+            f"{compressed_tokens:,}",
+            ratio,
+        )
+        if (
+            not fired
+            and prefill_settings is not None
+            and prefill_settings["threshold"] is not None
+            and orig >= prefill_settings["threshold"]
+        ):
+            log.info(
+                "Threshold was crossed without reduction; this usually means head/tail protection covered all prompt blocks."
+            )
+        return
+
     log.info("")
-    log.info(f"If compressed vs raw differ significantly, PFlash fired.")
-    log.info(f"At 5% keep ratio + 16K tail budget, {pt:,} tokens would")
-    tail = min(16000, pt)
+    log.info("No parseable PFlash debug line found in recent container logs.")
+    if prefill_settings is None:
+        log.info("Heuristic estimate unavailable because model prefill settings could not be loaded.")
+        return
+
+    keep_ratio = prefill_settings["keep_ratio"]
+    tail_budget = prefill_settings["tail_budget"]
+    tail = min(tail_budget, pt)
     middle = max(0, pt - tail)
-    compressed = tail + int(middle * 0.05)
-    log.info(f"  compress to ~{compressed:,} tokens if PFlash enabled.")
+    compressed = tail + int(middle * keep_ratio)
+    log.info(
+        "Heuristic only: using API prompt_tokens and model config because raw/compressed counts were unavailable."
+    )
+    log.info(
+        "At %.0f%% keep ratio + %s tail budget, %s tokens would",
+        keep_ratio * 100,
+        f"{tail_budget:,}",
+        f"{pt:,}",
+    )
+    log.info(f"  compress to ~{compressed:,} tokens if eligible for PFlash.")
 
 
 if __name__ == "__main__":
