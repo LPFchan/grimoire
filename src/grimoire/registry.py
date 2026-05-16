@@ -39,7 +39,7 @@ _GGUF_FIXED_VALUE_SIZES = {
     11: 8,
     12: 8,
 }
-_NATIVE_DFLASH_ALLOWED_ARCHES = {"dflash-draft", "qwen35-dflash-draft"}
+_NATIVE_DFLASH_ALLOWED_ARCHES = {"dflash-draft", "qwen35-dflash-draft", "qwen35"}
 _NATIVE_DFLASH_EXPECTED_BLOCK_SIZE = 16
 _NATIVE_DFLASH_EXPECTED_TARGET_LAYERS = 5
 _NATIVE_DFLASH_MAX_LAYERS = 1024
@@ -227,7 +227,7 @@ def _validate_native_dflash_draft_gguf(path: str) -> Optional[str]:
             if arch not in _NATIVE_DFLASH_ALLOWED_ARCHES:
                 return (
                     "Native DFlash draft GGUF has unexpected architecture "
-                    f"'{metadata.get('general.architecture')}' (expected dflash-draft or qwen35-dflash-draft)"
+                    f"'{metadata.get('general.architecture')}' (expected dflash-draft, qwen35-dflash-draft, or qwen35)"
                 )
 
             required_keys = [

@@ -668,7 +668,7 @@ class DropInBlockerTests(unittest.TestCase):
         cfg = data["models"]["dflash-native-qwen3.6-27B-canary"]
         self.assertEqual(cfg["speculative-type"], "dflash")
         self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
-        self.assertEqual(cfg["draft"], "gguf/Qwen3-0.6B-BF16.gguf")
+        self.assertEqual(cfg["draft"], "gguf/Qwen3.5-0.8B-Q8_0.gguf")
 
     def test_served_dflash_alias_stays_on_safetensors_until_gguf_cutover_is_proven(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
