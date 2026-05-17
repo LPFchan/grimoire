@@ -26,6 +26,13 @@ def _env_bool(name, default=False):
 
 # Backend binary
 LLAMA_SERVER_BIN = "/opt/grimoire-llama-cpp/bin/llama-server"
+TURBOQUANT_LIB_DIR = "/opt/grimoire-llama-cpp/lib"
+TURBOQUANT_LIB64_DIR = "/opt/grimoire-llama-cpp/lib64"
+DFLASH_HOME = os.environ.get("GRIMOIRE_DFLASH_HOME", "/opt/dflash")
+DFLASH_LIB_DIR = os.environ.get("GRIMOIRE_DFLASH_LIB_DIR", DFLASH_HOME)
+DFLASH_BIN = os.environ.get("GRIMOIRE_DFLASH_BIN", os.path.join(DFLASH_HOME, "dflash"))
+PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(DFLASH_HOME, "pflash_daemon"))
+PFLASH_SHIM_PATH = os.environ.get("GRIMOIRE_PFLASH_SHIM_PATH", os.path.join(DFLASH_HOME, "pflash_shim.so"))
 
 # Model defaults
 DEFAULT_CTX_SIZE = 131072

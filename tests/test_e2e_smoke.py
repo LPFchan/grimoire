@@ -17,6 +17,13 @@ Run selectively:
 
 Skip entirely:
     SKIP_E2E=1 python -m pytest tests/
+
+Model overrides:
+    GRIMOIRE_DFLASH_SMOKE_MODEL=dflash-native-qwen3.6-27B-canary python -m pytest tests/test_e2e_smoke.py::DFlashSmokeTests -v
+    GRIMOIRE_LLAMA_SMOKE_MODEL=qwen-3.6-27B python -m pytest tests/test_e2e_smoke.py::LlamaCppSmokeTests -v
+
+Long-prompt overrides:
+    GRIMOIRE_LONG_PROMPT_MIN_CHARS=1500 GRIMOIRE_LONG_PROMPT_MAX_CHARS=4000 python -m pytest tests/test_e2e_smoke.py::DFlashSmokeTests::test_02_session_snapshot_restore -v
 """
 
 import json
@@ -34,6 +41,10 @@ from tests._monitor import SystemMonitor
 SKIP_E2E = os.environ.get("SKIP_E2E", "0") == "1"
 BASE_URL = os.environ.get("GRIMOIRE_SMOKE_URL", "http://localhost:9001")
 API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
+DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL", "dflash-pflash-qwen3.6-27B")
+LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")
+LONG_PROMPT_MIN_CHARS = int(os.environ.get("GRIMOIRE_LONG_PROMPT_MIN_CHARS", "1500"))
+LONG_PROMPT_MAX_CHARS = int(os.environ.get("GRIMOIRE_LONG_PROMPT_MAX_CHARS", "4000"))
 FIXTURES_DIR = Path(
     os.environ.get("GRIMOIRE_OPENCODE_SESSION_FIXTURES", "/home/yeowool/opencode_splits")
 )
@@ -59,27 +70,41 @@ def _load_short_fixture() -> list[dict]:
     raise RuntimeError("No suitable fixture found")
 
 
-def _load_long_prompt_fixture(min_chars: int = 1500, max_chars: int = 4000) -> list[dict]:
+def _load_long_prompt_fixture(min_chars: int = 1500, max_chars: int | None = None) -> list[dict]:
     """Load a deterministic long user prompt from OpenCode session fixtures."""
-    candidate = FIXTURES_DIR / "opencode_ses_1edc_Assessing_lucebox-hub_integration_into_grimoire.json"
-    if not candidate.exists():
-        candidate = sorted(FIXTURES_DIR.glob("opencode_ses_*.json"), key=lambda p: p.stat().st_size, reverse=True)[0]
-    data = json.loads(candidate.read_text())
-    messages = data.get("messages", [])
     best = None
-    for raw_msg in messages:
-        meta = json.loads(raw_msg.get("data", "{}"))
-        if meta.get("role") != "user":
-            continue
-        parts = [json.loads(p.get("data", "{}")) for p in raw_msg.get("parts", [])]
-        texts = [p.get("text", "") for p in parts if p.get("type") == "text" and p.get("text")]
-        for text in texts:
-            if min_chars <= len(text) <= max_chars:
-                if best is None or len(text) > len(best):
-                    best = text
+    best_source = None
+    preferred = FIXTURES_DIR / "opencode_ses_1edc_Assessing_lucebox-hub_integration_into_grimoire.json"
+    candidates = []
+    if preferred.exists():
+        candidates.append(preferred)
+    for candidate in sorted(FIXTURES_DIR.glob("opencode_ses_*.json"), key=lambda p: p.stat().st_size, reverse=True):
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        data = json.loads(candidate.read_text())
+        messages = data.get("messages", [])
+        for raw_msg in messages:
+            meta = json.loads(raw_msg.get("data", "{}"))
+            if meta.get("role") != "user":
+                continue
+            parts = [json.loads(p.get("data", "{}")) for p in raw_msg.get("parts", [])]
+            texts = [p.get("text", "") for p in parts if p.get("type") == "text" and p.get("text")]
+            for text in texts:
+                if len(text) >= min_chars and (max_chars is None or len(text) <= max_chars):
+                    if best is None or len(text) > len(best):
+                        best = text
+                        best_source = candidate.name
     if best:
         return [{"role": "user", "content": best}]
-    raise RuntimeError(f"No user message found with {min_chars}-{max_chars} chars in {candidate.name}")
+    if max_chars is None:
+        raise RuntimeError(
+            f"No user message found with at least {min_chars} chars in scanned fixtures"
+        )
+    raise RuntimeError(
+        f"No user message found with {min_chars}-{max_chars} chars in scanned fixtures"
+    )
 
 
 class E2ESmokeTestCase(unittest.TestCase):
@@ -96,9 +121,27 @@ class E2ESmokeTestCase(unittest.TestCase):
 
         cls._fixture_messages = _load_short_fixture()
         try:
-            cls._long_fixture_messages = _load_long_prompt_fixture(min_chars=5000)
+            cls._long_fixture_messages = _load_long_prompt_fixture(
+                min_chars=LONG_PROMPT_MIN_CHARS,
+                max_chars=LONG_PROMPT_MAX_CHARS,
+            )
         except RuntimeError:
             cls._long_fixture_messages = cls._fixture_messages
+
+    @classmethod
+    def _headers(cls):
+        return {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
+    @classmethod
+    def _create_conversation(cls, model: str) -> str:
+        response = httpx.post(
+            f"{BASE_URL}/history",
+            json={"title": f"smoke-{uuid.uuid4()}", "model": model, "messages": []},
+            headers=cls._headers(),
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return response.json()["id"]
 
     @classmethod
     def _chat(cls, model: str, messages: list[dict], conversation_id: str | None = None, max_tokens: int = 16):
@@ -112,12 +155,13 @@ class E2ESmokeTestCase(unittest.TestCase):
         if conversation_id:
             payload["conversation_id"] = conversation_id
 
-        headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+        headers = cls._headers()
 
         t0 = time.monotonic()
         first_byte_at = None
         last_chunk_at = None
         chunks = []
+        error_message = None
 
         with httpx.stream(
             "POST",
@@ -139,6 +183,9 @@ class E2ESmokeTestCase(unittest.TestCase):
                     frame = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                error = frame.get("error") if isinstance(frame, dict) else None
+                if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+                    error_message = error["message"]
                 chunks.append(frame)
                 last_chunk_at = time.monotonic()
 
@@ -169,6 +216,7 @@ class E2ESmokeTestCase(unittest.TestCase):
             "total_time_ms": total_time * 1000,
             "decode_tps": decode_tps,
             "status_code": response.status_code,
+            "error": error_message,
         }
 
     def _assert_timings(self, result: dict, label: str):
@@ -186,7 +234,7 @@ class E2ESmokeTestCase(unittest.TestCase):
 class DFlashSmokeTests(E2ESmokeTestCase):
     """Smoke tests for the DFlash speculative-decoding backend."""
 
-    MODEL = "dflash-pflash-qwen-27B"
+    MODEL = DFLASH_SMOKE_MODEL
 
     def test_01_basic_chat_completion(self):
         """Single-turn chat with real fixture data returns a valid, timed response."""
@@ -194,13 +242,13 @@ class DFlashSmokeTests(E2ESmokeTestCase):
         result = self._chat(self.MODEL, messages, max_tokens=16)
 
         self.assertEqual(result["status_code"], 200)
-        self.assertTrue(result["text"])
+        self.assertTrue(result["text"], result.get("error"))
         self.assertGreater(result["completion_tokens"], 0)
         self._assert_timings(result, "DFlash basic")
 
     def test_02_session_snapshot_restore(self):
         """Two-turn conversation: second turn should restore from snapshot and be faster."""
-        conversation_id = str(uuid.uuid4())
+        conversation_id = self._create_conversation(self.MODEL)
 
         # Turn 1 — establish context with a LONG prompt so prefill takes measurable time
         turn1_messages = self._long_fixture_messages
@@ -209,7 +257,7 @@ class DFlashSmokeTests(E2ESmokeTestCase):
 
         result1 = self._chat(self.MODEL, turn1_messages, conversation_id=conversation_id, max_tokens=16)
         self.assertEqual(result1["status_code"], 200)
-        self.assertTrue(result1["text"])
+        self.assertTrue(result1["text"], result1.get("error"))
         self._assert_timings(result1, "DFlash turn 1 (long prompt)")
 
         # Turn 2 — should restore from snapshot (append assistant response + follow-up)
@@ -220,7 +268,7 @@ class DFlashSmokeTests(E2ESmokeTestCase):
         ]
         result2 = self._chat(self.MODEL, turn2_messages, conversation_id=conversation_id, max_tokens=16)
         self.assertEqual(result2["status_code"], 200)
-        self.assertTrue(result2["text"])
+        self.assertTrue(result2["text"], result2.get("error"))
         self._assert_timings(result2, "DFlash turn 2 (restore)")
 
         # Snapshot restore should make turn 2 significantly faster (lower TTFT).
@@ -240,7 +288,7 @@ class DFlashSmokeTests(E2ESmokeTestCase):
 class LlamaCppSmokeTests(E2ESmokeTestCase):
     """Smoke tests for the llama.cpp backend."""
 
-    MODEL = "qwen-3.6-27B"
+    MODEL = LLAMA_SMOKE_MODEL
 
     def test_01_basic_chat_completion(self):
         """Single-turn chat with real fixture data returns a valid, timed response."""
@@ -248,19 +296,19 @@ class LlamaCppSmokeTests(E2ESmokeTestCase):
         result = self._chat(self.MODEL, messages, max_tokens=16)
 
         self.assertEqual(result["status_code"], 200)
-        self.assertTrue(result["text"])
+        self.assertTrue(result["text"], result.get("error"))
         self.assertGreater(result["completion_tokens"], 0)
         self._assert_timings(result, "llama.cpp basic")
 
     def test_02_session_continuity(self):
         """Two-turn conversation preserves context via history store."""
-        conversation_id = str(uuid.uuid4())
+        conversation_id = self._create_conversation(self.MODEL)
 
         # Turn 1
         turn1_messages = [self._fixture_messages[0]]
         result1 = self._chat(self.MODEL, turn1_messages, conversation_id=conversation_id, max_tokens=16)
         self.assertEqual(result1["status_code"], 200)
-        self.assertTrue(result1["text"])
+        self.assertTrue(result1["text"], result1.get("error"))
         self._assert_timings(result1, "llama.cpp turn 1")
 
         # Turn 2
@@ -271,7 +319,7 @@ class LlamaCppSmokeTests(E2ESmokeTestCase):
         ]
         result2 = self._chat(self.MODEL, turn2_messages, conversation_id=conversation_id, max_tokens=16)
         self.assertEqual(result2["status_code"], 200)
-        self.assertTrue(result2["text"])
+        self.assertTrue(result2["text"], result2.get("error"))
         self._assert_timings(result2, "llama.cpp turn 2")
 
 

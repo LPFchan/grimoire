@@ -182,6 +182,8 @@ class PrefixCache:
                 key = bytes.fromhex(entry["key_hex"])
                 snapshot_key = bytes.fromhex(entry["snapshot_key_hex"])
                 self.entries[key] = snapshot_key
+            while len(self.entries) > self.cap:
+                self.entries.popitem(last=False)
             logger.info("prefix cache loaded: %s entries from %s", len(self.entries), meta_path)
         except Exception as e:
             logger.error("prefix cache load failed: %s", e)

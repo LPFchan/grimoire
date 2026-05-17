@@ -187,7 +187,11 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                     return (staging_slot, prefix_len)
 
                 if conversation_id and sk and store:
+                    prior_session_keys = sk.all_keys(conversation_id) if sk.has_session(conversation_id) else []
                     session_hit = sk.get_session(conversation_id, effective_ids)
+                    if session_hit is None and prior_session_keys and not sk.has_session(conversation_id):
+                        for key in prior_session_keys:
+                            await asyncio.to_thread(store.discard, key)
                     if session_hit is not None:
                         had_session = True
                         session_key, session_prefix_len = session_hit
@@ -196,6 +200,7 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             loaded_staging = True
                         except KeyError:
                             logger.warning("session snapshot missing from store; evicting session")
+                            await asyncio.to_thread(store.discard, session_key)
                             sk.evict(conversation_id)
 
                 if prefix_hit is None and pc and not pc.disabled and store:
@@ -207,6 +212,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             loaded_staging = True
                         except KeyError:
                             logger.warning("prefix snapshot missing from store; dropping cache entry")
+                            await asyncio.to_thread(store.discard, prefix_key)
+                            pc.discard(prefix_key)
 
                 restored_prefix_len = prefix_hit[1] if prefix_hit else 0
                 if pc and not pc.disabled and store and effective_boundaries:
@@ -231,16 +238,8 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
 
                 decoded_prefix = ""
                 tokens_emitted = []
-                # Sliding-window detokenize state: `read_offset` is the count of
-                # tokens whose decoded text has been emitted; `prefix_offset` is
-                # the earliest token still inside the decode window. Both reset
-                # to the current tail after every successful emit, so each
-                # decode is bounded to the most recent few tokens — overall O(n)
-                # over the response instead of O(n²) over `decode(full_list)`
-                # per token.
-                prefix_offset = 0
-                read_offset = 0
                 stop_seq_lens = sorted({len(seq) for seq in stop_seqs}, reverse=True)
+                holdback = max(stop_seq_lens, default=0)
                 t0 = time.monotonic()
 
                 def _decode(start, stop):
@@ -253,6 +252,21 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 try:
                     index = 0
                     hit_stop = False
+
+                    def _next_committed_delta() -> str:
+                        nonlocal decoded_prefix, index
+                        committed_len = len(tokens_emitted)
+                        if holdback > 0:
+                            committed_len = max(0, committed_len - holdback)
+                        if committed_len <= 0:
+                            return ""
+                        committed_text = _decode(0, committed_len)
+                        if committed_text.endswith("�") or len(committed_text) <= len(decoded_prefix):
+                            return ""
+                        delta = committed_text[len(decoded_prefix):]
+                        decoded_prefix = committed_text
+                        return delta
+
                     while True:
                         tok = await asyncio.to_thread(daemon.read_next_token)
                         if tok is None:
@@ -276,12 +290,6 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                     break
 
                             if stop_hit:
-                                # The trim may have removed tokens we already emitted
-                                # bytes for; re-decode against the shortened buffer
-                                # and reconcile decoded_prefix so the final usage
-                                # text matches what's actually in tokens_emitted.
-                                read_offset = min(read_offset, len(tokens_emitted))
-                                prefix_offset = min(prefix_offset, read_offset)
                                 final_text = _decode(0, len(tokens_emitted))
                                 if len(final_text) > len(decoded_prefix):
                                     delta = final_text[len(decoded_prefix):]
@@ -289,24 +297,11 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                                     frame = _delta_sse(completion_id, created, delta, index)
                                     index += 1
                                     yield f"data: {json.dumps(frame)}\n\n".encode()
-                                else:
-                                    decoded_prefix = final_text
-                                read_offset = len(tokens_emitted)
-                                prefix_offset = read_offset
                                 hit_stop = True
                                 break
 
-                            # Wait for a complete UTF-8 sequence before emitting:
-                            # multi-byte chars can straddle BPE/SentencePiece pieces,
-                            # so we keep accumulating while the window still ends in
-                            # the replacement char U+FFFD.
-                            prefix_text = _decode(prefix_offset, read_offset)
-                            new_text = _decode(prefix_offset, len(tokens_emitted))
-                            if not new_text.endswith("�") and len(new_text) > len(prefix_text):
-                                delta = new_text[len(prefix_text):]
-                                decoded_prefix += delta
-                                prefix_offset = read_offset
-                                read_offset = len(tokens_emitted)
+                            delta = _next_committed_delta()
+                            if delta:
                                 frame = _delta_sse(completion_id, created, delta, index)
                                 index += 1
                                 yield f"data: {json.dumps(frame)}\n\n".encode()
@@ -320,19 +315,17 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                             if leftover is None:
                                 break
 
-                    # Flush any complete bytes still trapped in the sliding
-                    # window (loop exited via EOS, max_tokens, or pipe close —
-                    # not via the stop-hit branch, which already reconciled).
-                    if read_offset < len(tokens_emitted):
-                        prefix_text = _decode(prefix_offset, read_offset)
-                        final_text = _decode(prefix_offset, len(tokens_emitted))
-                        if len(final_text) > len(prefix_text):
-                            delta = final_text[len(prefix_text):].rstrip("�")
-                            if delta:
-                                decoded_prefix += delta
-                                frame = _delta_sse(completion_id, created, delta, index)
-                                index += 1
-                                yield f"data: {json.dumps(frame)}\n\n".encode()
+                    # Flush any remaining committed text after the read loop.
+                    final_text = _decode(0, len(tokens_emitted))
+                    if final_text.endswith("�"):
+                        final_text = final_text.rstrip("�")
+                    if len(final_text) > len(decoded_prefix):
+                        delta = final_text[len(decoded_prefix):]
+                        if delta:
+                            decoded_prefix = final_text
+                            frame = _delta_sse(completion_id, created, delta, index)
+                            index += 1
+                            yield f"data: {json.dumps(frame)}\n\n".encode()
                 finally:
                     try:
                         os.unlink(cmd_path)
@@ -342,46 +335,47 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                 elapsed = max(time.monotonic() - t0, 1e-6)
                 tps = len(tokens_emitted) / elapsed
 
-                # Save snapshot before the zero-token guard so existing sessions
-                # always persist even when no new tokens are generated (e.g. a
-                # stop-token-only follow-up turn).
+                # Save snapshots before the zero-token guard so existing sessions
+                # still persist even when no new tokens are generated (e.g. a
+                # stop-token-only follow-up turn). One-off requests must not
+                # take an unsaved staging snapshot, or slot 7 remains resident.
                 try:
                     prefix_snapshot_written = False
+                    need_session_snapshot = bool(
+                        conversation_id and sk and store and (tokens_emitted or had_session)
+                    )
                     if prepared_prefix is not None:
                         await asyncio.to_thread(store.save, daemon, prefix_snapshot_key, staging_slot)
                         prefix_snapshot_written = True
 
-                    if tokens_emitted or had_session:
+                    if need_session_snapshot:
                         await asyncio.to_thread(daemon.snapshot, staging_slot)
-                        if conversation_id and sk and store:
-                            evicted_id = sk.evict_lru_if_full(conversation_id)
-                            if evicted_id is not None:
-                                for key in sk.all_keys(evicted_id):
-                                    await asyncio.to_thread(store.discard, key)
-                            session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
+                        evicted_id = sk.evict_lru_if_full(conversation_id)
+                        if evicted_id is not None:
+                            for key in sk.all_keys(evicted_id):
+                                await asyncio.to_thread(store.discard, key)
+                        session_key = sk.update(conversation_id, len(effective_ids), effective_ids)
+                        if session_key is not None:
                             await asyncio.to_thread(store.save, daemon, session_key, staging_slot)
 
-                        if prepared_prefix is not None:
-                            if prefix_snapshot_written and prefix_snapshot_key is not None and prefix_snapshot_len is not None:
-                                evicted_prefix_key = pc.confirm_inline_snap(
-                                    prefix_snapshot_key,
-                                    prefix_snapshot_len,
-                                    effective_ids,
-                                )
-                                prefix_snapshot_confirmed = True
-                                if evicted_prefix_key is not None:
-                                    await asyncio.to_thread(store.discard, evicted_prefix_key)
-                            else:
-                                pc.abort_inline_snap(prefix_snapshot_key)
+                    if prepared_prefix is not None and not prefix_snapshot_written:
+                        pc.abort_inline_snap(prefix_snapshot_key)
                 except Exception as e:
                     logger.warning(f"snapshot save failed: {e}")
+                    if store and prefix_snapshot_written and prefix_snapshot_key is not None:
+                        await asyncio.to_thread(store.discard, prefix_snapshot_key)
                     if pc and prepared_prefix is not None and prefix_snapshot_key is not None:
                         pc.abort_inline_snap(prefix_snapshot_key)
                     if conversation_id and sk:
+                        if store:
+                            for key in sk.all_keys(conversation_id):
+                                await asyncio.to_thread(store.discard, key)
                         sk.evict(conversation_id)
 
                 # Detect silent failures where no tokens were emitted.
                 if not tokens_emitted and max_tokens > 0:
+                    if store and prefix_snapshot_written and prefix_snapshot_key is not None:
+                        await asyncio.to_thread(store.discard, prefix_snapshot_key)
                     yield _sse_error_frames(
                         completion_id, created,
                         "DFlash generation failed: model produced zero tokens. "
@@ -389,6 +383,19 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
                         "exceeds available VRAM. Try reducing ctx-size or budget.",
                     )
                     return
+
+                if prepared_prefix is not None and not prefix_snapshot_confirmed:
+                    if prefix_snapshot_written and prefix_snapshot_key is not None and prefix_snapshot_len is not None:
+                        evicted_prefix_key = pc.confirm_inline_snap(
+                            prefix_snapshot_key,
+                            prefix_snapshot_len,
+                            effective_ids,
+                        )
+                        prefix_snapshot_confirmed = True
+                        if evicted_prefix_key is not None:
+                            await asyncio.to_thread(store.discard, evicted_prefix_key)
+                    else:
+                        pc.abort_inline_snap(prefix_snapshot_key)
 
                 final = _final_sse(
                     completion_id, created,
@@ -441,7 +448,10 @@ async def _proxy_dflash(requested_model, payload, active, user_hash, conversatio
         async for chunk in stream:
             body.extend(chunk)
 
-        from grimoire.proxy.sse import _extract_assistant_text, _extract_usage
+        from grimoire.proxy.sse import _extract_assistant_text, _extract_error_message, _extract_usage
+        error_message = _extract_error_message(bytes(body))
+        if error_message:
+            raise HTTPException(status_code=503, detail=error_message)
         text = _extract_assistant_text(bytes(body))
         usage = _extract_usage(bytes(body)) or {"input_tokens": len(effective_ids), "output_tokens": 0}
 

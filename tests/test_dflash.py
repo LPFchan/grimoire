@@ -7,6 +7,7 @@ import os
 import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -461,6 +462,86 @@ def _synthetic_prompt_blocks(boundaries, prompt_len, protected_indexes=None, inc
 class DflashRegistryValidationTests(unittest.TestCase):
     """Validation guardrails for the dflash backend entries in models.json."""
 
+    @staticmethod
+    def _write_gguf(path: Path, metadata: dict, tensors: list[str]) -> None:
+        def u32(v):
+            return struct.pack("<I", v)
+
+        def u64(v):
+            return struct.pack("<Q", v)
+
+        def i32(v):
+            return struct.pack("<i", v)
+
+        def string(v: str):
+            data = v.encode("utf-8")
+            return u64(len(data)) + data
+
+        def value(v):
+            if isinstance(v, str):
+                return u32(8) + string(v)
+            if isinstance(v, bool):
+                return u32(7) + (b"\x01" if v else b"\x00")
+            if isinstance(v, int):
+                return u32(5) + i32(v)
+            if isinstance(v, list):
+                payload = b"".join(i32(int(item)) for item in v)
+                return u32(9) + u32(5) + u64(len(v)) + payload
+            raise TypeError(f"unsupported metadata value {v!r}")
+
+        body = [u32(0x46554747), u32(3), u64(len(tensors)), u64(len(metadata))]
+        for key, raw in metadata.items():
+            body.append(string(key))
+            body.append(value(raw))
+
+        for name in tensors:
+            body.append(string(name))
+            body.append(u32(1))
+            body.append(u64(1))
+            body.append(u32(0))
+            body.append(u64(0))
+
+        path.write_bytes(b"".join(body))
+
+    @staticmethod
+    def _native_draft_metadata(**overrides):
+        metadata = {
+            "general.architecture": "dflash-draft",
+            "dflash-draft.embedding_length": 5120,
+            "dflash-draft.block_count": 5,
+            "dflash-draft.feed_forward_length": 17408,
+            "dflash-draft.attention.head_count": 32,
+            "dflash-draft.attention.head_count_kv": 8,
+            "dflash-draft.attention.key_length": 128,
+            "dflash-draft.dflash.block_size": 16,
+            "dflash-draft.dflash.n_target_layers": 5,
+            "dflash-draft.dflash.target_layer_ids": [1, 16, 31, 46, 61],
+            "dflash-draft.dflash.n_target_features": 25600,
+        }
+        metadata.update(overrides)
+        return metadata
+
+    @staticmethod
+    def _native_draft_tensors(layer_count: int = 5):
+        tensors = ["dflash_fc.weight", "dflash_hidden_norm.weight", "output_norm.weight"]
+        for layer_idx in range(layer_count):
+            tensors.extend(
+                [
+                    f"blk.{layer_idx}.attn_norm.weight",
+                    f"blk.{layer_idx}.ffn_norm.weight",
+                    f"blk.{layer_idx}.attn_q.weight",
+                    f"blk.{layer_idx}.attn_k.weight",
+                    f"blk.{layer_idx}.attn_v.weight",
+                    f"blk.{layer_idx}.attn_output.weight",
+                    f"blk.{layer_idx}.attn_q_norm.weight",
+                    f"blk.{layer_idx}.attn_k_norm.weight",
+                    f"blk.{layer_idx}.ffn_gate.weight",
+                    f"blk.{layer_idx}.ffn_up.weight",
+                    f"blk.{layer_idx}.ffn_down.weight",
+                ]
+            )
+        return tensors
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -471,7 +552,11 @@ class DflashRegistryValidationTests(unittest.TestCase):
         # Real files on disk for the happy path; tests can remove or shadow as needed.
         (self.models_dir / "target.gguf").write_bytes(b"x")
         (self.models_dir / "draft.safetensors").write_bytes(b"x")
-        (self.models_dir / "drafter.gguf").write_bytes(b"x")
+        self._write_gguf(
+            self.models_dir / "drafter.gguf",
+            self._native_draft_metadata(),
+            self._native_draft_tensors(),
+        )
 
         self.registry_path = self.models_dir / "registry.json"
         self.reg = registry_mod.ModelRegistry(path=str(self.registry_path), seed_path=None)
@@ -487,6 +572,9 @@ class DflashRegistryValidationTests(unittest.TestCase):
             "drafter": "drafter.gguf",
             "tokenizer": "hf:Qwen/Qwen3.6-27B",
             "ctx-size": 1024,
+            "snapshot-mode": "compact-full",
+            "snapshot-staging-slot": 7,
+            "session-kv-slots": 2,
         }
         cfg.update(overrides)
         self.reg.add(name, cfg)
@@ -510,6 +598,30 @@ class DflashRegistryValidationTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn("Draft model not found", reason)
 
+    def test_missing_compact_full_snapshot_mode_fails(self):
+        self._add("no_snapshot_mode", **{"snapshot-mode": None})
+        valid, reason = self.reg.validate("no_snapshot_mode")
+        self.assertFalse(valid)
+        self.assertIn("snapshot-mode", reason)
+
+    def test_missing_snapshot_staging_slot_fails(self):
+        self._add("no_staging_slot", **{"snapshot-staging-slot": None})
+        valid, reason = self.reg.validate("no_staging_slot")
+        self.assertFalse(valid)
+        self.assertIn("snapshot-staging-slot", reason)
+
+    def test_invalid_snapshot_staging_slot_fails(self):
+        self._add("bad_staging_slot", **{"snapshot-staging-slot": 8})
+        valid, reason = self.reg.validate("bad_staging_slot")
+        self.assertFalse(valid)
+        self.assertIn("range 0-7", reason)
+
+    def test_negative_session_kv_slots_fail(self):
+        self._add("bad_session_cap", **{"session-kv-slots": -1})
+        valid, reason = self.reg.validate("bad_session_cap")
+        self.assertFalse(valid)
+        self.assertIn("session-kv-slots", reason)
+
     def test_missing_drafter_optional_unless_set(self):
         os.unlink(self.models_dir / "drafter.gguf")
         # Without a drafter field, validation should still pass.
@@ -530,6 +642,71 @@ class DflashRegistryValidationTests(unittest.TestCase):
         valid, reason = self.reg.validate("weird")
         self.assertFalse(valid)
         self.assertIn("Unknown backend", reason)
+
+    def test_llama_native_dflash_entry_passes_with_gguf_draft(self):
+        self.reg.add(
+            "native-ok",
+            {
+                "file": "target.gguf",
+                "draft": "drafter.gguf",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-ok")
+        self.assertTrue(valid, reason)
+
+    def test_llama_native_dflash_entry_requires_draft(self):
+        self.reg.add(
+            "native-missing-draft",
+            {
+                "file": "target.gguf",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-missing-draft")
+        self.assertFalse(valid)
+        self.assertIn("Native DFlash draft model not found", reason)
+
+    def test_llama_native_dflash_entry_requires_gguf_draft(self):
+        self.reg.add(
+            "native-bad-draft",
+            {
+                "file": "target.gguf",
+                "draft": "draft.safetensors",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-bad-draft")
+        self.assertFalse(valid)
+        self.assertIn("must be GGUF", reason)
+
+    def test_llama_native_dflash_entry_accepts_explicit_spec_draft_model(self):
+        self.reg.add(
+            "native-explicit-draft",
+            {
+                "file": "target.gguf",
+                "draft": "draft.safetensors",
+                "spec-draft-model": "drafter.gguf",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-explicit-draft")
+        self.assertTrue(valid, reason)
+
+    def test_llama_native_dflash_entry_rejects_missing_explicit_spec_draft_model(self):
+        os.unlink(self.models_dir / "drafter.gguf")
+        self.reg.add(
+            "native-missing-explicit-draft",
+            {
+                "file": "target.gguf",
+                "draft": "target.gguf",
+                "spec-draft-model": "drafter.gguf",
+                "speculative-type": "dflash",
+            },
+        )
+        valid, reason = self.reg.validate("native-missing-explicit-draft")
+        self.assertFalse(valid)
+        self.assertIn("Native DFlash draft model not found", reason)
 
 
 class PrefixCacheBoundaryTests(unittest.TestCase):
@@ -1522,6 +1699,17 @@ class SessionKVTests(unittest.TestCase):
         sk = SessionKV(cap=0)
         self.assertIsNone(sk.evict_lru_if_full("a"))
 
+    def test_cap_zero_disables_updates_and_lookup(self):
+        sk = SessionKV(cap=0)
+        self.assertIsNone(sk.update("a", 10, self.PROMPT))
+        self.assertFalse(sk.has_session("a"))
+        self.assertIsNone(sk.get_session("a", self.PROMPT))
+
+    def test_all_keys_returns_stable_key_for_evicted_conversation(self):
+        sk = SessionKV(cap=2)
+        expected = sk.swap_key("gone")
+        self.assertEqual(sk.all_keys("gone"), [expected])
+
     def test_get_session_accepts_extended_prompt(self):
         sk = SessionKV(cap=2)
         cached = list(range(100))
@@ -1543,6 +1731,17 @@ class SessionKVTests(unittest.TestCase):
         sk = SessionKV(cap=2)
         sk.update("a", 100, list(range(200)))
         self.assertIsNone(sk.get_session("a", list(range(50))))
+
+    def test_persisted_sessions_reload_from_disk(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "session-kv.json"
+            original = SessionKV(cap=2, path=str(path))
+            original.update("a", 50, self.PROMPT)
+            original.update("b", 60, self.PROMPT)
+
+            restored = SessionKV(cap=2, path=str(path))
+            self.assertEqual(restored.get_session("a", self.PROMPT), (restored.swap_key("a"), 50))
+            self.assertEqual(restored.get_session("b", self.PROMPT), (restored.swap_key("b"), 60))
 
 
 class SnapshotSwapTests(unittest.TestCase):
@@ -1645,6 +1844,137 @@ class SnapshotSwapTests(unittest.TestCase):
             self.assertFalse(ram_path.exists())
             self.assertFalse(disk_path.exists())
 
+    def test_discard_cancels_pending_disk_mirror_before_publish(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"a" * 16
+            src = Path(td) / "source.dfsn"
+            src.write_text("snapshot\n")
+            started = threading.Event()
+            release = threading.Event()
+
+            def blocked_copy(_src, _dst):
+                started.set()
+                self.assertTrue(release.wait(timeout=5))
+                Path(_dst).write_bytes(Path(_src).read_bytes())
+
+            async def run():
+                with patch("grimoire.dflash.snapshot_swap.shutil.copy2", side_effect=blocked_copy):
+                    swap.bind_loop(asyncio.get_running_loop())
+                    swap._queue_mirror(src, swap.disk_path(key), key, target="disk")
+                    self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                    swap.discard(key)
+                    release.set()
+                    await swap.flush_pending()
+
+            asyncio.run(run())
+            self.assertNotIn(key, swap.disk)
+            self.assertFalse(swap.disk_path(key).exists())
+
+    def test_clear_invalidates_queued_mirrors_before_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"b" * 16
+            src = Path(td) / "source.dfsn"
+            src.write_text("snapshot\n")
+
+            async def run():
+                token = swap._mirror_token(key)
+                swap.clear()
+                await swap._mirror_async(src, swap.disk_path(key), key, target="disk", token=token)
+
+            asyncio.run(run())
+            self.assertNotIn(key, swap.disk)
+            self.assertFalse(swap.disk_path(key).exists())
+
+    def test_flush_pending_waits_for_queued_spawn(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+
+            async def release_spawn():
+                await asyncio.sleep(0.05)
+                with swap._state_lock:
+                    swap._pending_spawns = 0
+
+            async def run():
+                with swap._state_lock:
+                    swap._pending_spawns = 1
+                asyncio.create_task(release_spawn())
+                started_at = time.monotonic()
+                await swap.flush_pending()
+                self.assertGreaterEqual(time.monotonic() - started_at, 0.04)
+
+            asyncio.run(run())
+
+    def test_cleanup_disk_removes_untracked_snapshot_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            tracked_key = b"c" * 16
+            tracked_path = swap.disk_path(tracked_key)
+            tracked_path.parent.mkdir(parents=True, exist_ok=True)
+            tracked_path.write_text("tracked\n")
+            swap.disk[tracked_key] = str(tracked_path)
+
+            stray_path = Path(td) / "disk" / "swap-deadbeefdeadbeef.dfsn"
+            stray_path.write_text("stray\n")
+
+            swap._cleanup_disk()
+
+            self.assertTrue(tracked_path.exists())
+            self.assertFalse(stray_path.exists())
+
+    def test_newer_same_key_mirror_wins_over_older_completion(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"d" * 16
+            src_old = Path(td) / "old.dfsn"
+            src_new = Path(td) / "new.dfsn"
+            src_old.write_text("old\n")
+            src_new.write_text("new\n")
+            release_old = threading.Event()
+            release_new = threading.Event()
+
+            def blocked_copy(_src, _dst):
+                if Path(_src) == src_old:
+                    self.assertTrue(release_old.wait(timeout=5))
+                else:
+                    self.assertTrue(release_new.wait(timeout=5))
+                Path(_dst).write_bytes(Path(_src).read_bytes())
+
+            async def run():
+                with patch("grimoire.dflash.snapshot_swap.shutil.copy2", side_effect=blocked_copy):
+                    swap.bind_loop(asyncio.get_running_loop())
+                    swap._queue_mirror(src_old, swap.disk_path(key), key, target="disk")
+                    swap._queue_mirror(src_new, swap.disk_path(key), key, target="disk")
+                    release_new.set()
+                    await asyncio.sleep(0)
+                    release_old.set()
+                    await swap.flush_pending()
+
+            asyncio.run(run())
+            self.assertEqual(swap.disk_path(key).read_text(), "new\n")
+
+    def test_cleanup_disk_keeps_pending_mirror_destination(self):
+        with tempfile.TemporaryDirectory() as td:
+            swap = SnapshotSwap(ram_dir=f"{td}/ram", disk_dir=f"{td}/disk", ram_budget_gb=1)
+            key = b"e" * 16
+            pending_path = swap.disk_path(key)
+            pending_path.parent.mkdir(parents=True, exist_ok=True)
+            pending_path.write_text("pending\n")
+
+            async def parked():
+                await asyncio.sleep(0.5)
+
+            async def run():
+                task = asyncio.create_task(parked())
+                swap._track_mirror_task(task, key)
+                swap._cleanup_disk()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            asyncio.run(run())
+            self.assertTrue(pending_path.exists())
+
 
 class PrefixCachePersistenceTests(unittest.TestCase):
     def test_load_restores_snapshot_keys(self):
@@ -1659,6 +1989,24 @@ class PrefixCachePersistenceTests(unittest.TestCase):
             smaller = PrefixCache(cap=2, cache_dir=td)
             smaller.load()
             self.assertEqual(list(smaller.entries.values()), [snap_key])
+
+    def test_load_clamps_entries_back_to_runtime_cap(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = PrefixCache(cap=4, cache_dir=td)
+            key_a = cache.hash_prefix([1])
+            key_b = cache.hash_prefix([1, 2])
+            snap_a = cache.snapshot_key(key_a)
+            snap_b = cache.snapshot_key(key_b)
+            Path(td, "index.json").write_text(json.dumps({
+                "entries": [
+                    {"key_hex": key_a.hex(), "snapshot_key_hex": snap_a.hex()},
+                    {"key_hex": key_b.hex(), "snapshot_key_hex": snap_b.hex()},
+                ],
+            }))
+
+            smaller = PrefixCache(cap=1, cache_dir=td)
+            smaller.load()
+            self.assertEqual(list(smaller.entries.values()), [snap_b])
 
     def test_cleanup_clears_saved_index_on_disk(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1741,6 +2089,28 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(final["usage"]["completion_tokens"], 3)
         self.assertIn("timings", final)
         self.assertGreater(final["timings"]["predicted_per_second"], 0)
+
+    def test_streaming_holds_back_multi_token_stop_sequence(self):
+        self._install_fake_active([ord("h"), ord("i"), ord("E"), ord("N"), ord("D"), 0])
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+                "stop": ["END"],
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 200)
+        frames = _parse_sse(response.text)
+        deltas = [
+            f["choices"][0]["delta"].get("content", "")
+            for f in frames
+            if isinstance(f, dict) and "choices" in f and f["choices"][0].get("delta", {}).get("content")
+        ]
+        self.assertEqual("".join(deltas), "hi")
+        self.assertNotIn("END", "".join(deltas))
 
     def test_context_overflow_returns_400_before_daemon_call(self):
         active, daemon = self._install_fake_active([], cfg_overrides={"ctx-size": 4, "predict": 64})
@@ -1853,6 +2223,17 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         self.assertEqual(body["choices"][0]["message"]["content"], "ok")
         self.assertEqual(body["usage"]["completion_tokens"], 2)
 
+    def test_non_streaming_preserves_backend_error_detail(self):
+        active, daemon = self._install_fake_active([])
+        daemon._running = False
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={"model": "dflash-test", "messages": [{"role": "user", "content": "ping"}], "stream": False},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("dflash daemon not running", response.json()["detail"])
+
     def test_session_kv_saves_compact_full_snapshot_and_restores_next_turn(self):
         active, daemon = self._install_fake_active([ord("x"), 0])
         active.session_kv = SessionKV(cap=2)
@@ -1964,6 +2345,7 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         boundary = daemon.last_cmd_args["snap_pos"]
         self.assertEqual(daemon.last_cmd_args["snap_slot"], active.snapshot_staging_slot)
         self.assertGreater(boundary, 0)
+        self.assertEqual(daemon.snapshots, [])
         self.assertEqual(len(daemon.saved_snapshots), 1)
 
         prefix_key = active.prefix_cache.lookup(daemon.last_cmd_args["prompt_ids"], boundaries=[boundary])[0]
@@ -2016,6 +2398,137 @@ class DflashProxyIntegrationTests(unittest.TestCase):
         snapshot_key, prefix_len = active.session_kv.get_session(conv_id, prompt_ids)
         self.assertEqual(snapshot_key, active.session_kv.swap_key(conv_id))
         self.assertEqual(prefix_len, len(prompt_ids))
+
+    def test_session_lru_eviction_discards_old_snapshot_from_store(self):
+        active, daemon = self._install_fake_active([ord("a"), 0])
+        active.session_kv = SessionKV(cap=1)
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        conv_a = self.client.post(
+            "/history",
+            json={"title": "conv a", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        ).json()["id"]
+        first = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_a,
+                "messages": [{"role": "user", "content": "first"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(first.status_code, 200)
+        key_a = active.session_kv.swap_key(conv_a)
+        self.assertTrue(active.snapshot_swap.ram_path(key_a).exists())
+
+        daemon._tokens = [ord("b"), 0]
+        conv_b = self.client.post(
+            "/history",
+            json={"title": "conv b", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        ).json()["id"]
+        second = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_b,
+                "messages": [{"role": "user", "content": "second"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(second.status_code, 200)
+
+        self.assertFalse(active.session_kv.has_session(conv_a))
+        self.assertFalse(active.snapshot_swap.ram_path(key_a).exists())
+
+    def test_missing_prefix_snapshot_discards_stale_cache_entry(self):
+        active, daemon = self._install_fake_active([ord("o"), 0])
+        active.prefix_cache = PrefixCache(cap=2, cache_dir=tempfile.mkdtemp())
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        prompt_ids = [ord(c) for c in "[user]ping[/user][assistant]"]
+        boundary = len(prompt_ids)
+        prepared = active.prefix_cache.prepare_inline_snap(prompt_ids, boundary)
+        self.assertIsNotNone(prepared)
+        prefix_key, prefix_len = prepared
+        active.prefix_cache.confirm_inline_snap(prefix_key, prefix_len, prompt_ids)
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(active.prefix_cache.lookup(prompt_ids, boundaries=[boundary]))
+
+    def test_zero_token_failure_discards_unconfirmed_prefix_snapshot(self):
+        active, daemon = self._install_fake_active([0])
+        active.prefix_cache = PrefixCache(cap=2, cache_dir=tempfile.mkdtemp())
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        response = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("zero tokens", response.text)
+        self.assertFalse(any(active.snapshot_swap.ram_dir.glob("swap-*.dfsn")))
+        self.assertEqual(list(active.prefix_cache.entries.values()), [])
+
+    def test_hash_mismatch_evicts_stale_session_snapshot_from_store(self):
+        active, daemon = self._install_fake_active([ord("a"), 0])
+        active.session_kv = SessionKV(cap=2)
+        active.snapshot_swap = SnapshotSwap(ram_dir=tempfile.mkdtemp(), disk_dir=tempfile.mkdtemp(), ram_budget_gb=1)
+
+        hist = self.client.post(
+            "/history",
+            json={"title": "stale session", "model": "dflash-test", "messages": []},
+            headers=self.auth,
+        )
+        conv_id = hist.json()["id"]
+
+        first = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(first.status_code, 200)
+        session_key = active.session_kv.swap_key(conv_id)
+        self.assertTrue(active.snapshot_swap.ram_path(session_key).exists())
+
+        daemon._tokens = [0]
+        second = self.client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "dflash-test",
+                "conversation_id": conv_id,
+                "messages": [{"role": "user", "content": "different"}],
+                "stream": True,
+            },
+            headers=self.auth,
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(active.session_kv.has_session(conv_id))
+        self.assertFalse(active.snapshot_swap.ram_path(session_key).exists())
 
     def test_real_session_passes_obsidian_protected_blocks_to_compression(self):
         active, _ = self._install_fake_active(

@@ -100,6 +100,35 @@ def _extract_usage(raw_bytes):
     return found
 
 
+def _extract_error_message(raw_bytes):
+    """Extract an SSE or JSON error message if present."""
+    text = raw_bytes.decode("utf-8", errors="ignore")
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            parsed = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+            return error["message"]
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict) and isinstance(error.get("message"), str) and error["message"]:
+        return error["message"]
+    return None
+
+
 def _extract_tokens_per_sec(raw_bytes):
     """Extract predicted_per_second from the last timing chunk in SSE data."""
     text = raw_bytes.decode("utf-8", errors="ignore")
@@ -162,9 +191,7 @@ def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
-    if cached_tokens is not None and cached_tokens > 0:
-        usage["cached_tokens"] = cached_tokens
-    return {
+    payload = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
@@ -177,3 +204,6 @@ def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content
         "usage": usage,
         "context_window": ctx_size,
     }
+    if cached_tokens is not None:
+        payload["usage"]["cached_tokens"] = cached_tokens
+    return payload

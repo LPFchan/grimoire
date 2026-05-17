@@ -6,6 +6,7 @@ import logging
 import os
 import signal
 import subprocess
+from pathlib import Path
 from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Optional
@@ -53,6 +54,44 @@ def _extend_optional_arg(cmd, cfg, key, flag=None):
         cmd.extend([flag or f"--{key}", str(value)])
 
 
+def _append_native_dflash_args(cmd, cfg):
+    if cfg.get("backend", BACKEND_LLAMA) != BACKEND_LLAMA:
+        return
+    if cfg.get("speculative-type") != "dflash":
+        return
+
+    draft_model = _resolve_config_path(cfg.get("spec-draft-model") or cfg.get("draft"))
+    if not draft_model:
+        raise FileNotFoundError("Native DFlash requires a GGUF draft model path")
+    if not os.path.exists(draft_model):
+        raise FileNotFoundError(f"Native DFlash draft model not found at {draft_model}")
+
+    cmd.extend(["--spec-type", "dflash", "--spec-draft-model", draft_model])
+
+    cross_ctx = cfg.get("spec-dflash-cross-ctx")
+    if cross_ctx is not None:
+        cmd.extend(["--spec-dflash-cross-ctx", str(cross_ctx)])
+
+
+def _prepend_library_paths(env, paths, exclude_prefixes=()):
+    existing = []
+    for path in env.get("LD_LIBRARY_PATH", "").split(":"):
+        if not path:
+            continue
+        if any(path == prefix or path.startswith(f"{prefix}/") for prefix in exclude_prefixes):
+            continue
+        existing.append(path)
+
+    merged = []
+    for path in [*(paths or []), *existing]:
+        if path and path not in merged:
+            merged.append(path)
+    if merged:
+        env["LD_LIBRARY_PATH"] = ":".join(merged)
+    else:
+        env.pop("LD_LIBRARY_PATH", None)
+
+
 def build_cmd(cfg, port, alias=None):
     """Build llama-server command from model config."""
     model_path = _resolve_config_path(cfg["file"])
@@ -97,6 +136,7 @@ def build_cmd(cfg, port, alias=None):
 
     _extend_optional_arg(cmd, cfg, "image-min-tokens")
     _extend_optional_arg(cmd, cfg, "image-max-tokens")
+    _append_native_dflash_args(cmd, cfg)
 
     for bias in cfg.get("logit-bias", []) or []:
         cmd.extend(["--logit-bias", str(bias)])
@@ -157,17 +197,18 @@ class ActiveModel:
         # Put turboquant ggml libraries first so llama-server doesn't
         # accidentally load dflash's (older) ggml-cuda which lacks the
         # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
-        turboquant_libs = "/opt/grimoire-llama-cpp/lib"
-        existing = env.get("LD_LIBRARY_PATH", "")
-        env["LD_LIBRARY_PATH"] = f"{turboquant_libs}:/opt/dflash:" + ":".join(
-            p for p in existing.split(":") if p and p != turboquant_libs and not p.startswith("/opt/dflash")
+        _prepend_library_paths(
+            env,
+            [config.TURBOQUANT_LIB_DIR, config.TURBOQUANT_LIB64_DIR],
+            exclude_prefixes=(config.DFLASH_HOME,),
         )
 
         # LD_PRELOAD the park/unpark shim for park models
         if self.cfg.get("park-unpark"):
             existing_pre = env.get("LD_PRELOAD", "")
-            shim_path = "/opt/dflash/pflash_shim.so"
+            shim_path = config.PFLASH_SHIM_PATH
             env["LD_PRELOAD"] = f"{shim_path}:" + existing_pre if existing_pre else shim_path
+            env["PFLASH_SHIM_FIFO_BASE"] = f"/tmp/pflash_shim.{self.name}"
             logger.info(f"park-unpark enabled, LD_PRELOAD={env['LD_PRELOAD']}")
 
         logger.info(f"Starting {self.name} (llama) on GPU {self.gpu}, port {self.port}")
@@ -180,10 +221,11 @@ class ActiveModel:
         """Park llama-server GPU memory via shim FIFO (VMM unmap + host save)."""
         try:
             import os, select
-            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            base = f"/tmp/pflash_shim.{self.name}"
+            fd = os.open(f"{base}.ctl", os.O_WRONLY | os.O_NONBLOCK)
             os.write(fd, b"park\n")
             os.close(fd)
-            with open("/tmp/pflash_shim.ack", "r") as f:
+            with open(f"{base}.ack", "r") as f:
                 poll = select.poll()
                 poll.register(f, select.POLLIN)
                 if poll.poll(30000):
@@ -199,10 +241,11 @@ class ActiveModel:
         """Unpark llama-server GPU memory via shim FIFO (VMM remap + host restore)."""
         try:
             import os, select
-            fd = os.open("/tmp/pflash_shim.ctl", os.O_WRONLY | os.O_NONBLOCK)
+            base = f"/tmp/pflash_shim.{self.name}"
+            fd = os.open(f"{base}.ctl", os.O_WRONLY | os.O_NONBLOCK)
             os.write(fd, b"unpark\n")
             os.close(fd)
-            with open("/tmp/pflash_shim.ack", "r") as f:
+            with open(f"{base}.ack", "r") as f:
                 poll = select.poll()
                 poll.register(f, select.POLLIN)
                 if poll.poll(30000):
@@ -218,8 +261,7 @@ class ActiveModel:
         """Start the PFlash compression daemon on the same GPU."""
         drafter_path = resolve_path(self.cfg, "drafter")
         if not drafter_path:
-            logger.warning(f"pflash requested but no drafter configured for {self.name}")
-            return
+            raise RuntimeError(f"pflash requested but no drafter configured for {self.name}")
 
         # Pre-build PrefillConfig from model config
         self.prefill_config = PrefillConfig(
@@ -262,18 +304,22 @@ class ActiveModel:
             tail_budget=self.cfg.get("prefill-tail-budget", 12288),
         )
 
+        snapshot_disk_dir = self.cfg.get(
+            "snapshot-disk-dir",
+            f"/var/lib/grimoire/snapshot_swap/{self.name}",
+        )
+        snapshot_ram_root = Path(self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"))
+        snapshot_ram_dir = snapshot_ram_root / self.name
         session_cap = max(0, int(self.cfg.get("session-kv-slots", 2)))
         self.session_kv = SessionKV(
             cap=session_cap,
+            path=os.path.join(snapshot_disk_dir, "session-kv.json"),
         )
 
         self.snapshot_staging_slot = int(self.cfg.get("snapshot-staging-slot", 7))
         self.snapshot_swap = SnapshotSwap(
-            ram_dir=self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"),
-            disk_dir=self.cfg.get(
-                "snapshot-disk-dir",
-                f"/var/lib/grimoire/snapshot_swap/{self.name}",
-            ),
+            ram_dir=str(snapshot_ram_dir),
+            disk_dir=snapshot_disk_dir,
             ram_budget_gb=self.cfg.get("snapshot-ram-budget-gb", 20.0),
             disk_budget_gb=self.cfg.get("snapshot-disk-budget-gb", 100.0),
             disk_ttl_hours=self.cfg.get("snapshot-disk-ttl-hours", 24.0),
@@ -394,11 +440,14 @@ class ActiveModel:
 
     def _stop_dflash(self):
         """Stop the dflash daemon and save prefix cache."""
+        if self.snapshot_swap:
+            try:
+                self.snapshot_swap.flush_pending_sync(timeout=30)
+            except Exception as e:
+                logger.warning("snapshot flush failed during %s shutdown: %s", self.name, e)
         if self.prefix_cache:
             self.prefix_cache.save()
             self.prefix_cache.cleanup(self.dflash_daemon)
-        if self.session_kv:
-            self.session_kv.clear()
         if self.dflash_daemon:
             self.dflash_daemon.stop()
         self.process = None
@@ -467,12 +516,67 @@ class ModelManager:
 
     def _find_available_port(self, gpu_id):
         """Find an available port for a model on a given GPU."""
+        return self._find_available_port_excluding(gpu_id)
+
+    def _find_available_port_excluding(self, gpu_id, ignore_ports=None):
+        """Find an available port for a model on a given GPU, excluding known victims."""
+        ignored = {port for port in (ignore_ports or set()) if port is not None}
         port = 8001 + gpu_id * 10
         for _ in range(100):
-            if not any(m.port == port for m in self.active.values()):
+            if port in ignored:
+                return port
+            if not any(m.port == port for m in self.active.values() if m.port not in ignored):
                 return port
             port += 1
         raise RuntimeError("No available ports found")
+
+    @staticmethod
+    def _startup_timeout(cfg):
+        startup_timeout = cfg.get("startup-timeout", config.DEFAULT_STARTUP_TIMEOUT)
+        try:
+            return float(startup_timeout)
+        except (TypeError, ValueError):
+            return float(config.DEFAULT_STARTUP_TIMEOUT)
+
+    async def _start_active_model(self, active: ActiveModel):
+        """Start an ActiveModel and wait until it is ready."""
+        active.status = config.MODEL_STATUS_LOADING
+        is_dflash = active.backend_type == BACKEND_DFLASH
+
+        logger.warning(f"pflash: cfg.pflash={active.cfg.get('pflash')}, is_dflash={is_dflash}")
+        if active.cfg.get("pflash") and not is_dflash:
+            await asyncio.to_thread(active._start_pflash_daemon)
+            logger.warning(f"pflash: daemon started for {active.name}")
+
+        await asyncio.to_thread(active.start)
+        await active.wait_ready(timeout=self._startup_timeout(active.cfg))
+        active.status = config.MODEL_STATUS_LOADED
+
+    async def _stop_active_model(self, name: str, active: ActiveModel, drop_on_success: bool = True):
+        """Stop a tracked model, but retain failed cleanup in manager state."""
+        try:
+            await asyncio.to_thread(active.stop)
+        except Exception as e:
+            active.status = config.MODEL_STATUS_FAILED
+            self.active[name] = active
+            raise RuntimeError(f"failed to stop {name}: {e}") from e
+        if drop_on_success and self.active.get(name) is active:
+            self.active.pop(name, None)
+
+    async def _restore_incumbents(self, incumbents):
+        """Best-effort restart of incumbents evicted during failed replacement startup."""
+        errors = []
+        for name, incumbent in incumbents:
+            try:
+                await self._start_active_model(incumbent)
+            except Exception as e:
+                incumbent.status = config.MODEL_STATUS_FAILED
+                try:
+                    await self._stop_active_model(name, incumbent)
+                    errors.append(f"{name}: {e}")
+                except Exception as stop_error:
+                    errors.append(f"{name}: {e}; {stop_error}")
+        return errors
 
     async def start_model(self, model_name):
         """Start a model with GPU allocation priority: pinned, free, oldest eviction."""
@@ -496,6 +600,7 @@ class ModelManager:
             if not valid:
                 raise RuntimeError(reason)
 
+            incumbents = []
             pinned_gpu = registry.get_fixed_gpu(model_name)
             if pinned_gpu is not None:
                 if pinned_gpu >= self.gpu_count:
@@ -506,49 +611,43 @@ class ModelManager:
                         continue
                     if registry.is_fixed(name):
                         raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {gpu}")
-                    logger.info(f"Evicting {name} from GPU {gpu} for pinned model {model_name}")
-                    await asyncio.to_thread(active.stop)
-                    del self.active[name]
+                    incumbents.append((name, active))
             else:
                 gpu = self._find_free_gpu()
                 if gpu is None:
                     victim = self._find_oldest_evictable()
                     if not victim:
                         raise RuntimeError("All GPUs occupied by pinned models")
-                    logger.info(f"Evicting {victim.name} from GPU {victim.gpu} (oldest load)")
-                    await asyncio.to_thread(victim.stop)
-                    del self.active[victim.name]
+                    incumbents.append((victim.name, victim))
                     gpu = victim.gpu
 
             is_dflash = cfg.get("backend") == BACKEND_DFLASH
-            port = None if is_dflash else self._find_available_port(gpu)
+            ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
+            port = None if is_dflash else self._find_available_port_excluding(gpu, ignored_ports)
             active = ActiveModel(model_name, cfg, port, gpu)
-            self.active[model_name] = active
 
-            # Start pflash daemon BEFORE the backend to get contiguous VRAM
-            logger.warning(f"pflash: cfg.pflash={cfg.get('pflash')}, is_dflash={is_dflash}")
-            if cfg.get("pflash") and not is_dflash:
-                try:
-                    await asyncio.to_thread(active._start_pflash_daemon)
-                    logger.warning(f"pflash: daemon started for {model_name}")
-                except Exception as e:
-                    logger.warning(f"pflash: daemon failed for {model_name}: {e}")
-
-            await asyncio.to_thread(active.start)
             try:
-                startup_timeout = cfg.get("startup-timeout", config.DEFAULT_STARTUP_TIMEOUT)
-                try:
-                    startup_timeout = float(startup_timeout)
-                except (TypeError, ValueError):
-                    startup_timeout = config.DEFAULT_STARTUP_TIMEOUT
-                await active.wait_ready(timeout=startup_timeout)
-            except Exception:
+                for name, incumbent in incumbents:
+                    logger.info(f"Evicting {name} from GPU {gpu} for replacement model {model_name}")
+                    await asyncio.to_thread(incumbent.stop)
+                self.active[model_name] = active
+                await self._start_active_model(active)
+            except Exception as e:
                 active.status = config.MODEL_STATUS_FAILED
-                await asyncio.to_thread(active.stop)
-                self.active.pop(model_name, None)
+                try:
+                    await self._stop_active_model(model_name, active)
+                except Exception as stop_error:
+                    raise RuntimeError(f"{e}; {stop_error}") from e
+                rollback_errors = await self._restore_incumbents(incumbents)
+                if rollback_errors:
+                    raise RuntimeError(
+                        f"{e}; rollback failed for evicted incumbents: {'; '.join(rollback_errors)}"
+                    ) from e
                 raise
 
-            active.status = config.MODEL_STATUS_LOADED
+            for name, incumbent in incumbents:
+                if self.active.get(name) is incumbent:
+                    self.active.pop(name, None)
             logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
             return active
 

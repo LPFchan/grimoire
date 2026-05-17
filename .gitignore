@@ -15,3 +15,11 @@ opencode/node_modules/
 venv/
 
 .test-venv/
+
+# repo-template adoption
+.DS_Store
+Thumbs.db
+.tmp_commit_msg_*
+
+# build artifacts
+tmp/

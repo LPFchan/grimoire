@@ -317,7 +317,9 @@ bool migrate_prefill_cache(const TargetWeights & w,
                                                    head_v_dim, head_v_dim, w.ssm_dt_rank);
             ggml_tensor * Cn = ggml_new_tensor_2d(cache.rollback_ctx, GGML_TYPE_F32,
                                                    w.ssm_d_conv - 1, conv_channels);
-            ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_F16,
+            // Match the full-cache path so prefill->decode promotion does not
+            // inflate rollback intermediates relative to a cold full-cache alloc.
+            ggml_tensor * Si = ggml_new_tensor_4d(cache.rollback_ctx, GGML_TYPE_Q8_0,
                                                    head_v_dim, head_v_dim,
                                                    w.ssm_dt_rank, max_verify_tokens);
             ggml_tensor * Ci = ggml_new_tensor_3d(cache.rollback_ctx, GGML_TYPE_F32,

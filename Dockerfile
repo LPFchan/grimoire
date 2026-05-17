@@ -52,6 +52,8 @@ ENV CCACHE_DIR=/root/.ccache \
 
 # Copy only non-webui patches for the build stage
 RUN mkdir -p /app/patches
+COPY patches/prefill-thinking-fix.patch /app/patches/
+COPY patches/spec-dflash-contract.patch /app/patches/
 COPY patches/slot-save-mtmd.patch /app/patches/
 
 RUN --mount=type=cache,target=/root/.ccache \
@@ -60,6 +62,9 @@ RUN --mount=type=cache,target=/root/.ccache \
     set -eux; \
     # If CACHE_BUST changed, invalidate the built marker so cmake re-runs
     cache_bust_file=/app/.cache/llama-cpp-build/.cache_bust; \
+    patch_hash_file=/app/.cache/llama-cpp-build/.patch_hash; \
+    patch_hash=$( (sha256sum /app/patches/*.patch 2>/dev/null || true) | sha256sum | cut -d' ' -f1 ); \
+    need_patches=0; \
     if [ -f "$cache_bust_file" ]; then \
         old_bust=$(cat "$cache_bust_file"); \
         if [ "$old_bust" != "$CACHE_BUST" ]; then \
@@ -67,16 +72,14 @@ RUN --mount=type=cache,target=/root/.ccache \
             rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
         fi; \
     fi; \
+    if [ ! -f "$patch_hash_file" ] || [ "$(cat "$patch_hash_file" 2>/dev/null || true)" != "$patch_hash" ]; then \
+        need_patches=1; \
+    fi; \
     echo "$CACHE_BUST" > "$cache_bust_file"; \
     if [ ! -d /app/.cache/llama-cpp-src/repo/.git ]; then \
         rm -rf /app/.cache/llama-cpp-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /app/.cache/llama-cpp-src/repo; \
-        for patch in /app/patches/*.patch; do \
-            [ -f "$patch" ] || continue; \
-            echo "Applying $patch"; \
-            git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
-        done; \
-        rm -f /app/.cache/llama-cpp-build/.built; \
+        need_patches=1; \
     else \
         old_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
         git -C /app/.cache/llama-cpp-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
@@ -84,16 +87,25 @@ RUN --mount=type=cache,target=/root/.ccache \
         new_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse FETCH_HEAD); \
         if [ "$old_ref" != "$new_ref" ]; then \
             git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
-            git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
-            rm -f /app/.cache/llama-cpp-build/.built; \
-        else \
-            git -C /app/.cache/llama-cpp-src/repo checkout -- .; \
+            need_patches=1; \
         fi; \
         for patch in /app/patches/*.patch; do \
             [ -f "$patch" ] || continue; \
             echo "Applying $patch"; \
             git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
         done; \
+    fi; \
+    if [ "$need_patches" = "1" ] || [ ! -f /app/.cache/llama-cpp-build/.patched ]; then \
+        git -C /app/.cache/llama-cpp-src/repo checkout -- .; \
+        git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
+        for patch in /app/patches/*.patch; do \
+            [ -f "$patch" ] || continue; \
+            echo "Applying $patch"; \
+            git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
+        done; \
+        rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
+        touch /app/.cache/llama-cpp-build/.patched; \
+        printf '%s' "$patch_hash" > "$patch_hash_file"; \
     fi; \
     if [ ! -f /app/.cache/llama-cpp-build/.built ]; then \
         rm -f /app/.cache/llama-cpp-build/CMakeCache.txt; \
@@ -191,15 +203,16 @@ COPY dashboard/ /src/dashboard/
 RUN --mount=type=cache,target=/cache/webui-src \
     --mount=type=cache,target=/root/.npm \
     set -eux; \
+    webui_patch_hash_file=/cache/webui-src/.patch_hash; \
+    webui_patch_hash=$( (sha256sum /src/patches/grimoire-webui-*.patch 2>/dev/null || true) | sha256sum | cut -d' ' -f1 ); \
+    need_webui_patches=0; \
+    if [ ! -f "$webui_patch_hash_file" ] || [ "$(cat "$webui_patch_hash_file" 2>/dev/null || true)" != "$webui_patch_hash" ]; then \
+        need_webui_patches=1; \
+    fi; \
     if [ ! -d /cache/webui-src/repo/.git ]; then \
         rm -rf /cache/webui-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /cache/webui-src/repo; \
-        for patch in /src/patches/grimoire-webui-*.patch; do \
-            [ -f "$patch" ] || continue; \
-            echo "Applying webui patch: $patch"; \
-            git -C /cache/webui-src/repo apply "$patch"; \
-        done; \
-        touch /cache/webui-src/.patched; \
+        need_webui_patches=1; \
     else \
         old_ref=$(git -C /cache/webui-src/repo rev-parse HEAD); \
         git -C /cache/webui-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
@@ -207,9 +220,7 @@ RUN --mount=type=cache,target=/cache/webui-src \
         new_ref=$(git -C /cache/webui-src/repo rev-parse FETCH_HEAD); \
         if [ "$old_ref" != "$new_ref" ]; then \
             git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
-            git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
-        else \
-            git -C /cache/webui-src/repo checkout -- .; \
+            need_webui_patches=1; \
         fi; \
         for patch in /src/patches/grimoire-webui-*.patch; do \
             [ -f "$patch" ] || continue; \
@@ -217,6 +228,18 @@ RUN --mount=type=cache,target=/cache/webui-src \
             git -C /cache/webui-src/repo apply "$patch"; \
         done; \
         touch /cache/webui-src/.patched; \
+    fi; \
+    if [ "$need_webui_patches" = "1" ] || [ ! -f /cache/webui-src/.patched ]; then \
+        git -C /cache/webui-src/repo checkout -- .; \
+        git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
+        for patch in /src/patches/grimoire-webui-*.patch; do \
+            [ -f "$patch" ] || continue; \
+            echo "Applying webui patch: $patch"; \
+            git -C /cache/webui-src/repo apply "$patch"; \
+        done; \
+        rm -f /cache/webui-src/.built; \
+        touch /cache/webui-src/.patched; \
+        printf '%s' "$webui_patch_hash" > "$webui_patch_hash_file"; \
     fi; \
     cp -r /cache/webui-src/repo/tools /src/tools; \
     mkdir -p /src/tools/server/webui/src/routes/dashboard; \
@@ -241,7 +264,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     GRIMOIRE_MODELS_DIR=/models \
     GRIMOIRE_REGISTRY_PATH=/var/lib/grimoire/models.json \
     GRIMOIRE_REGISTRY_SEED_PATH=/etc/grimoire/models.json \
-    LD_LIBRARY_PATH=/opt/dflash:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
+    LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64 \
     PATH=/opt/grimoire-venv/bin:$PATH
 
 RUN apt-get update \

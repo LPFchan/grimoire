@@ -2,10 +2,13 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 import logging
+import os
 
 import httpx
+from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
@@ -15,6 +18,46 @@ from grimoire.prompt.generic import _prompt_layout_from_messages
 from grimoire.registry import BACKEND_DFLASH, resolve_path
 
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_slot_component(value: str) -> str:
+    raw = str(value)
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
+    safe = safe.strip("_-") or "conversation"
+    if safe != raw or len(safe) > 96:
+        digest = hashlib.sha1(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
+        safe = f"{safe[:96].rstrip('_-') or 'conversation'}-{digest}"
+    return safe
+
+
+def _kv_filename(model_name: str, conversation_id: str) -> str:
+    model_safe = _sanitize_slot_component(model_name)
+    conv_safe = _sanitize_slot_component(conversation_id)
+    return f"pflash-{model_safe}-{conv_safe}.kv"
+
+
+def _slot_lock(active):
+    lock = getattr(active, "_pflash_slot_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(active, "_pflash_slot_lock", lock)
+    return lock
+
+
+def _slot_save_key(active, conversation_id: str) -> str:
+    return _kv_filename(active.name, conversation_id)
+
+
+def _has_saved_kv(active, conversation_id: str) -> bool:
+    if not conversation_id:
+        return False
+    return os.path.isfile(f"/dev/shm/grimoire-slots/{_slot_save_key(active, conversation_id)}")
+
+
+def _maybe_kv_save_key(active, conversation_id: str | None) -> str | None:
+    if not conversation_id:
+        return None
+    return _slot_save_key(active, conversation_id)
 
 
 def _backend_request_headers(headers):
@@ -54,27 +97,19 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     payload["model"] = backend_model_id
     url = f"http://127.0.0.1:{active.port}/v1/chat/completions"
     headers = {}
+    validated_conversation_id = conversation_id if isinstance(conversation_id, str) else None
 
-    _kv_save_key = None  # set inside if fired: block when compression fires
+    _kv_save_key = None
 
     # PFlash compression: if the model has a pflash daemon and the prompt
     # exceeds the threshold, compress before proxying to llama-server.
-    # Compression is MANDATORY when the prompt exceeds threshold — if the
-    # daemon is missing or fails, the request is rejected with a 503 so the
-    # user knows compression is broken instead of silently passing through.
+    # Compression is mandatory once the threshold is hit. If the daemon is
+    # unavailable or compression fails, reject the request instead of silently
+    # bypassing the long-prompt path.
     daemon = getattr(active, 'pflash_daemon', None)
     pcfg = getattr(active, 'prefill_config', None)
     log = logging.getLogger(__name__)
     log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
-
-    def _kv_filename(cid: str) -> str:
-        return f"pflash-{cid}.kv"
-
-    def _check_warm(cid: str) -> bool:
-        """Check if a KV save file exists for this conversation (warm vs cold)."""
-        import os
-        kv_dir = "/dev/shm/grimoire-slots"
-        return os.path.isfile(f"{kv_dir}/{_kv_filename(cid)}") if cid else False
 
     if pcfg and pcfg.enabled:
         try:
@@ -84,40 +119,27 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 tokenizer, messages, add_generation_prompt=True,
                 model_cfg=model_cfg, active=active,
             )
-
+            _kv_save_key = _maybe_kv_save_key(active, validated_conversation_id)
             if len(prompt_ids) >= pcfg.threshold:
                 if not daemon or not daemon.is_running():
                     raise HTTPException(
                         status_code=503,
                         detail=(
                             f"pflash compression required for {active.name} "
-                            f"(prompt={len(prompt_ids)} ≥ threshold={pcfg.threshold}) "
-                            f"but pflash daemon is not running. Check that the drafter model "
-                            f"file exists and the daemon started at model load time."
+                            f"(prompt={len(prompt_ids)} >= threshold={pcfg.threshold}) "
+                            "but pflash daemon is not running. Check that the drafter model "
+                            "file exists and the daemon started at model load time."
                         ),
                     )
 
-                cid = payload.get("conversation_id")
-                is_warm = _check_warm(cid)
+                is_warm = _has_saved_kv(active, validated_conversation_id)
 
                 if not is_warm:
                     # ── COLD TURN: park + full compress + unpark ────────────
                     park_ok = False
-                    _park_ctl_fd = None
-                    _park_ack_fd = None
                     if model_cfg.get("park-unpark"):
                         try:
-                            import os, select
-                            _park_ctl_fd = os.open("/tmp/pflash_shim.ctl",
-                                                   os.O_WRONLY | os.O_NONBLOCK)
-                            os.write(_park_ctl_fd, b"park\n")
-                            _park_ack_fd = os.open("/tmp/pflash_shim.ack",
-                                                   os.O_RDONLY | os.O_NONBLOCK)
-                            poll = select.poll()
-                            poll.register(_park_ack_fd, select.POLLIN)
-                            if poll.poll(30000):
-                                resp = os.read(_park_ack_fd, 64).decode().strip()
-                                park_ok = (resp == "ok")
+                            park_ok = await asyncio.to_thread(active._park_llama)
                             if park_ok:
                                 log.warning("pflash park: llama parked")
                         except Exception as e:
@@ -132,26 +154,17 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             status_code=503,
                             detail=f"pflash compression failed for {active.name}: {e}",
                         )
-
-                    if park_ok and _park_ctl_fd is not None:
-                        try:
-                            import os, select
-                            os.write(_park_ctl_fd, b"unpark\n")
-                            poll = select.poll()
-                            poll.register(_park_ack_fd, select.POLLIN)
-                            if poll.poll(30000):
-                                resp = os.read(_park_ack_fd, 64).decode().strip()
-                                if resp == "ok":
+                    finally:
+                        if park_ok:
+                            try:
+                                if await asyncio.to_thread(active._unpark_llama):
                                     log.warning("pflash park: llama unparked")
-                        except Exception as e:
-                            log.warning(f"pflash park: unpark failed ({e})")
-                        finally:
-                            if _park_ctl_fd is not None: os.close(_park_ctl_fd)
-                            if _park_ack_fd is not None: os.close(_park_ack_fd)
+                            except Exception as e:
+                                log.warning(f"pflash park: unpark failed ({e})")
 
                 else:
                     # ── WARM TURN: skip park, only compress delta blocks ────
-                    log.warning(f"pflash warm: KV cache exists for {cid}")
+                    log.warning(f"pflash warm: KV cache exists for {validated_conversation_id}")
                     try:
                         compressed_ids, fired, blocks = await maybe_compress(
                             prompt_ids, daemon, pcfg, blocks=prompt_blocks,
@@ -208,8 +221,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
-                    if payload.get("conversation_id"):
-                        _kv_save_key = f"pflash-{payload['conversation_id']}.kv"
+                    if validated_conversation_id:
+                        _kv_save_key = _slot_save_key(active, validated_conversation_id)
                         log.warning(f"pflash kv: will save as {_kv_save_key}")
         except HTTPException:
             raise
@@ -221,34 +234,40 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
     client = httpx.AsyncClient(timeout=None)
     try:
-        payload = await plugin_manager.before_backend_request(
-            payload, active.name, model_cfg, backend_model_id, client, url, headers
-        )
+        slot_guard = _slot_lock(active)
+        await slot_guard.acquire()
+        try:
+            payload = await plugin_manager.before_backend_request(
+                payload, active.name, model_cfg, backend_model_id, client, url, headers
+            )
 
-        # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
-        _kv_key_raw = payload.get("conversation_id")
-        log.warning(f"pflash kv: raw key = {_kv_key_raw}")
-        if _kv_key_raw:
-            kv_name = f"pflash-{_kv_key_raw}.kv"
-            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
-            try:
-                rr = await client.post(f"{slot_url}?action=restore",
-                    json={"filename": kv_name}, timeout=5)
-                log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
-                if rr.status_code == 200:
-                    log.warning(f"pflash kv: restored {kv_name}")
-            except Exception as e:
-                log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
+            # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
+            log.warning(f"pflash kv: validated key = {validated_conversation_id}")
+            if validated_conversation_id:
+                kv_name = _slot_save_key(active, validated_conversation_id)
+                slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+                try:
+                    rr = await client.post(f"{slot_url}?action=restore",
+                        json={"filename": kv_name}, timeout=5)
+                    log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
+                    if rr.status_code == 200:
+                        _kv_save_key = _kv_save_key or kv_name
+                        log.warning(f"pflash kv: restored {kv_name}")
+                except Exception as e:
+                    log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
 
-        upstream = await client.send(
-            client.build_request(
-                "POST",
-                url,
-                headers=headers,
-                json=payload,
-            ),
-            stream=True,
-        )
+            upstream = await client.send(
+                client.build_request(
+                    "POST",
+                    url,
+                    headers=headers,
+                    json=payload,
+                ),
+                stream=True,
+            )
+        except Exception:
+            slot_guard.release()
+            raise
     except Exception:
         await client.aclose()
         raise
@@ -302,6 +321,10 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                             log.warning(f"pflash kv: saved {_kv_save_key}")
                 except Exception as e:
                     log.warning(f"pflash kv: save failed for {_kv_save_key}: {e}")
+                finally:
+                    slot_guard.release()
+            else:
+                slot_guard.release()
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")

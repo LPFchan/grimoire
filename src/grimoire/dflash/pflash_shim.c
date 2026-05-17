@@ -30,6 +30,8 @@ static size_t sh_sz;
 static int cf=-1, af=-1;
 static pthread_t th;
 static volatile int thr;
+static char ctl_path[256] = "/tmp/pflash_shim.ctl";
+static char ack_path[256] = "/tmp/pflash_shim.ack";
 
 __attribute__((constructor)) static void shim_init(void);
 __attribute__((destructor))  static void shim_fini(void);
@@ -209,10 +211,8 @@ static int unpark(void) {
 }
 
 static void listener(void) {
-    cf = open("/tmp/pflash_shim.ctl", O_RDONLY);
+    cf = open(ctl_path, O_RDWR);
     if (cf < 0) return;
-    af = open("/tmp/pflash_shim.ack", O_WRONLY | O_NONBLOCK);
-    if (af < 0) return;
     LOG("listener ready");
     char buf[256];
     while (thr) {
@@ -223,16 +223,28 @@ static void listener(void) {
         if (!strcmp(buf,"park")) r = park()==0?"ok\n":"err:park\n";
         else if (!strcmp(buf,"unpark")) r = unpark()==0?"ok\n":"err:unpark\n";
         else if (!strcmp(buf,"quit")) break;
-        write(af, r, strlen(r)); fsync(af);
+        af = open(ack_path, O_WRONLY);
+        if (af >= 0) {
+            write(af, r, strlen(r));
+            fsync(af);
+            close(af);
+            af = -1;
+        }
     }
-    close(cf); close(af);
-    unlink("/tmp/pflash_shim.ctl"); unlink("/tmp/pflash_shim.ack");
+    close(cf);
+    if (af >= 0) close(af);
+    unlink(ctl_path); unlink(ack_path);
 }
 
 static void shim_init(void) {
     LOG("loading");
-    mkfifo("/tmp/pflash_shim.ctl",0666);
-    mkfifo("/tmp/pflash_shim.ack",0666);
+    const char *base = getenv("PFLASH_SHIM_FIFO_BASE");
+    if (base && base[0]) {
+        snprintf(ctl_path, sizeof(ctl_path), "%s.ctl", base);
+        snprintf(ack_path, sizeof(ack_path), "%s.ack", base);
+    }
+    mkfifo(ctl_path,0666);
+    mkfifo(ack_path,0666);
     thr = 1;
     pthread_create(&th, NULL, (void*(*)(void*))listener, NULL);
     pthread_detach(th);
@@ -242,5 +254,5 @@ static void shim_init(void) {
 static void shim_fini(void) {
     thr = 0;
     if (cf>=0) close(cf); if (af>=0) close(af);
-    unlink("/tmp/pflash_shim.ctl"); unlink("/tmp/pflash_shim.ack");
+    unlink(ctl_path); unlink(ack_path);
 }

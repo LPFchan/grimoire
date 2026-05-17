@@ -26,7 +26,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen3.6-27B", dict(self.model_cfg))
 
         self.assertEqual(result["messages"][0]["role"], "system")
         self.assertIn(DFLASH_AWARENESS_MARKER, result["messages"][0]["content"])
@@ -43,7 +43,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "functions": [{"name": "conversation_recall"}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen3.6-27B", dict(self.model_cfg))
 
         self.assertEqual(len(result["messages"]), 2)
         self.assertIn("You are terse.", result["messages"][0]["content"])
@@ -59,7 +59,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen3.6-27B", dict(self.model_cfg))
 
         self.assertEqual([message["role"] for message in result["messages"]], ["system", "user"])
         self.assertIsInstance(result["messages"][0]["content"], list)
@@ -74,7 +74,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "bash"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen3.6-27B", dict(self.model_cfg))
 
         self.assertEqual(result, payload)
 
@@ -102,7 +102,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen3.6-27B", dict(self.model_cfg))
 
         self.assertEqual(result["messages"][0]["content"].count(DFLASH_AWARENESS_MARKER), 1)
 
@@ -120,7 +120,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-pflash-qwen3.6-27B", dict(self.model_cfg))
 
         rendered = "".join(part.get("text", "") for part in result["messages"][0]["content"])
         self.assertEqual(rendered.count(DFLASH_AWARENESS_MARKER), 1)

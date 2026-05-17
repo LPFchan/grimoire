@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Binary search for max stable ctx-size on pflash-qwen-27B."""
+"""Binary search for max stable ctx-size on pflash-qwen3.6-27B."""
 import json, subprocess, sys, time
 from pathlib import Path
 import httpx
 
 BASE = "http://localhost:9001"
 KEY = "7JcW7xX82ypTQPlsYle6XdjlBSWfG3NwbtYSRSXZQ88"
-MODEL = "pflash-qwen-27B"
+MODEL = "pflash-qwen3.6-27B"
 FIXTURES = Path("/home/yeowool/opencode_splits")
 CONFIG = Path("/home/yeowool/grimoire/etc/models.json")
 GRIMOIRE = Path("/home/yeowool/grimoire")
@@ -38,8 +38,8 @@ def build_prompt(chars):
 
 def set_ctx(ctx):
     data = json.loads(CONFIG.read_text())
-    data["models"]["pflash-qwen-27B"]["ctx-size"] = ctx
-    data["models"]["pflash-qwen-27B"]["max-effective-context"] = ctx
+    data["models"]["pflash-qwen3.6-27B"]["ctx-size"] = ctx
+    data["models"]["pflash-qwen3.6-27B"]["max-effective-context"] = ctx
     CONFIG.write_text(json.dumps(data, indent=2))
 
 
@@ -141,7 +141,7 @@ def main():
     lo, hi = int(sys.argv[1]) if len(sys.argv) > 1 else 10000, \
              int(sys.argv[2]) if len(sys.argv) > 2 else 100000
 
-    print(f"Binary search pflash-qwen-27B ctx-size: [{lo:,}, {hi:,}]")
+    print(f"Binary search pflash-qwen3.6-27B ctx-size: [{lo:,}, {hi:,}]")
     print(f"=" * 55)
 
     results = {}

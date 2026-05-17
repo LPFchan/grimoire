@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PID-like context-length tuning for pflash-qwen-27B.
+PID-like context-length tuning for pflash-qwen3.6-27B.
 
 Binary searches for the maximum stable ctx-size on RTX 3090 24GB
 by sending long prompts from OpenCode session fixtures and checking
@@ -27,7 +27,7 @@ import httpx
 
 BASE_URL = "http://localhost:9001"
 API_KEY = "7JcW7xX82ypTQPlsYle6XdjlBSWfG3NwbtYSRSXZQ88"
-MODEL = "pflash-qwen-27B"
+MODEL = "pflash-qwen3.6-27B"
 FIXTURES_DIR = Path("/home/yeowool/opencode_splits")
 MODELS_JSON = Path("/home/yeowool/grimoire/etc/models.json")
 GRIMOIRE_DIR = Path("/home/yeowool/grimoire")
@@ -164,7 +164,7 @@ def set_ctx_size_and_restart(ctx_size):
     print(f"  [config] Setting ctx-size={ctx_size}...")
     with open(MODELS_JSON) as f:
         data = json.load(f)
-    cfg = data["models"]["pflash-qwen-27B"]
+    cfg = data["models"]["pflash-qwen3.6-27B"]
     old = cfg.get("ctx-size", 0)
     cfg["ctx-size"] = ctx_size
     cfg["max-effective-context"] = ctx_size
@@ -258,7 +258,7 @@ def main():
 
     print(f"""
 ╔══════════════════════════════════════════════════════════════╗
-║  pflash-qwen-27B Context Length Tuning                      ║
+║  pflash-qwen3.6-27B Context Length Tuning                   ║
 ║  Model: {MODEL}                                           ║
 ║  Backend: dflash (pflash compression only, no DDTree)       ║
 ║  KV cache: q8_0 ({KV_BYTES_PER_TOKEN:,} bytes/token)                ║
