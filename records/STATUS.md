@@ -62,12 +62,11 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Active Blocker
 
-Resolved — switching canary to Bee's binary. TheTom's DFlash port produces 0% acceptance due to a subtle cross-data or CUDA kernel difference that we haven't isolated. Bee's binary achieves 100% acceptance with the same GGUF and target. Since the canary only uses Q8_0 cache types (no turboquant), Bee's binary is a drop-in replacement.
+Resolved — Bee's binary supports all cache types we need (turbo4 for baseline, q8_0 for DFlash/PFlash). No turboquant porting needed. Bee is a drop-in replacement for both the canary and the production stack.
 
 ## Immediate Next Steps
 
 1. ✅ Phase 1 core pipeline — ring buffer, Bee's dflash_draft.cpp, all bugs fixed
-2. ✅ Binary comparison test — Bee gets 100% acceptance (11/11), we get 0%
-3. ✅ Decision: use Bee's binary for the canary instead of continuing to port DFlash to TheTom
-4. 🔴 Launch Bee's `llama-server` as the native DFlash canary on GPU 1 (port 9002)
-5. Phase 2-7: proceed on remaining tracks (persistence, PFlash, integration)
+2. ✅ Decision: Bee's binary supports everything — turbo4, q8_0, and DFlash (100% acceptance)
+3. 🔴 Launch Bee's `llama-server` as the served runtime on GPU 1 (port 9002)
+4. Phase 2: Persistence, PFlash parity, integration on Bee's stack
