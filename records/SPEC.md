@@ -78,7 +78,7 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 | --- | --- | --- | --- |
 | TheTom/llama-cpp-turboquant | `https://github.com/TheTom/llama-cpp-turboquant.git` (branch `feature-turboquant-kv-cache-b9079-69d8e4b`) | `tmp/spec-analysis/thetom-shallow/` | `69d8e4be47243e83b3d0d71e932bc7aa61c644dc` |
 | spiritbuun/buun-llama-cpp | `https://github.com/spiritbuun/buun-llama-cpp.git` | `tmp/spec-analysis/buun-shallow/` | `853eebdd02c2db4baf7bf781adadee6e7ce1d44e` |
-| Anbeeld/beellama.cpp | `https://github.com/Anbeeld/beellama.cpp.git` | `tmp/spec-analysis/bee-shallow/` | `633cd34fb6df72ad88a74e9320dad03ddd788fb1` |
+| Anbeeld/beellama.cpp | `https://github.com/Anbeeld/beellama.cpp.git` | `tmp/spec-analysis/bee-shallow/` | `0ef12a52c35eeff894ca4ef8019f2510f5e3ded8` |
 | ggml-org/llama.cpp PR 22105 | `https://github.com/ggml-org/llama.cpp.git` | `tmp/spec-analysis/ggml-pr22105/` | `320a6a44a5b1de6a074ba781e65f5fd79fb4051a` |
 | Luce-Org/lucebox-hub | `https://github.com/Luce-Org/lucebox-hub.git` | `tmp/spec-analysis/lucebox-hub/` | `e5347801719ad7d45a3d7bd096e9e57778ce23ea` |
 

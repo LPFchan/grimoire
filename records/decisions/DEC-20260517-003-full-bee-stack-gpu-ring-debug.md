@@ -11,7 +11,7 @@ Adopt Bee's `llama-server` binary (`Anbeeld/beellama.cpp`) as the single runtime
 
 Phase 1 ported Bee's DFlash pipeline onto TheTom (ring buffer, graph builder, flush_prefill). TheTom achieves 0% draft acceptance. Bee's binary achieves 100% with the same GGUF. Investigation revealed Bee already has turbo4 KV cache support built-in — no porting needed.
 
-However, DFlash + turbo4 together hang during prompt processing when the GPU cross ring buffer is active. The GPU ring performs D2D copies of hidden states and runs interleave kernels on the default CUDA stream. With turbo4 KV cache, these operations conflict, causing a GPU-side deadlock. `GGML_DFLASH_GPU_RING=0` avoids the bug by using CPU copies, but adds 15-50ms per draft cycle (2-3x slower draft).
+However, DFlash + turbo4 together hang during prompt processing when the GPU cross ring buffer is active. The GPU ring performs D2D copies of hidden states and runs interleave kernels on `cudaStreamPerThread`. With turbo4 KV cache, the ggml CUDA backend uses a private per-context stream — the cross-stream ordering hazard deadlocks at `cudaStreamSynchronize`. **Fixed upstream** via `ggml_backend_sched_synchronize` after `process_ubatch()` (PR #19, commit `0ef12a5`).
 
 The purpose of DFlash is faster decode. A 2-3x slower draft path negates the speculative decoding benefit.
 

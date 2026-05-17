@@ -21,13 +21,11 @@
 
 - [x] Phase 1: Core DFlash decode pipeline — ring buffer, Bee's dflash_draft.cpp
 - [x] Phase 1.5: Binary comparison — Bee 100%, TheTom 0%. Decision: full Bee stack.
-- [ ] **Phase 1.6: Fix GPU ring + turbo4 hang** — CUDA stream conflict in `dflash_cross_ring_gpu`
-  - The GPU ring uses the default CUDA stream; turbo4's KV cache operations may be conflicting
-  - Likely fix: use explicit stream for ring operations or add `cudaStreamSynchronize` before interleave
-  - Target: draft decode time back to ~7ms with turbo4 cache
-- [ ] Phase 2: Server integration (reduced verifier, multi-slot, rollback)
-- [ ] Phase 3: Supporting infrastructure (GPU ring, KV cache)
-- [ ] Phase 2: Server integration (est. 5 days)
+- [x] **Phase 1.6: Fix GPU ring + turbo4 hang** — merged upstream as PR #19 (commit `0ef12a5`)
+  - Root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml uses private per-context stream
+  - Fix: `ggml_backend_sched_synchronize` after `process_ubatch()` when DFlash active
+  - Verified: 100% acceptance, draft 6-14ms, verify 48-58ms
+- [ ] Phase 2: Server integration — integrate DFlash canary into production (reduced verifier, multi-slot, rollback)
   - [ ] 2.1 Port `dflash_reduced_verify_plan()`
   - [ ] 2.2 Port `dflash_sample_reduced_verify()`
   - [ ] 2.3 Multi-slot setup

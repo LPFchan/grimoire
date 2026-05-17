@@ -62,11 +62,11 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Active Blocker
 
-GPU cross ring buffer hangs when DFlash + `--cache-type-k turbo4` are used together. CUDA stream conflict between the GPU ring's D2D copies and turbo4's KV cache operations. `GGML_DFLASH_GPU_RING=0` works around it but makes draft 2-3x slower (58ms vs 7ms), defeating DFlash's purpose. Fix is Phase 1.6.
+GPU cross ring buffer hang with DFlash + `--cache-type-k turbo4` resolved. Root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml uses private per-context stream. Fix: `ggml_backend_sched_synchronize` after `process_ubatch()` when DFlash active. Merged upstream at Anbeeld/beellama.cpp PR #19 (commit `0ef12a5`).
 
 ## Immediate Next Steps
 
 1. ✅ Full Bee stack adopted (turbo4 + DFlash, single binary, 100% acceptance)
 2. ✅ Canary deployed on GPU 1, port 9002 with GPU ring + turbo4 (no workaround needed)
-3. ✅ GPU ring + turbo4 hang fixed — root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml backend uses a private stream. After `process_ubatch()`, the ggml stream may still have pending work. `llama_get_layer_hidden()` calls `ctx->synchronize()` which syncs the ggml stream, but this sync itself hangs because of cross-stream ordering issues. Fix: `ggml_backend_sched_synchronize(sched.get())` after `process_ubatch()` when DFlash is active, ensuring the ggml stream completes before DFlash ring reads tensor data.
+3. ✅ GPU ring + turbo4 hang fixed — root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml backend uses a private stream. After `process_ubatch()`, the ggml stream may still have pending work. `llama_get_layer_hidden()` calls `ctx->synchronize()` which syncs the ggml stream, but this sync itself hangs because of cross-stream ordering issues. Fix: `ggml_backend_sched_synchronize(sched.get())` after `process_ubatch()` when DFlash is active, ensuring the ggml stream completes before DFlash ring reads tensor data. PR opened at https://github.com/Anbeeld/beellama.cpp/pull/19
 4. Phase 2: Server integration, persistence, PFlash parity
