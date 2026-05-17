@@ -25,12 +25,12 @@
   - Root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml uses private per-context stream
   - Fix: `ggml_backend_sched_synchronize` after `process_ubatch()` when DFlash active
   - Verified: 100% acceptance, draft 6-14ms, verify 48-58ms
-- [ ] Phase 2: Server integration — integrate DFlash canary into production (reduced verifier, multi-slot, rollback)
-  - [ ] 2.1 Port `dflash_reduced_verify_plan()`
-  - [ ] 2.2 Port `dflash_sample_reduced_verify()`
-  - [ ] 2.3 Multi-slot setup
-  - [ ] 2.4 Verification loop
-  - [ ] 2.5 Accept path
+- [ ] Phase 2: Server integration — deploy DFlash canary as production service
+  - [ ] 2.1 Systemd service for canary (restart behavior, logging, GPU affinity)
+  - [ ] 2.2 Gateway routing: route DFlash requests to port 9002
+  - [ ] 2.3 Monitor DFlash metrics (draft acceptance, spec cycle time)
+  - [ ] 2.4 Swap to upstream-rebuilt binary when build completes
+  - [ ] 2.5 Load test: verify no regressions under concurrent requests
 - [ ] Phase 3: Supporting infrastructure (est. 5.5 days)
   - [ ] 3.1 Ring buffer data structures (done in Phase 1)
   - [ ] 3.2 `dflash_eval_callback()` — graph-level hidden capture
