@@ -66,7 +66,9 @@ GPU cross ring buffer hang with DFlash + `--cache-type-k turbo4` resolved. Root 
 
 ## Immediate Next Steps
 
-1. ✅ Full Bee stack adopted (turbo4 + DFlash, single binary, 100% acceptance)
-2. ✅ Canary deployed on GPU 1, port 9002 with GPU ring + turbo4 (no workaround needed)
-3. ✅ GPU ring + turbo4 hang fixed — root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml backend uses a private stream. After `process_ubatch()`, the ggml stream may still have pending work. `llama_get_layer_hidden()` calls `ctx->synchronize()` which syncs the ggml stream, but this sync itself hangs because of cross-stream ordering issues. Fix: `ggml_backend_sched_synchronize(sched.get())` after `process_ubatch()` when DFlash is active, ensuring the ggml stream completes before DFlash ring reads tensor data. PR opened at https://github.com/Anbeeld/beellama.cpp/pull/19
-4. Phase 2: Server integration, persistence, PFlash parity
+1. ✅ Full Bee stack adopted — canonical engine for both DFlash and non-DFlash serving
+2. ✅ GPU ring + turbo4 fixed (PR #19 merged upstream)
+3. ✅ Bee tested with Gemma 4 31B + turbo4 + multimodal — all production flags supported
+4. ✅ Sparse V skip warp fix cherry-picked from TheTom
+5. 🔄 Docker build with Bee (webui patches need porting)
+6. Phase 2.5: Gateway routing, monitoring, DFlash canary productionization
