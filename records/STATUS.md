@@ -62,11 +62,11 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Active Blocker
 
-Resolved — Bee's binary supports all cache types we need (turbo4 for baseline, q8_0 for DFlash/PFlash). No turboquant porting needed. Bee is a drop-in replacement for both the canary and the production stack.
+GPU cross ring buffer hangs when DFlash + `--cache-type-k turbo4` are used together. CUDA stream conflict between the GPU ring's D2D copies and turbo4's KV cache operations. `GGML_DFLASH_GPU_RING=0` works around it but makes draft 2-3x slower (58ms vs 7ms), defeating DFlash's purpose. Fix is Phase 1.6.
 
 ## Immediate Next Steps
 
-1. ✅ Phase 1 core pipeline — ring buffer, Bee's dflash_draft.cpp, all bugs fixed
-2. ✅ Decision: Bee's binary supports everything — turbo4, q8_0, and DFlash (100% acceptance)
-3. 🔴 Launch Bee's `llama-server` as the served runtime on GPU 1 (port 9002)
-4. Phase 2: Persistence, PFlash parity, integration on Bee's stack
+1. ✅ Full Bee stack adopted (turbo4 + DFlash, single binary, 100% acceptance)
+2. 🔴 Phase 1.6: Fix GPU ring + turbo4 hang (CUDA stream conflict in cross-ring-interleave.cu)
+3. Phase 2: Server integration (reduced verifier, multi-slot, rollback)
+4. Phase 3: Supporting infrastructure
