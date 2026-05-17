@@ -7,11 +7,11 @@
 
 ## Mission
 
-Migrate the served DFlash/PFlash stack onto the canonical `TheTom/llama-cpp-turboquant` base. Preserve live runtime contracts first — porting files is not enough. Lucebox retirement is blocked until decode, DFlash `compact-full` persistence, and the preserved llama-side PFlash path are all green.
+Migrate the served DFlash/PFlash stack onto the canonical `Anbeeld/beellama.cpp` (Bee) base.
 
 ### Workstreams
 
-- **A**: Canonical DFlash decode on TheTom.
+- **A**: Canonical DFlash decode on Bee.
 - **B**: DFlash `compact-full` persistence parity for `dflash-pflash-qwen3.6-27B`.
 - **C**: Preserved llama-side PFlash path, including its `.kv` slot contract, warm/cold behavior, and text-only reconstruction semantics.
 - A, B, and C are not validation-independent. Changes to prompt layout, effective prompt semantics, or snapshot formats can invalidate multiple tracks at once.
@@ -25,7 +25,7 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 - DFlash remains text-only for this migration.
 - Served `pflash-qwen3.6-27B` is text-only. Do not carry multimodal behavior or `mmproj` wiring for this model into the migrated stack.
 - GGUF is the target end-state for DFlash draft artifacts, but the served artifact flip happens only after the canonical path is proven.
-- Bee is a selective helper source only. Do not adopt Bee wholesale unless the selective path fails and the failure is documented.
+- Bee is the canonical engine. TheTom retired — all turboquant features upstreamed or ported.
 - Standalone PFlash packaging is the default first target.
 - The llama-side PFlash path keeps the current token -> text -> message reconstruction flow after compression. Direct prompt/token integration is out of scope.
 - VMM-based park/unpark is preferred only if isolated measurement proves the gain. SIGTERM/page-cache reload behavior is fallback.
@@ -70,7 +70,7 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 ### Contract D: Runtime Isolation
 - End-state removes `/opt/dflash` entirely from served runtime image, startup environment, and runtime search path.
 - Any remaining `/opt/dflash` dependency before cutover is temporary migration debt, limited to pre-cutover preservation work.
-- The canonical non-PFlash llama path must be anchored on TheTom libraries only throughout the migration.
+- The canonical non-PFlash llama path must be anchored on Bee libraries throughout the migration (TheTom retired — all turboquant features upstreamed).
 
 ## Pinned Upstream Repos
 
@@ -118,12 +118,12 @@ Default regression budget: median TTFT no worse than +20%, median decode TPS no 
 | `dflash-pflash-qwen3.6-27B` served decode | Text-only chat semantics, `parallel=1`, `ctx-size=60000`, `max-effective-context=60000`, `budget=18`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `<|im_end|>` stop-string behavior, block-aware prompt compression/reconstruction, `snapshot-mode=compact-full` | Lucebox decode daemon dependency. Early `.safetensors` -> GGUF draft cutover before proven. |
 | `pflash-qwen3.6-27B` preserved PFlash path | Standalone `pflash_daemon`, raw `compress <path> <keep_x1000>` protocol, `Qwen3.5-0.8B Q8_0` drafter, token -> text -> message reconstruction | Multimodal serving and `mmproj` wiring |
 | `pflash-park-qwen3.6-27B` preserved park path | FIFO park/unpark via `pflash_shim.so`, same text-only compression semantics as above | Global `/opt/dflash` library-path coupling |
-| `qwen-3.6-27B` normal llama path | Canonical non-PFlash startup, multimodal config, resolves against TheTom libraries without `/opt/dflash` | Hidden fallback that only works because `/opt/dflash` is in runtime search path |
+ | `qwen-3.6-27B` normal llama path | Canonical non-PFlash startup, multimodal config, resolves against Bee libraries without `/opt/dflash` | Hidden fallback that only works because `/opt/dflash` is in runtime search path |
 | `dflash-native-qwen3.6-27B-canary` native canary | Dormant native-control-plane launch contract | Treating canary as served replacement before real-hardware decode verification |
 
 ## Final Gates
 
-1. Canonical base remains TheTom + buun core + selective Bee, not Bee-first.
+1. Canonical base is Bee (`Anbeeld/beellama.cpp`). TheTom retired — all turboquant features upstreamed or ported.
 2. DFlash decode parity is green for `dflash-pflash-qwen3.6-27B`.
 3. DFlash `compact-full` persistence parity is green (restart resilience, staging-slot, hash invalidation, bounded snapshot-store growth).
 4. Preserved llama-side PFlash parity is green (.kv slot contract, warm/cold, reconstruction, all required native fixes).

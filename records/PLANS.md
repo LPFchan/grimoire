@@ -3,17 +3,16 @@
 ## Approved Directions
 
 ### Canonical Stack Migration (Phases 1-7)
-- **Outcome:** DFlash decode, compact-full persistence, and preserved PFlash all run on the canonical TheTom base; Lucebox retired
-- **Why accepted:** Single canonical llama.cpp fork, no `/opt/dflash` in served runtime, unified control plane
+- **Outcome:** DFlash decode, compact-full persistence, and preserved PFlash all run on the canonical Bee base (`Anbeeld/beellama.cpp`); Lucebox retired
+- **Why accepted:** Single canonical llama.cpp fork with both turboquant and DFlash built in; no `/opt/dflash` in served runtime; unified control plane
 - **Value:** Simpler build, smaller runtime image, reduced operational surface
-- **Preconditions:** All upstream repos pinned by SHA (done), TheTom native binary builds (done)
+- **Preconditions:** All upstream repos pinned by SHA (done), Bee native binary builds (done), GPU ring + turbo4 hang fixed upstream (PR #19, merged)
 
-### Port Bee's DFlash Pipeline Onto TheTom
-- **Outcome:** Native canary generates valid draft tokens and achieves speculative decode speedup
-- **Why accepted:** Our simplified DFlash patch produces garbage draft tokens. Bee's implementation is user-verified working with Buun's GGUF
-- **Root cause:** Flat `vector<float> history` capture is incorrect — Bee uses a ring buffer with incremental prefill population and a `prepare_batch_draft()` step that our port omitted
-- **Value:** Working DFlash decode on TheTom turboquant base; unlocks Phase 3-7
-- **Preconditions:** Buun's `dflash-draft-3.6-q8_0.gguf` validated (done: arch `dflash-draft`, full tokenizer, 58 tensors)
+### Adopt Bee as Canonical Engine
+- **Outcome:** Single Bee binary serves both DFlash and non-DFlash production traffic. TheTom retired.
+- **Why accepted:** TheTom's custom turboquant work is either upstreamed into Bee's base or irrelevant for CUDA Linux. Bee has DFlash built in. GPU ring + turbo4 hang fixed upstream.
+- **Value:** One binary to build, deploy, and maintain. No TheTom-specific patches to carry forward.
+- **Preconditions:** Bee tested with Gemma 4 + turbo4 + multimodal (done). All production flags supported (done). Docker build with web UI patches (in progress).
 
 ## Sequencing
 
@@ -31,12 +30,12 @@
   - [x] 2.3 Sparse V skip warp fix cherry-picked from TheTom
   - [ ] 2.4 Docker build with Bee (webui patches need porting)
   - [ ] 2.5 Gateway routing for DFlash canary
-- [ ] Phase 3: Supporting infrastructure (est. 5.5 days)
-  - [ ] 3.1 Ring buffer data structures (done in Phase 1)
-  - [ ] 3.2 `dflash_eval_callback()` — graph-level hidden capture
-  - [ ] 3.3 `set_dflash_capture()` + GPU capture variant
-  - [ ] 3.4 `llama_set_cross_data_seq()` improvements
-  - [ ] 3.5 `dflash_kv_cache_init/update/reset` — K/V projection cache (CPU first)
+- [ ] Phase 3: compact-full Persistence Implementation (on Bee base)
+  - [ ] 3.1 DFlash snapshot save/load for KV + recurrent state + `target_feat`
+  - [ ] 3.2 Prompt-boundary inline snapshots, staging-slot semantics
+  - [ ] 3.3 RAM-first writes, async disk mirror, TTL/budget enforcement, hash invalidation
+  - [ ] 3.4 Prefix-cache compatibility
+  - [ ] 3.5 Preserved llama-side PFlash path on Bee
 - [ ] Verify: short-prompt decode with positive `#gen drafts` and speedup >1.5x
 
 ### Mid term
