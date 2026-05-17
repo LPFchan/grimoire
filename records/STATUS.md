@@ -67,6 +67,6 @@ GPU cross ring buffer hangs when DFlash + `--cache-type-k turbo4` are used toget
 ## Immediate Next Steps
 
 1. ✅ Full Bee stack adopted (turbo4 + DFlash, single binary, 100% acceptance)
-2. ✅ Canary deployed on GPU 1, port 9002 (`GGML_DFLASH_GPU_RING=0` workaround)
-3. 🔴 GPU ring + turbo4 hang unresolved — Anbeeld fix (`75ae2a6`) applied but addresses different crash path
+2. ✅ Canary deployed on GPU 1, port 9002 with GPU ring + turbo4 (no workaround needed)
+3. ✅ GPU ring + turbo4 hang fixed — root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml backend uses a private stream. After `process_ubatch()`, the ggml stream may still have pending work. `llama_get_layer_hidden()` calls `ctx->synchronize()` which syncs the ggml stream, but this sync itself hangs because of cross-stream ordering issues. Fix: `ggml_backend_sched_synchronize(sched.get())` after `process_ubatch()` when DFlash is active, ensuring the ggml stream completes before DFlash ring reads tensor data.
 4. Phase 2: Server integration, persistence, PFlash parity
