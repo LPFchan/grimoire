@@ -67,6 +67,6 @@ GPU cross ring buffer hangs when DFlash + `--cache-type-k turbo4` are used toget
 ## Immediate Next Steps
 
 1. ✅ Full Bee stack adopted (turbo4 + DFlash, single binary, 100% acceptance)
-2. 🔴 Phase 1.6: Fix GPU ring + turbo4 hang (CUDA stream conflict in cross-ring-interleave.cu)
-3. Phase 2: Server integration (reduced verifier, multi-slot, rollback)
-4. Phase 3: Supporting infrastructure
+2. ✅ Canary deployed on GPU 1, port 9002 (`GGML_DFLASH_GPU_RING=0` workaround)
+3. 🔴 GPU ring + turbo4 hang unresolved — Anbeeld fix (`75ae2a6`) applied but addresses different crash path
+4. Phase 2: Server integration, persistence, PFlash parity
