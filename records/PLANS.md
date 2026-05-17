@@ -19,22 +19,20 @@
 
 ### Near term
 
-- [ ] Phase 1: Core DFlash decode pipeline (est. 4 days)
-  - [ ] 1.1 Port `build_cross_data()` — ring-to-cross-data assembly
-  - [ ] 1.2 Port `prepare_batch_draft()` — separate cross-data setup from decode
-  - [ ] 1.3 Fix `draft()` — proper batch sizing, cross-data usage
-  - [ ] 1.4 Port `flush_prefill()` — incremental ring population during prefill
-  - [ ] 1.5 Port `capture_target_hiddens()` — ring-based (replace flat history)
-  - [ ] 1.6 Fix server `n_draft_max` — cap to `block_size - 1`
-  - [ ] 1.7 Wire `common_speculative_draft()` return path properly
+- [x] Phase 1: Core DFlash decode pipeline — ring buffer, build_cross_data, Bee's dflash_draft.cpp
+- [ ] **Phase 1.5: Debug 0% draft acceptance** — cross-data interleave layout, ring offset accuracy
+  - [ ] 1.5a Validate build_cross_data() interleave matches graph builder set_input() expectations
+  - [ ] 1.5b Check ring_write() slot placement against Bee's ring_write()
+  - [ ] 1.5c Verify n_real/n_enc/ctx_len consistency at graph input time
+  - [ ] 1.5d Binary comparison test: Bee vs TheTom on same prompt, same GGUF
 - [ ] Phase 2: Server integration (est. 5 days)
   - [ ] 2.1 Port `dflash_reduced_verify_plan()`
   - [ ] 2.2 Port `dflash_sample_reduced_verify()`
-  - [ ] 2.3 Multi-slot setup — shared drafter ctx, `llama_dflash_allocate_slots()`
-  - [ ] 2.4 Verification loop — set verify flags, consume reduced logits
-  - [ ] 2.5 Accept path — `dflash_set_active_slot()`, `dflash_rollback()`, ring updates
+  - [ ] 2.3 Multi-slot setup
+  - [ ] 2.4 Verification loop
+  - [ ] 2.5 Accept path
 - [ ] Phase 3: Supporting infrastructure (est. 5.5 days)
-  - [ ] 3.1 Ring buffer data structures
+  - [ ] 3.1 Ring buffer data structures (done in Phase 1)
   - [ ] 3.2 `dflash_eval_callback()` — graph-level hidden capture
   - [ ] 3.3 `set_dflash_capture()` + GPU capture variant
   - [ ] 3.4 `llama_set_cross_data_seq()` improvements

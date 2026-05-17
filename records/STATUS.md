@@ -66,13 +66,8 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Immediate Next Steps
 
-1. ✅ Build TheTom native binary (done: `tmp/thetom-bin/bin/llama-server`)
-2. ✅ Launch native canary on GPU 1 (port 9002)
-3. ✅ Buun's GGUF downloads and loads correctly (arch `dflash-draft`, 496K tokenizer)
-4. ✅ Phase 1: Core DFlash pipeline — ring buffer, build_cross_data(), Bee's dflash_draft.cpp
-   - Root causes found and fixed: missing `n_enc_real` in `set_cross_data`, missing `dflash_verify_logits` init
-   - Draft generates valid tokens (e.g., 579, 264, 7047...) — DFlash graph works
-   - 0% draft acceptance rate — cross-data quality or draft model accuracy needs tuning
-5. Phase 2: Server integration — fix draft reuse logic, tune verification
-6. Phase 3: Supporting infrastructure
-7. Verify: short-prompt decode with positive #gen drafts and >1.5x speedup
+1. ✅ Phase 1 core pipeline — ring buffer, Bee's dflash_draft.cpp, all 3 bugs fixed
+2. 🔴 Phase 1.5: Debug 0% draft acceptance (cross-data interleave layout, ring offset accuracy)
+3. Phase 2: Server integration (multi-slot, reduced verifier, rollback)
+4. Phase 3: Supporting infrastructure (GPU ring, KV cache)
+5. Verify: short-prompt decode with positive #gen drafts and >1.5x speedup
