@@ -21,10 +21,10 @@
 
 - [x] Phase 1: Core DFlash decode pipeline — ring buffer, build_cross_data, Bee's dflash_draft.cpp
 - [ ] **Phase 1.5: Debug 0% draft acceptance** — cross-data interleave layout, ring offset accuracy
-  - [ ] 1.5a Validate build_cross_data() interleave matches graph builder set_input() expectations
-  - [ ] 1.5b Check ring_write() slot placement against Bee's ring_write()
-  - [ ] 1.5c Verify n_real/n_enc/ctx_len consistency at graph input time
-  - [ ] 1.5d Binary comparison test: Bee vs TheTom on same prompt, same GGUF
+  - [x] 1.5a Validate build_cross_data() interleave matches graph builder set_input() expectations — CONFIRMED MATCH
+  - [x] 1.5b Check ring_write() slot placement against Bee's ring_write() — LOGIC MATCHES
+  - [ ] 1.5c Test with temperature > 0 to check if greedy decode is the cause
+  - [ ] 1.5d if temp>0 still 0%: add binary comparison test (Bee vs TheTom on same prompt)
 - [ ] Phase 2: Server integration (est. 5 days)
   - [ ] 2.1 Port `dflash_reduced_verify_plan()`
   - [ ] 2.2 Port `dflash_sample_reduced_verify()`
