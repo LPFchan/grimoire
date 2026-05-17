@@ -25,7 +25,7 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 - DFlash remains text-only for this migration.
 - Served `pflash-qwen3.6-27B` is text-only. Do not carry multimodal behavior or `mmproj` wiring for this model into the migrated stack.
 - GGUF is the target end-state for DFlash draft artifacts, but the served artifact flip happens only after the canonical path is proven.
-- Bee is the canonical engine. TheTom retired — all turboquant features upstreamed or ported.
+- Bee is the canonical engine.
 - Standalone PFlash packaging is the default first target.
 - The llama-side PFlash path keeps the current token -> text -> message reconstruction flow after compression. Direct prompt/token integration is out of scope.
 - VMM-based park/unpark is preferred only if isolated measurement proves the gain. SIGTERM/page-cache reload behavior is fallback.
@@ -70,13 +70,13 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 ### Contract D: Runtime Isolation
 - End-state removes `/opt/dflash` entirely from served runtime image, startup environment, and runtime search path.
 - Any remaining `/opt/dflash` dependency before cutover is temporary migration debt, limited to pre-cutover preservation work.
-- The canonical non-PFlash llama path must be anchored on Bee libraries throughout the migration (TheTom retired — all turboquant features upstreamed).
+- The canonical non-PFlash llama path must be anchored on Bee libraries throughout the migration.
 
 ## Pinned Upstream Repos
 
 | Repo | URL | Local path | SHA |
 | --- | --- | --- | --- |
-| TheTom/llama-cpp-turboquant (retired) | `https://github.com/TheTom/llama-cpp-turboquant.git` (branch `feature-turboquant-kv-cache-b9079-69d8e4b`) | `tmp/spec-analysis/thetom-shallow/` | `69d8e4be47243e83b3d0d71e932bc7aa61c644dc` |
+| TheTom/llama-cpp-turboquant | `https://github.com/TheTom/llama-cpp-turboquant.git` (branch `feature-turboquant-kv-cache-b9079-69d8e4b`) | `tmp/spec-analysis/thetom-shallow/` | `69d8e4be47243e83b3d0d71e932bc7aa61c644dc` |
 | spiritbuun/buun-llama-cpp | `https://github.com/spiritbuun/buun-llama-cpp.git` | `tmp/spec-analysis/buun-shallow/` | `853eebdd02c2db4baf7bf781adadee6e7ce1d44e` |
 | Anbeeld/beellama.cpp | `https://github.com/Anbeeld/beellama.cpp.git` | `tmp/spec-analysis/bee-shallow/` | `2b9aa77aa67ef0af7ee6eaa3d1f970215c7310fe` |
 | ggml-org/llama.cpp PR 22105 | `https://github.com/ggml-org/llama.cpp.git` | `tmp/spec-analysis/ggml-pr22105/` | `320a6a44a5b1de6a074ba781e65f5fd79fb4051a` |
@@ -123,7 +123,7 @@ Default regression budget: median TTFT no worse than +20%, median decode TPS no 
 
 ## Final Gates
 
-1. Canonical base is Bee (`Anbeeld/beellama.cpp`). TheTom retired — all turboquant features upstreamed or ported.
+1. Canonical base is Bee (`Anbeeld/beellama.cpp`).
 2. DFlash decode parity is green for `dflash-pflash-qwen3.6-27B`.
 3. DFlash `compact-full` persistence parity is green (restart resilience, staging-slot, hash invalidation, bounded snapshot-store growth).
 4. Preserved llama-side PFlash parity is green (.kv slot contract, warm/cold, reconstruction, all required native fixes).

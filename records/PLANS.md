@@ -9,9 +9,9 @@
 - **Preconditions:** All upstream repos pinned by SHA (done), Bee native binary builds (done), GPU ring + turbo4 hang fixed upstream (PR #19, merged)
 
 ### Adopt Bee as Canonical Engine
-- **Outcome:** Single Bee binary serves both DFlash and non-DFlash production traffic. TheTom retired.
-- **Why accepted:** TheTom's custom turboquant work is either upstreamed into Bee's base or irrelevant for CUDA Linux. Bee has DFlash built in. GPU ring + turbo4 hang fixed upstream.
-- **Value:** One binary to build, deploy, and maintain. No TheTom-specific patches to carry forward.
+- **Outcome:** Single Bee binary serves both DFlash and non-DFlash production traffic. 
+- **Why accepted:** Bee has both turboquant and DFlash built in. GPU ring + turbo4 hang fixed upstream. The Tom's custom turboquant work is upstreamed into Bee's base or irrelevant for CUDA Linux.
+- **Value:** One binary to build, deploy, and maintain.
 - **Preconditions:** Bee tested with Gemma 4 + turbo4 + multimodal (done). All production flags supported (done). Docker build with web UI patches (in progress).
 
 ## Sequencing
@@ -24,7 +24,7 @@
   - Root cause: `ggml_backend_cuda_buffer_get_tensor` uses `cudaStreamPerThread` but ggml uses private per-context stream
   - Fix: `ggml_backend_sched_synchronize` after `process_ubatch()` when DFlash active
   - Verified: 100% acceptance, draft 6-14ms, verify 48-58ms
-- [x] **Phase 2: Server integration** — Bee binary deployed as canonical engine (TheTom retired)
+- [x] **Phase 2: Server integration** — Bee binary deployed as canonical engine
   - [x] 2.1 Bee binary tested with Gemma 4 + turbo4 + multimodal — all flags supported
   - [x] 2.2 GPU ring + turbo4 hang fixed upstream (PR #19)
   - [x] 2.3 Sparse V skip warp fix cherry-picked from TheTom
@@ -67,14 +67,13 @@
 
 ### Deferred
 
-**GPU ring buffer** (`cross-ring-interleave.cu`) — CPU fallback works for initial decode
 **GPU tape recording** (`dflash_tape_*`) — only needed for tree-mode DDTree verify
 **Multi-spec batched decode** (`common_speculative_draft_batch()`) — single-spec is sufficient for MVP
 
 **Phase 6 — Optional Runtime Optimizations**
 - VMM-based park/unpark (preferred only if isolated measurement proves gain)
 - Warm-turn detection + KV slot reuse
-- Selective Bee runtime helpers
+- Bee runtime helpers
 - Verification: isolate each optimization, measure before/after
 - Exit: every retained optimization has a measurable win
 
@@ -89,7 +88,7 @@
 
 ## Final Gates
 
-1. Canonical base: TheTom + buun core + selective Bee, not Bee-first
+1. Canonical base: Bee (`Anbeeld/beellama.cpp`)
 2. DFlash decode parity green for `dflash-pflash-qwen3.6-27B`
 3. compact-full persistence parity green (restart resilience, staging-slot, hash invalidation, bounded growth)
 4. Preserved PFlash parity green (.kv slot, warm/cold, reconstruction, native fixes)
