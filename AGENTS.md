@@ -15,6 +15,8 @@ Before writing into an artifact directory, read its `README.md` and follow its p
 
 Migration contracts, plans, and baselines are dissolved into `records/SPEC.md`, `records/STATUS.md`, `records/PLANS.md`, `records/decisions/`, and `records/research/`. Read those instead. The legacy `MIGRATION_EXECUTION_CHECKLIST.md` is retired.
 
+The native DFlash canary uses Bee's `llama-server` binary at `/tmp/spec-analysis/bee-shallow/build/bin/llama-server` (not TheTom's). This is a deliberate decision — Bee's DFlash pipeline achieves 100% draft acceptance while the TheTom port produces 0%. See `records/decisions/DEC-20260517-002-use-bee-binary-for-canary.md`.
+
 ## Skills
 
 Load the skill before the trigger condition fires. Each skill defines the procedure; follow it.

@@ -62,12 +62,12 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Active Blocker
 
-1. **0% draft acceptance persists after flush_prefill fix.** Bee achieves 100% acceptance with the same GGUF and target model. Hidden states are valid, cross-data layout is correct, graph builder is identical. Remaining suspect: subtle difference in how TheTom's `dflash_fc` weight loading or CUDA kernel execution differs from Bee's. The draft tokens change per prompt (confirming cross-data is used) but never match the target's output.
+Resolved — switching canary to Bee's binary. TheTom's DFlash port produces 0% acceptance due to a subtle cross-data or CUDA kernel difference that we haven't isolated. Bee's binary achieves 100% acceptance with the same GGUF and target. Since the canary only uses Q8_0 cache types (no turboquant), Bee's binary is a drop-in replacement.
 
 ## Immediate Next Steps
 
 1. ✅ Phase 1 core pipeline — ring buffer, Bee's dflash_draft.cpp, all bugs fixed
 2. ✅ Binary comparison test — Bee gets 100% acceptance (11/11), we get 0%
-3. ✅ flush_prefill implemented — ring now gets 25 committed tokens (was 4)
-4. 🔴 0% acceptance remains — hidden states valid, draft tokens change per prompt, but never match target
-5. Next: debug remaining acceptance gap or move to Phase 2 server integration
+3. ✅ Decision: use Bee's binary for the canary instead of continuing to port DFlash to TheTom
+4. 🔴 Launch Bee's `llama-server` as the native DFlash canary on GPU 1 (port 9002)
+5. Phase 2-7: proceed on remaining tracks (persistence, PFlash, integration)
