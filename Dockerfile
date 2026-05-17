@@ -136,43 +136,33 @@ RUN --mount=type=cache,target=/root/.ccache \
 # DFlash build stage: Compile the DFlash speculative decoding daemon
 # =============================================================================
 
-FROM ${CUDA_BASE} AS dflash-build
+FROM ${CUDA_BASE} AS pflash-build
 
 WORKDIR /app
 
-COPY lucebox/ /app/dflash-hub
+COPY src/pflash/ /app/pflash/
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates cmake build-essential && rm -rf /var/lib/apt/lists/*
 
-# test_dflash is the daemon entrypoint upstream ships under the test tree;
-# pflash_daemon doesn't exist as a standalone target, so we build and rename
-# test_dflash to /opt/dflash/dflash at install.
 RUN --mount=type=cache,target=/root/.ccache \
-    --mount=type=cache,target=/app/.cache/dflash-build \
+    --mount=type=cache,target=/app/.cache/pflash-build \
     set -eux; \
-    cd /app/dflash-hub/dflash; \
-    rm -f .git && git init && git add -A && git -c user.name=build -c user.email=build commit -qm snapshot; \
-    git submodule update --init --recursive; \
-    cmake -B /app/.cache/dflash-build/build -S . \
+    cmake -B /app/.cache/pflash-build/build -S /app/pflash \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_CUDA_ARCHITECTURES=86 \
-        -DDFLASH27B_TESTS=ON \
-        -DDFLASH27B_FA_ALL_QUANTS=ON \
-        -DDFLASH27B_ENABLE_BSA=ON; \
-    cmake --build /app/.cache/dflash-build/build \
-        --target test_dflash --target pflash_daemon --parallel "$(nproc)"; \
-    mkdir -p /opt/dflash; \
-    cp /app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash; \
-    cp /app/.cache/dflash-build/build/pflash_daemon /opt/dflash/pflash_daemon; \
-    # Copy dflash's own ggml shared libs so the binary resolves symbols
-    # against its build-time llama.cpp, not the independently-built one.
+        -DPFLASH_FA_ALL_QUANTS=ON \
+        -DPFLASH_ENABLE_BSA=ON; \
+    cmake --build /app/.cache/pflash-build/build \
+        --target pflash_daemon --parallel "$(nproc)"; \
+    mkdir -p /opt/pflash; \
+    cp /app/.cache/pflash-build/build/pflash_daemon /opt/pflash/pflash_daemon; \
     ccache --clear -q 2>/dev/null || rm -rf /root/.ccache/* 2>/dev/null; \
-    find /app/.cache/dflash-build/build -name "libggml*.so*" -exec cp {} /opt/dflash/ \; 2>/dev/null || true; \
-    ls -la /opt/dflash/
+    find /app/.cache/pflash-build/build -name "libggml*.so*" -exec cp {} /opt/pflash/ \; 2>/dev/null || true; \
+    ls -la /opt/pflash/
 
 # Compile the park/unpark LD_PRELOAD shim
 COPY src/grimoire/dflash/pflash_shim.c /app/pflash_shim.c
-RUN gcc -shared -o /opt/dflash/pflash_shim.so -fPIC -I/usr/local/cuda/include \
+RUN gcc -shared -o /opt/pflash/pflash_shim.so -fPIC -I/usr/local/cuda/include \
     /app/pflash_shim.c -lcuda -ldl -Wall -Wextra 2>&1
 
 
@@ -286,8 +276,8 @@ WORKDIR /app
 # Copy compiled llama-server
 COPY --from=build /opt/grimoire-llama-cpp /opt/grimoire-llama-cpp
 
-# Copy compiled dflash daemon
-COPY --from=dflash-build /opt/dflash /opt/dflash
+# Copy compiled pflash daemon
+COPY --from=pflash-build /opt/pflash /opt/pflash
 
 # Purge legacy directory name from older images
 RUN rm -rf /opt/model-a-llama-cpp
@@ -303,7 +293,7 @@ RUN mkdir -p /etc/grimoire /var/lib/grimoire
 COPY etc/models.json /etc/grimoire/models.json
 
 # Tokenizer files are mounted at runtime via /models volume (see compose)
-# No COPY needed — the dflash model config points to 'tokenizers/qwen3.6-27B'
+# Tokenizers mounted at runtime via /models volume
 # which resolves to /models/tokenizers/qwen3.6-27B via MODELS_DIR
 
 # Install Python dependencies

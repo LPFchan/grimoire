@@ -41,7 +41,7 @@ from tests._monitor import SystemMonitor
 SKIP_E2E = os.environ.get("SKIP_E2E", "0") == "1"
 BASE_URL = os.environ.get("GRIMOIRE_SMOKE_URL", "http://localhost:9001")
 API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
-DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL", "dflash-pflash-qwen3.6-27B")
+DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL",     "dflash-native-qwen3.6-27B-canary")
 LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")
 LONG_PROMPT_MIN_CHARS = int(os.environ.get("GRIMOIRE_LONG_PROMPT_MIN_CHARS", "1500"))
 LONG_PROMPT_MAX_CHARS = int(os.environ.get("GRIMOIRE_LONG_PROMPT_MAX_CHARS", "4000"))

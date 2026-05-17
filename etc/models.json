@@ -42,115 +42,6 @@
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
-    "huihui-qwen3.5-27B": {
-      "file": "gguf/Huihui-Qwen3.5-27B-abliterated.Q4_K_M.gguf",
-      "mmproj": "gguf/Huihui-Qwen3.5-27B-abliterated.mmproj-Q8_0.gguf",
-      "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.3,
-        "output": 2.4,
-        "cache_read": 0.09
-      },
-      "ctx-size": 262144,
-      "predict": 16384,
-      "parallel": 1,
-      "image-min-tokens": 1024,
-      "image-max-tokens": 1024,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4"
-    },
-    "huihui-gemma-4-31B": {
-      "file": "gguf/huihui-gemma-4-31b-it-abliterated-v2-q4_k_m.gguf",
-      "mmproj": "gguf/mmproj-BF16.gguf",
-      "family": "gemma",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "ctx-size": 131072,
-      "predict": 16384,
-      "parallel": 1,
-      "image-min-tokens": 280,
-      "image-max-tokens": 280,
-      "chat-template-file": "/templates/gemma-4-31B-it-chat_template.jinja",
-      "logit-bias": [
-        "3873-inf",
-        "547-inf",
-        "3041-inf"
-      ],
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4"
-    },
-    "qwopus-3.6-27B": {
-      "file": "gguf/Qwopus3.6-27B-v1-preview-Q4_K_M.gguf",
-      "mmproj": "gguf/qwopus-mmproj.gguf",
-      "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.10
-      },
-      "ctx-size": 262144,
-      "predict": 16384,
-      "parallel": 1,
-      "image-min-tokens": 1024,
-      "image-max-tokens": 1024,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4"
-    },
-    "dflash-pflash-qwen3.6-27B": {
-      "backend": "dflash",
-      "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
-      "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
-      "tokenizer": "tokenizers/qwen3.6-27B",
-      "tokenizer-trust-remote-code": true,
-      "stop-strings": [
-        "<|im_end|>"
-      ],
-      "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.10
-      },
-      "ctx-size": 60000,
-      "max-effective-context": 60000,
-      "predict": 16384,
-      "budget": 18,
-      "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0",
-      "fa-window": 2048,
-      "snapshot-mode": "compact-full",
-      "snapshot-ram-dir": "/dev/shm/grimoire-snapshots",
-      "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/dflash-pflash-qwen3.6-27B",
-      "snapshot-ram-budget-gb": 20,
-      "snapshot-disk-budget-gb": 30,
-      "snapshot-disk-ttl-hours": 24,
-      "snapshot-staging-slot": 7,
-      "prefix-cache-slots": 0,
-      "session-kv-slots": 4,
-      "prefill-threshold": 48000,
-      "prefill-keep-ratio": 0.05,
-      "prefill-tail-budget": 16000,
-      "prefill-compression": "auto"
-    },
     "dflash-native-qwen3.6-27B-canary": {
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
@@ -171,7 +62,11 @@
       "predict": 16384,
       "parallel": 1,
       "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0"
+      "cache-type-v": "q8_0",
+      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-native-qwen3.6-27B-canary",
+      "kv-cache-disk-budget-gb": 30,
+      "kv-cache-disk-ttl-hours": 24,
+      "kv-cache-cap": 8
     },
     "pflash-qwen3.6-27B": {
       "pflash": true,

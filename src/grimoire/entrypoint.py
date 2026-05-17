@@ -57,7 +57,7 @@ from grimoire.config import (
     DFLASH_IGNORED_SAMPLING,
     DEFAULT_GENERATION_PARAMS,
 )
-from grimoire.dflash import DflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
+from grimoire.dflash import PrefillConfig
 from grimoire.dflash.prefill import PromptBlock, materialize_blocks, maybe_compress
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
@@ -68,7 +68,6 @@ from grimoire.registry import (
     resolve_path,
     _looks_like_local_path,
     BACKEND_LLAMA,
-    BACKEND_DFLASH,
 )
 from grimoire.prompt import _tool_name_from_message
 from grimoire.prompt.qwen import (
@@ -95,7 +94,6 @@ from grimoire.proxy.llama import (
     _backend_request_headers,
     _backend_response_headers,
 )
-from grimoire.proxy.dflash import _proxy_dflash, _dflash_collect_stop_ids
 from grimoire.routes.history import router as history_router
 from grimoire.routes.dashboard import router as dashboard_router
 from grimoire.routes.models import router as models_router
@@ -320,14 +318,6 @@ async def proxy_v1(request: Request, path: str):
     client = None
     try:
         active = await manager.start_model(model_name)
-        if active.backend_type == BACKEND_DFLASH:
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    f"/v1/{path} is not supported on dflash backend "
-                    f"'{active.name}'; only /v1/chat/completions and /v1/models are wired up"
-                ),
-            )
         client = httpx.AsyncClient(timeout=None)
         headers = _backend_request_headers(request.headers)
 

@@ -2,38 +2,21 @@
 
 import asyncio
 import copy
-import hashlib
 import json
 import logging
-import os
 
 import httpx
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
+from grimoire.dflash.kv_cache_store import KVCacheStore
 from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
-from grimoire.prompt.generic import _prompt_layout_from_messages
-from grimoire.registry import BACKEND_DFLASH, resolve_path
+from grimoire.prompt.generic import _prefix_cache_boundaries, _prompt_layout_from_messages
+from grimoire.registry import resolve_path
 
 logger = logging.getLogger(__name__)
-
-
-def _sanitize_slot_component(value: str) -> str:
-    raw = str(value)
-    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in raw)
-    safe = safe.strip("_-") or "conversation"
-    if safe != raw or len(safe) > 96:
-        digest = hashlib.sha1(raw.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
-        safe = f"{safe[:96].rstrip('_-') or 'conversation'}-{digest}"
-    return safe
-
-
-def _kv_filename(model_name: str, conversation_id: str) -> str:
-    model_safe = _sanitize_slot_component(model_name)
-    conv_safe = _sanitize_slot_component(conversation_id)
-    return f"pflash-{model_safe}-{conv_safe}.kv"
 
 
 def _slot_lock(active):
@@ -44,20 +27,22 @@ def _slot_lock(active):
     return lock
 
 
-def _slot_save_key(active, conversation_id: str) -> str:
-    return _kv_filename(active.name, conversation_id)
-
-
-def _has_saved_kv(active, conversation_id: str) -> bool:
-    if not conversation_id:
-        return False
-    return os.path.isfile(f"/dev/shm/grimoire-slots/{_slot_save_key(active, conversation_id)}")
-
-
-def _maybe_kv_save_key(active, conversation_id: str | None) -> str | None:
-    if not conversation_id:
-        return None
-    return _slot_save_key(active, conversation_id)
+def _kv_store(active):
+    store = getattr(active, "kv_cache_store", None)
+    if store is None:
+        cfg = active.cfg
+        store = KVCacheStore(
+            ram_dir="/dev/shm/grimoire-slots",
+            disk_dir=cfg.get("kv-cache-disk-dir", ""),
+            disk_budget_gb=cfg.get("kv-cache-disk-budget-gb", 30.0),
+            disk_ttl_hours=cfg.get("kv-cache-disk-ttl-hours", 24.0),
+            cap=cfg.get("kv-cache-cap", 8),
+            kv_k_type=cfg.get("cache-type-k", "q8_0"),
+            kv_v_type=cfg.get("cache-type-v", "q8_0"),
+            fa_window=cfg.get("fa-window", 2048),
+        )
+        active.kv_cache_store = store
+    return store
 
 
 def _backend_request_headers(headers):
@@ -80,16 +65,40 @@ def _backend_response_headers(headers):
     return clean
 
 
+async def _try_restore_kv(client, slot_url, prompt_ids, store, log, override_hash=None):
+    h = override_hash or store.hash_prefix(prompt_ids)
+    path = store.lookup(h)
+    if not path:
+        return None
+    try:
+        rr = await client.post(f"{slot_url}?action=restore",
+            json={"filename": path.name}, timeout=5)
+        if rr.status_code == 200:
+            return h
+    except Exception:
+        pass
+    return None
+
+
+async def _save_kv(sc, slot_url, hash_bytes, store, log):
+    filename = store.kv_filename(hash_bytes)
+    try:
+        rr = await sc.post(f"{slot_url}?action=save",
+            json={"filename": filename}, timeout=10)
+        if rr.status_code == 200:
+            store.register(hash_bytes)
+            return True
+    except Exception as e:
+        log.warning(f"kv cache: save failed for {filename}: {e}")
+    return False
+
+
 async def _proxy_chat(requested_model, payload, active, user_hash=None, conversation_id=None):
     """Proxy chat completions while keeping the upstream client open."""
     # Local imports avoid circular dependency with entrypoint.
-    from grimoire.proxy.dflash import _proxy_dflash
     from grimoire.entrypoint import _record_response_stream
 
     model_cfg = active.cfg
-
-    if active.backend_type == BACKEND_DFLASH:
-        return await _proxy_dflash(requested_model, payload, active, user_hash, conversation_id)
 
     payload = copy.deepcopy(payload)
     payload = plugin_manager.before_request(payload, active.name, model_cfg)
@@ -99,7 +108,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     headers = {}
     validated_conversation_id = conversation_id if isinstance(conversation_id, str) else None
 
-    _kv_save_key = None
+    _save_hash: Optional[bytes] = None
 
     # PFlash compression: if the model has a pflash daemon and the prompt
     # exceeds the threshold, compress before proxying to llama-server.
@@ -111,6 +120,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     log = logging.getLogger(__name__)
     log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
 
+    store = _kv_store(active)
+
     if pcfg and pcfg.enabled:
         try:
             tokenizer = active.get_tokenizer()
@@ -119,7 +130,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 tokenizer, messages, add_generation_prompt=True,
                 model_cfg=model_cfg, active=active,
             )
-            _kv_save_key = _maybe_kv_save_key(active, validated_conversation_id)
             if len(prompt_ids) >= pcfg.threshold:
                 if not daemon or not daemon.is_running():
                     raise HTTPException(
@@ -132,7 +142,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         ),
                     )
 
-                is_warm = _has_saved_kv(active, validated_conversation_id)
+                _save_hash = store.hash_prefix(prompt_ids)
+                is_warm = store.lookup(_save_hash) is not None
 
                 if not is_warm:
                     # ── COLD TURN: park + full compress + unpark ────────────
@@ -221,9 +232,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         new_messages.append(entry)
                     log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
                     payload["messages"] = new_messages
-                    if validated_conversation_id:
-                        _kv_save_key = _slot_save_key(active, validated_conversation_id)
-                        log.warning(f"pflash kv: will save as {_kv_save_key}")
+                    _save_hash = store.hash_prefix(prompt_ids)
+                    log.warning(f"pflash kv: will save with hash {_save_hash.hex()[:16]}")
         except HTTPException:
             raise
         except Exception as e:
@@ -241,20 +251,22 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 payload, active.name, model_cfg, backend_model_id, client, url, headers
             )
 
-            # KV prefix cache: restore saved KV slot to skip re-prefixing shared prefix
-            log.warning(f"pflash kv: validated key = {validated_conversation_id}")
-            if validated_conversation_id:
-                kv_name = _slot_save_key(active, validated_conversation_id)
-                slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+            # KV prefix cache: restore by content hash, always save hash for later
+            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+            if _save_hash is None:
                 try:
-                    rr = await client.post(f"{slot_url}?action=restore",
-                        json={"filename": kv_name}, timeout=5)
-                    log.warning(f"pflash kv: restore status {rr.status_code} for {kv_name}")
-                    if rr.status_code == 200:
-                        _kv_save_key = _kv_save_key or kv_name
-                        log.warning(f"pflash kv: restored {kv_name}")
+                    tokenizer = active.get_tokenizer()
+                    messages = payload.get("messages", [])
+                    pids, _ = _prompt_layout_from_messages(
+                        tokenizer, messages, add_generation_prompt=True,
+                        model_cfg=model_cfg, active=active,
+                    )
+                    _save_hash = store.hash_prefix(pids)
+                    await _try_restore_kv(client, slot_url, pids, store, log)
                 except Exception as e:
-                    log.warning(f"pflash kv: restore failed for {kv_name}: {e}")
+                    log.warning(f"kv cache: setup failed: {e}")
+            else:
+                await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
 
             upstream = await client.send(
                 client.build_request(
@@ -308,23 +320,11 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         finally:
             await upstream.aclose()
             await client.aclose()
-            # KV prefix cache: save slot state after response completes
-            log.warning(f"pflash kv: finally block, _kv_save_key={_kv_save_key}")
-            if _kv_save_key:
-                try:
-                    async with httpx.AsyncClient(timeout=5) as sc:
-                        slot_url = f"http://127.0.0.1:{active.port}/slots/0"
-                        rr = await sc.post(f"{slot_url}?action=save",
-                            json={"filename": _kv_save_key})
-                        log.warning(f"pflash kv: save status {rr.status_code} for {_kv_save_key}")
-                        if rr.status_code == 200:
-                            log.warning(f"pflash kv: saved {_kv_save_key}")
-                except Exception as e:
-                    log.warning(f"pflash kv: save failed for {_kv_save_key}: {e}")
-                finally:
-                    slot_guard.release()
-            else:
-                slot_guard.release()
+            # KV prefix cache: save slot by content hash after response
+            if _save_hash:
+                async with httpx.AsyncClient(timeout=5) as sc:
+                    await _save_kv(sc, slot_url, _save_hash, store, log)
+            slot_guard.release()
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")

@@ -14,7 +14,7 @@ from typing import Optional
 import httpx
 
 from grimoire import config
-from grimoire.dflash import DflashDaemon, PflashDaemon, PrefixCache, PrefillConfig, SessionKV, SnapshotSwap
+from grimoire.dflash import PflashDaemon, PrefillConfig
 from grimoire.registry import (
     MODELS_DIR,
     registry,
@@ -22,7 +22,6 @@ from grimoire.registry import (
     _looks_like_local_path,
     _strip_hf_prefix,
     BACKEND_LLAMA,
-    BACKEND_DFLASH,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,27 +166,16 @@ class ActiveModel:
         self.status = config.MODEL_STATUS_LOADING
         self.backend_type = cfg.get("backend", BACKEND_LLAMA)
 
-        # DFlash-specific state
-        self.dflash_daemon: Optional[DflashDaemon] = None
         self.pflash_daemon: Optional[PflashDaemon] = None
-        self.prefix_cache: Optional[PrefixCache] = None
         self.prefill_config: Optional[PrefillConfig] = None
-        self.session_kv: Optional[SessionKV] = None
-        self.snapshot_swap: Optional[SnapshotSwap] = None
+        self.kv_cache_store = None
         self.snapshot_staging_slot: int = 7
         self._tokenizer = None
         self._qwen_prompt_block_cache = OrderedDict()
-        # Serializes generate() calls against the single daemon stdin/stdout
-        # pair. Created lazily so the unit-test path that constructs an
-        # ActiveModel outside an event loop doesn't crash.
-        self._dflash_lock: Optional[asyncio.Lock] = None
 
     def start(self):
-        """Start the backend process."""
-        if self.backend_type == BACKEND_DFLASH:
-            self._start_dflash()
-        else:
-            self._start_llama()
+        """Start the llama-server process."""
+        self._start_llama()
 
     def _start_llama(self):
         """Start the llama-server process."""
@@ -200,7 +188,7 @@ class ActiveModel:
         _prepend_library_paths(
             env,
             [config.TURBOQUANT_LIB_DIR, config.TURBOQUANT_LIB64_DIR],
-            exclude_prefixes=(config.DFLASH_HOME,),
+            exclude_prefixes=(config.PFLASH_HOME,),
         )
 
         # LD_PRELOAD the park/unpark shim for park models
@@ -277,85 +265,8 @@ class ActiveModel:
         self.pflash_daemon = daemon
         logger.info(f"Started pflash daemon for {self.name} on GPU {self.gpu}")
 
-    def _start_dflash(self):
-        """Start the dflash daemon process."""
-        target_path = resolve_path(self.cfg, "target")
-        draft_path = resolve_path(self.cfg, "draft")
-        drafter_path = resolve_path(self.cfg, "drafter")
-
-        pc_cap = max(0, min(int(self.cfg.get("prefix-cache-slots", 4)), 8))
-        self.prefix_cache = PrefixCache(
-            cap=pc_cap,
-            cache_dir=f"/var/lib/grimoire/prefix_cache/{self.name}",
-            kv_k_type=self.cfg.get("cache-type-k", "q8_0"),
-            kv_v_type=self.cfg.get("cache-type-v", "q8_0"),
-            fa_window=self.cfg.get("fa-window", 2048),
-        )
-        self.prefix_cache.load()
-
-        use_pflash = self.cfg.get("pflash", True)
-        use_dflash = self.cfg.get("dflash", True)
-
-        self.prefill_config = PrefillConfig(
-            enabled=bool(use_pflash) and self.cfg.get("prefill-compression", "auto") != "never",
-            threshold=self.cfg.get("prefill-threshold", 32000),
-            keep_ratio=self.cfg.get("prefill-keep-ratio", 0.05),
-            drafter_path=drafter_path,
-            tail_budget=self.cfg.get("prefill-tail-budget", 12288),
-        )
-
-        snapshot_disk_dir = self.cfg.get(
-            "snapshot-disk-dir",
-            f"/var/lib/grimoire/snapshot_swap/{self.name}",
-        )
-        snapshot_ram_root = Path(self.cfg.get("snapshot-ram-dir", "/dev/shm/grimoire-snapshots"))
-        snapshot_ram_dir = snapshot_ram_root / self.name
-        session_cap = max(0, int(self.cfg.get("session-kv-slots", 2)))
-        self.session_kv = SessionKV(
-            cap=session_cap,
-            path=os.path.join(snapshot_disk_dir, "session-kv.json"),
-        )
-
-        self.snapshot_staging_slot = int(self.cfg.get("snapshot-staging-slot", 7))
-        self.snapshot_swap = SnapshotSwap(
-            ram_dir=str(snapshot_ram_dir),
-            disk_dir=snapshot_disk_dir,
-            ram_budget_gb=self.cfg.get("snapshot-ram-budget-gb", 20.0),
-            disk_budget_gb=self.cfg.get("snapshot-disk-budget-gb", 100.0),
-            disk_ttl_hours=self.cfg.get("snapshot-disk-ttl-hours", 24.0),
-        )
-
-        self.dflash_daemon = DflashDaemon(
-            target_path=target_path,
-            draft_path=draft_path if use_dflash else None,
-            max_ctx=self.cfg.get("ctx-size", 16384),
-            budget=self.cfg.get("budget", 22),
-            gpu_id=self.gpu,
-            pflash=bool(use_pflash),
-            dflash=bool(use_dflash),
-            prefill_threshold=self.prefill_config.threshold,
-            prefill_keep_ratio=self.prefill_config.keep_ratio,
-            kv_k_type=self.cfg.get("cache-type-k", "q8_0"),
-            kv_v_type=self.cfg.get("cache-type-v", "q8_0"),
-            fa_window=self.cfg.get("fa-window", 2048),
-        )
-        self.dflash_daemon.spawn(timeout=self.cfg.get("startup-timeout", config.DEFAULT_STARTUP_TIMEOUT))
-        self.process = self.dflash_daemon.proc
-
-    def dflash_lock(self) -> asyncio.Lock:
-        """Return the per-model lock that serializes daemon I/O."""
-        if self._dflash_lock is None:
-            self._dflash_lock = asyncio.Lock()
-        return self._dflash_lock
-
     async def wait_ready(self, timeout=config.DEFAULT_STARTUP_TIMEOUT):
         """Wait until the backend is ready."""
-        if self.backend_type == BACKEND_DFLASH:
-            # DFlash health check via VRAM (done in spawn)
-            if self.dflash_daemon and self.dflash_daemon.is_running():
-                return
-            raise RuntimeError(f"{self.name} dflash daemon not running")
-
         deadline = asyncio.get_running_loop().time() + timeout
         url = f"http://127.0.0.1:{self.port}/health"
         last_error = None
@@ -378,8 +289,6 @@ class ActiveModel:
 
     async def get_backend_model_id(self):
         """Resolve the backend model ID for core alias rewriting."""
-        if self.backend_type == BACKEND_DFLASH:
-            return self.name
         if self.backend_model_id:
             return self.backend_model_id
         try:
@@ -399,10 +308,7 @@ class ActiveModel:
 
     def stop(self):
         """Stop the backend process."""
-        if self.backend_type == BACKEND_DFLASH and self.dflash_daemon:
-            self._stop_dflash()
-        else:
-            self._stop_llama()
+        self._stop_llama()
         self._stop_pflash_daemon()
 
     def _stop_pflash_daemon(self):
@@ -438,25 +344,8 @@ class ActiveModel:
         logger.info(f"Stopped {self.name}")
         self.process = None
 
-    def _stop_dflash(self):
-        """Stop the dflash daemon and save prefix cache."""
-        if self.snapshot_swap:
-            try:
-                self.snapshot_swap.flush_pending_sync(timeout=30)
-            except Exception as e:
-                logger.warning("snapshot flush failed during %s shutdown: %s", self.name, e)
-        if self.prefix_cache:
-            self.prefix_cache.save()
-            self.prefix_cache.cleanup(self.dflash_daemon)
-        if self.dflash_daemon:
-            self.dflash_daemon.stop()
-        self.process = None
-        logger.info(f"Stopped {self.name}")
-
     def is_running(self):
         """Check if the process is running."""
-        if self.backend_type == BACKEND_DFLASH and self.dflash_daemon:
-            return self.dflash_daemon.is_running()
         return self.process is not None and self.process.poll() is None
 
     def get_tokenizer(self):
@@ -541,10 +430,8 @@ class ModelManager:
     async def _start_active_model(self, active: ActiveModel):
         """Start an ActiveModel and wait until it is ready."""
         active.status = config.MODEL_STATUS_LOADING
-        is_dflash = active.backend_type == BACKEND_DFLASH
-
-        logger.warning(f"pflash: cfg.pflash={active.cfg.get('pflash')}, is_dflash={is_dflash}")
-        if active.cfg.get("pflash") and not is_dflash:
+        logger.warning(f"pflash: cfg.pflash={active.cfg.get('pflash')}")
+        if active.cfg.get("pflash"):
             await asyncio.to_thread(active._start_pflash_daemon)
             logger.warning(f"pflash: daemon started for {active.name}")
 
@@ -621,9 +508,8 @@ class ModelManager:
                     incumbents.append((victim.name, victim))
                     gpu = victim.gpu
 
-            is_dflash = cfg.get("backend") == BACKEND_DFLASH
             ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
-            port = None if is_dflash else self._find_available_port_excluding(gpu, ignored_ports)
+            port = self._find_available_port_excluding(gpu, ignored_ports)
             active = ActiveModel(model_name, cfg, port, gpu)
 
             try:

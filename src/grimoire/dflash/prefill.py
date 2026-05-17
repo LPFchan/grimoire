@@ -199,7 +199,7 @@ async def maybe_compress(
 
     Args:
         prompt_ids: Original prompt token IDs
-        daemon: DflashDaemon instance
+        daemon: PflashDaemon instance
         config: PrefillConfig
         blocks: Prompt manifest in raw token space.
 

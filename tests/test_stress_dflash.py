@@ -36,7 +36,7 @@ API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
 FIXTURES_DIR = Path(
     os.environ.get("GRIMOIRE_OPENCODE_SESSION_FIXTURES", "/home/yeowool/opencode_splits")
 )
-MODEL = os.environ.get("STRESS_MODEL", "dflash-pflash-qwen3.6-27B")
+MODEL = os.environ.get("STRESS_MODEL",     "dflash-native-qwen3.6-27B-canary")
 MAX_TOKENS = int(os.environ.get("STRESS_MAX_TOKENS", "64"))
 CONTAINER_NAME = os.environ.get("GRIMOIRE_SMOKE_CONTAINER", "grimoire")
 
