@@ -10,6 +10,7 @@ import asyncio
 import glob
 import logging
 import os
+import shutil
 import subprocess
 import sqlite3
 import time
@@ -279,6 +280,15 @@ def _read_container_ram_mb():
         return None
 
 
+def _read_disk_usage_pct():
+    """Read root filesystem usage percentage via shutil.disk_usage."""
+    try:
+        usage = shutil.disk_usage("/")
+        return usage.used / usage.total * 100.0
+    except OSError:
+        return None
+
+
 def _read_fan_rpm():
     """Read fan1_input and fan2_input from the main fan-controller hwmon chip.
 
@@ -323,6 +333,9 @@ def collect_one_sample():
     ctr_ram = _read_container_ram_mb()
     if ctr_ram is not None:
         rows.append((0, "container_ram_mb", ctr_ram))
+    disk_pct = _read_disk_usage_pct()
+    if disk_pct is not None:
+        rows.append((0, "disk_used_pct", disk_pct))
     if rows:
         telemetry_store.record(time.time(), rows)
     return rows

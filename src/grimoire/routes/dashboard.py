@@ -100,6 +100,19 @@ async def get_dashboard_stats(request: Request):
                 "series": _cumulative(usage["output_tokens_series"]),
             },
         },
+        "cache": {
+            "read": {
+                "tokens": {
+                    "current": usage["total_cache_read_input_tokens"],
+                    "series": _cumulative(usage["cache_read_input_tokens_series"]),
+                },
+                "cost": {
+                    "current": usage["total_cache_read_input_cost"],
+                    "series": _cumulative(usage["cache_read_input_cost_series"]),
+                },
+            },
+            "lifetime_tokens": int(lifetime.get("cache_read_input_tokens") or 0),
+        },
         "cost": {
             "total": usage["total_input_cost"] + usage["total_output_cost"],
             "input": usage["total_input_cost"],
@@ -123,4 +136,21 @@ async def get_dashboard_stats(request: Request):
             "system": _system("system_ram_mb", 0),
             "container": _system("container_ram_mb", 0),
         },
+        "disk": _system("disk_used_pct", 0),
+        "card_order": usage_store.load_card_arrangement(user_hash),
     }
+
+
+@router.put("/stats/card-order")
+async def save_card_order(request: Request):
+    """Save the user's dashboard card arrangement."""
+    _, user_hash = require_api(request)
+    try:
+        body = await request.json()
+        card_order = body.get("card_order", [])
+        if not isinstance(card_order, list):
+            raise HTTPException(status_code=400, detail="card_order must be a list of strings")
+        usage_store.save_card_arrangement(user_hash, card_order)
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))

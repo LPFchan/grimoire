@@ -14,6 +14,12 @@ def utcnow():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _dollar_cost(tokens, rate_per_million):
+    if not tokens or tokens <= 0 or not rate_per_million:
+        return 0.0
+    return tokens / 1_000_000 * float(rate_per_million)
+
+
 class UsageStore:
     """SQLite-backed token and equivalent-cost tally."""
 
@@ -55,27 +61,48 @@ class UsageStore:
                     source TEXT PRIMARY KEY,
                     imported_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS card_arrangements (
+                    user_hash TEXT PRIMARY KEY,
+                    card_order TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
+            self._migrate_add_cache_columns(conn)
 
-    def record(self, user_hash, model, input_tokens, output_tokens, cost_rates=None):
+    def _migrate_add_cache_columns(self, conn):
+        for col, typ in [("cache_read_input_tokens", "INTEGER"), ("cache_read_input_cost", "REAL")]:
+            try:
+                conn.execute(f"ALTER TABLE usage_events ADD COLUMN {col} {typ} NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
+    def record(self, user_hash, model, input_tokens, output_tokens, cost_rates=None, cache_read_input_tokens=None):
         input_tokens = int(input_tokens or 0)
         output_tokens = int(output_tokens or 0)
         if input_tokens <= 0 and output_tokens <= 0:
             return
 
+        cache_read_input_tokens = int(cache_read_input_tokens or 0)
+        if cache_read_input_tokens > input_tokens:
+            cache_read_input_tokens = input_tokens
+
         cost_rates = cost_rates or {}
-        input_cost = input_tokens / 1_000_000 * float(cost_rates.get("input", 0) or 0)
-        output_cost = output_tokens / 1_000_000 * float(cost_rates.get("output", 0) or 0)
+        input_cost = _dollar_cost(input_tokens, cost_rates.get("input"))
+        output_cost = _dollar_cost(output_tokens, cost_rates.get("output"))
+        cache_read_input_cost = _dollar_cost(cache_read_input_tokens, cost_rates.get("cache_read"))
 
         with self._lock, self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO usage_events
-                    (user_hash, model, input_tokens, output_tokens, input_cost, output_cost, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (user_hash, model, input_tokens, output_tokens, input_cost, output_cost,
+                     cache_read_input_tokens, cache_read_input_cost, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_hash, model, input_tokens, output_tokens, input_cost, output_cost, utcnow()),
+                (user_hash, model, input_tokens, output_tokens, input_cost, output_cost,
+                 cache_read_input_tokens, cache_read_input_cost, utcnow()),
             )
 
     def summary(self, user_hash=None):
@@ -88,7 +115,9 @@ class UsageStore:
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(input_cost), 0) AS input_cost,
-                    COALESCE(SUM(output_cost), 0) AS output_cost
+                    COALESCE(SUM(output_cost), 0) AS output_cost,
+                    COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+                    COALESCE(SUM(cache_read_input_cost), 0) AS cache_read_input_cost
                 FROM usage_events
                 {where}
                 """,
@@ -101,7 +130,9 @@ class UsageStore:
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(input_cost), 0) AS input_cost,
-                    COALESCE(SUM(output_cost), 0) AS output_cost
+                    COALESCE(SUM(output_cost), 0) AS output_cost,
+                    COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+                    COALESCE(SUM(cache_read_input_cost), 0) AS cache_read_input_cost
                 FROM usage_events
                 {where}
                 GROUP BY model
@@ -113,13 +144,19 @@ class UsageStore:
         def row_dict(row):
             input_cost = float(row["input_cost"] or 0)
             output_cost = float(row["output_cost"] or 0)
+            cache_read_input_cost = float(row["cache_read_input_cost"] or 0)
+            cache_read_input_tokens = int(row["cache_read_input_tokens"] or 0)
+            input_tokens = int(row["input_tokens"] or 0)
+            output_tokens = int(row["output_tokens"] or 0)
             return {
-                "input_tokens": int(row["input_tokens"] or 0),
-                "output_tokens": int(row["output_tokens"] or 0),
-                "total_tokens": int((row["input_tokens"] or 0) + (row["output_tokens"] or 0)),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
                 "input_cost": input_cost,
                 "output_cost": output_cost,
                 "total_cost": input_cost + output_cost,
+                "cache_read_input_tokens": cache_read_input_tokens,
+                "cache_read_input_cost": cache_read_input_cost,
             }
 
         return {
@@ -128,20 +165,19 @@ class UsageStore:
         }
 
     def binned_window(self, user_hash, ts_from, ts_to, bins):
-        """Return token/cost time series binned into `bins` buckets over [ts_from, ts_to).
-
-        ts_from and ts_to are Unix timestamps (seconds). Costs are summed per bin
-        in dollars; tokens are integer counts per bin. Empty bins are zero.
-        """
         empty = {
             "input_tokens_series": [0] * max(bins, 0),
             "output_tokens_series": [0] * max(bins, 0),
             "input_cost_series": [0.0] * max(bins, 0),
             "output_cost_series": [0.0] * max(bins, 0),
+            "cache_read_input_tokens_series": [0] * max(bins, 0),
+            "cache_read_input_cost_series": [0.0] * max(bins, 0),
             "total_input_tokens": 0,
             "total_output_tokens": 0,
             "total_input_cost": 0.0,
             "total_output_cost": 0.0,
+            "total_cache_read_input_tokens": 0,
+            "total_cache_read_input_cost": 0.0,
         }
         if ts_to <= ts_from or bins <= 0:
             return empty
@@ -162,7 +198,9 @@ class UsageStore:
                     COALESCE(SUM(input_tokens), 0) AS input_tokens,
                     COALESCE(SUM(output_tokens), 0) AS output_tokens,
                     COALESCE(SUM(input_cost), 0) AS input_cost,
-                    COALESCE(SUM(output_cost), 0) AS output_cost
+                    COALESCE(SUM(output_cost), 0) AS output_cost,
+                    COALESCE(SUM(cache_read_input_tokens), 0) AS cache_read_input_tokens,
+                    COALESCE(SUM(cache_read_input_cost), 0) AS cache_read_input_cost
                 FROM usage_events
                 {where}
                 GROUP BY bin
@@ -173,10 +211,14 @@ class UsageStore:
         out_tok = [0] * bins
         in_cost = [0.0] * bins
         out_cost = [0.0] * bins
+        cr_tok = [0] * bins
+        cr_cost = [0.0] * bins
         total_in_tok = 0
         total_out_tok = 0
         total_in_cost = 0.0
         total_out_cost = 0.0
+        total_cr_tok = 0
+        total_cr_cost = 0.0
         for r in rows:
             try:
                 b = int(r["bin"])
@@ -187,23 +229,30 @@ class UsageStore:
                 out_tok[b] = int(r["output_tokens"] or 0)
                 in_cost[b] = float(r["input_cost"] or 0)
                 out_cost[b] = float(r["output_cost"] or 0)
+                cr_tok[b] = int(r["cache_read_input_tokens"] or 0)
+                cr_cost[b] = float(r["cache_read_input_cost"] or 0)
                 total_in_tok += in_tok[b]
                 total_out_tok += out_tok[b]
                 total_in_cost += in_cost[b]
                 total_out_cost += out_cost[b]
+                total_cr_tok += cr_tok[b]
+                total_cr_cost += cr_cost[b]
         return {
             "input_tokens_series": in_tok,
             "output_tokens_series": out_tok,
             "input_cost_series": in_cost,
             "output_cost_series": out_cost,
+            "cache_read_input_tokens_series": cr_tok,
+            "cache_read_input_cost_series": cr_cost,
             "total_input_tokens": total_in_tok,
             "total_output_tokens": total_out_tok,
             "total_input_cost": total_in_cost,
             "total_output_cost": total_out_cost,
+            "total_cache_read_input_tokens": total_cr_tok,
+            "total_cache_read_input_cost": total_cr_cost,
         }
 
     def earliest_event_ts(self, user_hash=None):
-        """Return the earliest event timestamp (Unix seconds) or None."""
         where = "WHERE user_hash = ?" if user_hash else ""
         params = (user_hash,) if user_hash else ()
         with self._lock, self._connect() as conn:
@@ -215,7 +264,6 @@ class UsageStore:
         return int(row["t"]) if row and row["t"] is not None else None
 
     def import_legacy_token_stats(self, path, user_hash, cost_by_model=None):
-        """Import legacy token-stats.json once, then continue appending new events."""
         if not path or not os.path.exists(path):
             return False
 
@@ -261,16 +309,45 @@ class UsageStore:
 
     def _record_with_conn(self, conn, user_hash, model, input_tokens, output_tokens, cost_rates=None):
         cost_rates = cost_rates or {}
-        input_cost = input_tokens / 1_000_000 * float(cost_rates.get("input", 0) or 0)
-        output_cost = output_tokens / 1_000_000 * float(cost_rates.get("output", 0) or 0)
+        input_cost = _dollar_cost(input_tokens, cost_rates.get("input"))
+        output_cost = _dollar_cost(output_tokens, cost_rates.get("output"))
         conn.execute(
             """
             INSERT INTO usage_events
-                (user_hash, model, input_tokens, output_tokens, input_cost, output_cost, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (user_hash, model, input_tokens, output_tokens, input_cost, output_cost,
+                 cache_read_input_tokens, cache_read_input_cost, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_hash, model, input_tokens, output_tokens, input_cost, output_cost, utcnow()),
+            (user_hash, model, input_tokens, output_tokens, input_cost, output_cost,
+             0, 0.0, utcnow()),
         )
+
+
+    def save_card_arrangement(self, user_hash, card_order):
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO card_arrangements (user_hash, card_order, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_hash) DO UPDATE SET
+                    card_order = excluded.card_order,
+                    updated_at = excluded.updated_at
+                """,
+                (user_hash, json.dumps(card_order), utcnow()),
+            )
+
+    def load_card_arrangement(self, user_hash):
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT card_order FROM card_arrangements WHERE user_hash = ?",
+                (user_hash,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row["card_order"])
+        except (json.JSONDecodeError, TypeError):
+            return None
 
 
 usage_store = UsageStore()

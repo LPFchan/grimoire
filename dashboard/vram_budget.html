@@ -48,6 +48,10 @@ input[type=range]{width:100%;margin:1px 0;accent-color:#58a6ff}
 .toggle input:checked+.sl{background:#1f6feb;border-color:#1f6feb}
 .toggle input:checked+.sl::before{transform:translateX(17px);background:#fff}
 .toggle-label{font-size:.78rem;color:#8b949e}
+.drafter-sel{display:flex;gap:4px;margin-bottom:4px}
+.drafter-sel label{font-size:.72rem;padding:2px 8px;border:1px solid #30363d;border-radius:3px;cursor:pointer;color:#8b949e;background:#21262d}
+.drafter-sel input{display:none}
+.drafter-sel input:checked+label{background:#1f6feb33;border-color:#1f6feb;color:#58a6ff}
 .results{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:6px;margin-bottom:12px}
 .result-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px}
 .result-card .label{font-size:.68rem;color:#8b949e;text-transform:uppercase;letter-spacing:.4px}
@@ -71,7 +75,7 @@ input[type=range]{width:100%;margin:1px 0;accent-color:#58a6ff}
 <body>
 <div class="container">
 <h1>VRAM · PFlash Pipeline</h1>
-<div class="subtitle">RTX 3090 24 GB · Qwen3.6-27B Q4_K_M · Qwen3.5-0.8B Q8_0 · dtype: hidden <b>F32</b> · Q <b>F16</b> · attn_out <b>Q8_0</b> · K/V <b>Q8_0</b> · FA chunked <b>4K</b> · transient <b>~80 MB</b></div>
+<div class="subtitle" id="subtitle"></div>
 
 <div class="vram-bar-wrapper">
   <div class="phase-tabs"><div class="phase-tab active" id="tabPrefill" onclick="sw('prefill')">Prefill</div><div class="phase-tab" id="tabDecode" onclick="sw('decode')">Decode</div></div>
@@ -92,6 +96,7 @@ input[type=range]{width:100%;margin:1px 0;accent-color:#58a6ff}
     <h3>Hardware</h3>
     <div class="slider-row"><label>KV cache <span class="val" id="kVT">Q8_0</span></label><input type="range" id="kvT" min="0" max="3" value="2" step="1"><div class="knob-desc">0=TURBO4 1=Q4_0 2=Q8_0 3=F16</div></div>
     <div class="slider-row"><label>PF K/V dtype <span class="val" id="pKV">Q8_0</span></label><input type="range" id="pKvT" min="0" max="2" value="0" step="1"><div class="knob-desc">0=Q8_0 1=F16 2=F32</div></div>
+    <div class="slider-row"><label>Drafter</label><div class="drafter-sel"><input type="radio" name="drafter" id="d0" value="0_8b_q8" checked><label for="d0">0.8B Q8</label><input type="radio" name="drafter" id="d1" value="2b_q4"><label for="d1">2B Q4</label><input type="radio" name="drafter" id="d2" value="2b_q8"><label for="d2">2B Q8</label></div><div class="knob-desc">PFlash drafter model</div></div>
     <div class="toggle-row"><label class="toggle"><input type="checkbox" id="parkT"><span class="sl"></span></label><span class="toggle-label">Park/unpark — <strong id="parkL">off</strong></span></div>
     <div class="knob-desc" style="margin-bottom:6px">Llama freed during prefill, PFlash freed during decode</div>
     <div class="slider-row"><label>GPU VRAM <span class="val" id="gV">24 100</span></label><input type="range" id="gB" min="8000" max="80000" value="24100" step="100"></div>
@@ -114,15 +119,23 @@ input[type=range]{width:100%;margin:1px 0;accent-color:#58a6ff}
 </div>
 
 <script>
-const MW=15345.66,MP=888,CP=495,RS=150,PFW=800;
+const MW=15345.66,MP=888,CP=495,RS=150;
 const KT=['TURBO4','Q4_0','Q8_0','F16'],KVB=[.5,.5,1,2],KDT=['Q8_0','F16','F32'],KDB=[1,2,4];
+const MCONF={
+  '0_8b_q8':{w:800,hid:1024,q:256*8,attn:Math.ceil(256*8/32)*34,kvch:6*2*256*2,lb:6,kh:256,kh2:2,ln:'Qwen3.5-0.8B Q8_0'},
+  '2b_q4':{w:1310,hid:2048,q:256*8,attn:Math.ceil(256*8/32)*34,kvch:24*2*256*2,lb:24,kh:256,kh2:2,ln:'Qwen3.5-2B Q4_K_M'},
+  '2b_q8':{w:2059,hid:2048,q:256*8,attn:Math.ceil(256*8/32)*34,kvch:24*2*256*2,lb:24,kh:256,kh2:2,ln:'Qwen3.5-2B Q8_0'}
+};
+const MKEYS=Object.keys(MCONF);
+function mc(){return MCONF[document.querySelector('input[name=drafter]:checked').value]}
+function updateSubtitle(){const m=mc();document.getElementById('subtitle').innerHTML=`RTX 3090 24 GB · Qwen3.6-27B Q4_K_M · ${m.ln} · dtype: hidden <b>F32</b> · Q <b>F16</b> · attn_out <b>Q8_0</b> · K/V <b>Q8_0</b> · FA chunked <b>4K</b> · transient <b>~80 MB</b>`}
 
 function fmt(n){return Number(n).toLocaleString(undefined,{maximumFractionDigits:0})}
 function f1(n){return(n/1024).toFixed(1)}
 function savePreset(n){
   const s={h:+document.getElementById('hB').value,t:+document.getElementById('tB').value,k:+document.getElementById('kB').value,
     c:+document.getElementById('cB').value,kt:+document.getElementById('kvT').value,pk:+document.getElementById('pKvT').value,
-    g:+document.getElementById('gB').value,prk:document.getElementById('parkT').checked};
+    g:+document.getElementById('gB').value,prk:document.getElementById('parkT').checked,dr:document.querySelector('input[name=drafter]:checked').value};
   localStorage.setItem('pf_preset_'+n,JSON.stringify(s));
   const btn=event.target;btn.textContent='✅ Saved '+n;setTimeout(()=>btn.textContent='💾 Save '+n,1500);
 }
@@ -134,14 +147,15 @@ function loadPreset(n){
   document.getElementById('kB').value=s.k;document.getElementById('cB').value=s.c;
   document.getElementById('kvT').value=s.kt;document.getElementById('pKvT').value=s.pk;
   document.getElementById('gB').value=s.g;document.getElementById('parkT').checked=s.prk;
+  if(s.dr){const dm={'0_8b_q8':'d0','2b_q4':'d1','2b_q8':'d2'};if(dm[s.dr])document.getElementById(dm[s.dr]).checked=true}
   const btn=event.target;btn.textContent='✅ Loaded '+n;setTimeout(()=>btn.textContent='📂 Load '+n,1500);
-  syncLabels();calc();
+  syncLabels();updateSubtitle();calc();
 }
 function showPresets(){
   let msg='';
   for(let i=1;i<=3;i++){
     const raw=localStorage.getItem('pf_preset_'+i);
-    if(raw){const s=JSON.parse(raw);msg+=`Preset ${i}: h=${s.h} t=${s.t} k=${s.k}% ctx=${s.c} kv=${KT[s.kt]} pkv=${KDT[s.pk]} park=${s.prk} gpu=${s.g}\n`}
+    if(raw){const s=JSON.parse(raw);msg+=`Preset ${i}: h=${s.h} t=${s.t} k=${s.k}% ctx=${s.c} kv=${KT[s.kt]} pkv=${KDT[s.pk]} park=${s.prk} gpu=${s.g} drafter=${s.dr||'0_8b_q8'}\n`}
     else msg+=`Preset ${i}: empty\n`;
   }
   alert(msg);
@@ -159,6 +173,8 @@ function calc(){
   const kt=+document.getElementById('kvT').value,pkd=+document.getElementById('pKvT').value;
   const gpu=+document.getElementById('gB').value,pk=document.getElementById('parkT').checked;
   const ke=KDB[pkd],kb=KVB[kt];
+  const m=mc();
+  const PFW=m.w;
   document.getElementById('parkL').textContent=document.getElementById('parkT').checked?'on':'off';
 
   const prot=hb+tb,S=Math.round((ctx-prot)/kr)+prot,eff=prot+Math.max(0,S-prot)*kr;
@@ -166,8 +182,8 @@ function calc(){
   const lW=MW+MP;
   const lB=lW+kvB+CP+RS;
 
-  const pKvB=S*6*2*256*2*ke;
-  const pBuf=(1024*4 + 256*8*2 + Math.ceil(256*8/32)*34 + 8*4)*S;
+  const pKvB=S*m.kvch*ke;
+  const pBuf=(m.hid*4 + m.q*2 + m.attn + 8*4)*S;
   const pWS=(pKvB+pBuf)/(1024*1024);
   // Transient peak during chunked flash-attention: Q chunk cont (4 KB/tok F16)
   // + Q chunk cast F32 (8 KB/tok) = 12 KB/tok per chunk. With CHUNK_S=4096:
@@ -239,15 +255,15 @@ function calc(){
   else if(!eOk){wb.style.display='block';wb.textContent='⚠ Effective exceeds ctx.'}
   else wb.style.display='none';
 
-  const pH=1024*4*S,pQ=256*8*2*S,pA=Math.ceil(256*8/32)*34*S,pM=8*4*S;
+  const pH=m.hid*4*S,pQ=m.q*2*S,pA=m.attn*S,pM=8*4*S;
   const formula=
 `S = (${fmt(ctx)} − ${fmt(prot)}) / ${kr} + ${fmt(prot)} = ${fmt(S)}
 C = ${fmt(prot)} + (${fmt(S)} − ${fmt(prot)}) × ${kr} = ${fmt(Math.round(eff))}
 KV = ${fmt(ctx)} × 16L×2×1024×${kb}B = ${fmt(kvB)} MB
-PF hidden F32 = ${fmt(pH/1048576)} MB (1024×4×${fmt(S)})
-PF Q F16 = ${fmt(pQ/1048576)} MB (256×8×2×${fmt(S)})
-PF attn Q8_0 = ${fmt(pA/1048576)} MB (ceil(2048/32)×34×${fmt(S)})
-PF K/V ${KDT[pkd]} = ${fmt(pKvB/1048576)} MB (6L×2×256×2×${ke}B×${fmt(S)})
+PF hidden F32 = ${fmt(pH/1048576)} MB (${m.hid}×4×${fmt(S)})
+PF Q F16 = ${fmt(pQ/1048576)} MB (${m.q}×2×${fmt(S)})
+PF attn Q8_0 = ${fmt(pA/1048576)} MB (${m.attn}×${fmt(S)})
+PF K/V ${KDT[pkd]} = ${fmt(pKvB/1048576)} MB (${m.lb}L×${m.kh2}×${m.kh}×${ke}B×${fmt(S)})
 PF total = ${fmt(pH/1048576)} + ${fmt(pQ/1048576)} + ${fmt(pA/1048576)} + 0 + ${fmt(pKvB/1048576)} = ${fmt(pWS)} MB
 PF transient FA (chunked 4K) = ~80 MB (peak per chunk)
 Mode: ${phase} park=${pk?'yes':'no'}
@@ -283,6 +299,8 @@ document.getElementById('tabDecode').className='phase-tab'+(p==='decode'?' activ
     calc();
   });
 });
+document.querySelectorAll('input[name=drafter]').forEach(r=>r.addEventListener('change',()=>{updateSubtitle();calc()}));
+updateSubtitle();
 calc();
 </script>
 </body>

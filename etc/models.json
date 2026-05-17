@@ -10,7 +10,8 @@
       ],
       "cost": {
         "input": 0.33,
-        "output": 3.25
+        "output": 3.25,
+        "cache_read": 0.10
       },
       "ctx-size": 262144,
       "predict": 16384,
@@ -30,7 +31,8 @@
       ],
       "cost": {
         "input": 0.14,
-        "output": 0.4
+        "output": 0.4,
+        "cache_read": 0.04
       },
       "ctx-size": 131072,
       "predict": 16384,
@@ -50,7 +52,8 @@
       ],
       "cost": {
         "input": 0.3,
-        "output": 2.4
+        "output": 2.4,
+        "cache_read": 0.09
       },
       "ctx-size": 262144,
       "predict": 16384,
@@ -70,7 +73,8 @@
       ],
       "cost": {
         "input": 0.14,
-        "output": 0.4
+        "output": 0.4,
+        "cache_read": 0.04
       },
       "ctx-size": 131072,
       "predict": 16384,
@@ -96,7 +100,8 @@
       ],
       "cost": {
         "input": 0.33,
-        "output": 3.25
+        "output": 3.25,
+        "cache_read": 0.10
       },
       "ctx-size": 262144,
       "predict": 16384,
@@ -122,7 +127,8 @@
       ],
       "cost": {
         "input": 0.33,
-        "output": 3.25
+        "output": 3.25,
+        "cache_read": 0.10
       },
       "ctx-size": 60000,
       "max-effective-context": 60000,
@@ -153,12 +159,12 @@
       "tokenizer-trust-remote-code": true,
       "family": "qwen",
       "capabilities": [
-        "completion",
-        "multimodal"
+        "completion"
       ],
       "cost": {
         "input": 0.33,
-        "output": 3.25
+        "output": 3.25,
+        "cache_read": 0.10
       },
       "ctx-size": 65000,
       "max-effective-context": 65000,
@@ -171,8 +177,7 @@
       "prefill-threshold": 36000,
       "prefill-keep-ratio": 0.1,
       "prefill-tail-budget": 16000,
-      "park-unpark": false,
-      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf"
+      "park-unpark": false
     },
     "pflash-park-qwen3.6-27B": {
       "pflash": true,
@@ -187,7 +192,8 @@
       ],
       "cost": {
         "input": 0.33,
-        "output": 3.25
+        "output": 3.25,
+        "cache_read": 0.10
       },
       "ctx-size": 140000,
       "max-effective-context": 140000,

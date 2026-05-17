@@ -54,14 +54,20 @@ def _usage_from_object(data):
         return None
     input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
+    cached_tokens = usage.get("cached_tokens")
     try:
         input_tokens = int(input_tokens or 0)
         output_tokens = int(output_tokens or 0)
+        if cached_tokens is not None:
+            cached_tokens = int(cached_tokens)
     except (TypeError, ValueError):
         return None
     if input_tokens <= 0 and output_tokens <= 0:
         return None
-    return {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    result = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    if cached_tokens is not None and cached_tokens > 0:
+        result["cached_tokens"] = cached_tokens
+    return result
 
 
 def _extract_usage(raw_bytes):
@@ -150,7 +156,14 @@ def _delta_sse(completion_id, created, content, index=0):
     }
 
 
-def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content, ctx_size):
+def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content, ctx_size, cached_tokens=None):
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if cached_tokens is not None and cached_tokens > 0:
+        usage["cached_tokens"] = cached_tokens
     return {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -161,10 +174,6 @@ def _final_sse(completion_id, created, prompt_tokens, completion_tokens, content
             "delta": {},
             "finish_reason": "stop",
         }],
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
+        "usage": usage,
         "context_window": ctx_size,
     }

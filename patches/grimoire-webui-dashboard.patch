@@ -1,30 +1,18 @@
-diff --git a/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebarActions.svelte b/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebarActions.svelte
-index e0d379f..516517e 100644
---- a/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebarActions.svelte
-+++ b/tools/server/webui/src/lib/components/app/chat/ChatSidebar/ChatSidebarActions.svelte
-@@ -1,5 +1,5 @@
- <script lang="ts">
--	import { Search, SquarePen, X } from '@lucide/svelte';
-+	import { LayoutDashboard, Search, SquarePen, X } from '@lucide/svelte';
- 	import { KeyboardShortcutInfo } from '$lib/components/app';
- 	import { Button } from '$lib/components/ui/button';
- 	import { Input } from '$lib/components/ui/input';
-@@ -98,5 +98,18 @@
- 				MCP Servers
- 			</div>
- 		</Button>
-+
-+		<Button
-+			class="w-full justify-between backdrop-blur-none! hover:[&>kbd]:opacity-100"
-+			href="#/dashboard"
-+			onclick={handleMobileSidebarItemClick}
-+			variant="ghost"
-+		>
-+			<div class="flex items-center gap-2">
-+				<LayoutDashboard class="h-4 w-4" />
-+
-+				Dashboard
-+			</div>
-+		</Button>
- 	{/if}
- </div>
+diff --git a/tools/server/webui/src/lib/constants/ui.ts b/tools/server/webui/src/lib/constants/ui.ts
+index 47c402f..d3d489f 100644
+--- a/tools/server/webui/src/lib/constants/ui.ts
++++ b/tools/server/webui/src/lib/constants/ui.ts
+@@ -1,4 +1,4 @@
+-import { Database, Settings, Search, SquarePen } from '@lucide/svelte';
++import { Database, LayoutDashboard, Settings, Search, SquarePen } from '@lucide/svelte';
+ import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
+ import type { Component } from 'svelte';
+ 
+@@ -21,6 +21,7 @@ export interface DesktopIconStripItem {
+ export const SIDEBAR_ACTIONS_ITEMS: DesktopIconStripItem[] = [
+ 	{ icon: SquarePen, tooltip: 'New chat', route: '?new_chat=true#/', keys: ['shift', 'cmd', 'o'] },
+ 	{ icon: Search, tooltip: 'Search', keys: ['cmd', 'k'] },
++	{ icon: LayoutDashboard, tooltip: 'Dashboard', route: '#/dashboard', activeRouteId: '/dashboard' },
+ 	{
+ 		icon: McpLogo,
+ 		tooltip: 'MCP Servers',

@@ -116,6 +116,7 @@ const buildSearchQuery = (input: {
   limit: number
   includeToolOutput: boolean
   includeReasoning: boolean
+  role?: string
 }) => {
   const textExpr = `coalesce(json_extract(p.data, '$.text'), '')`
   const toolOutputExpr = `coalesce(json_extract(p.data, '$.state.output'), '')`
@@ -138,7 +139,40 @@ const buildSearchQuery = (input: {
       : `(json_extract(p.data, '$.type') in (${textTypeFilter}) and instr(lower(${textExpr}), lower(${queryText})) > 0)`,
   ]
 
+  if (input.role) {
+    const roleFilter = `json_extract(m.data, '$.role') = ${sqlQuote(input.role)}`
+    where.push(`(${roleFilter})`)
+  }
+
   return `${buildBaseSelect(input.includeToolOutput)} where ${where.join(" and ")} order by p.time_created desc limit ${input.limit}`
+}
+
+const buildListQuery = (input: {
+  sessionID?: string
+  scope: "current" | "all"
+  currentSessionID: string
+  limit: number
+  includeToolOutput: boolean
+  includeReasoning: boolean
+  role?: string
+}) => {
+  const partTypes = input.includeReasoning ? DEFAULT_PART_TYPES : (["text"] as const)
+  const typeFilter = partTypes.map((type) => sqlQuote(type)).join(", ")
+
+  const where = [
+    input.sessionID
+      ? `p.session_id = ${sqlQuote(input.sessionID)}`
+      : input.scope === "current"
+        ? `p.session_id = ${sqlQuote(input.currentSessionID)}`
+        : "1 = 1",
+    `json_extract(p.data, '$.type') in (${typeFilter})`,
+  ]
+
+  if (input.role) {
+    where.push(`json_extract(m.data, '$.role') = ${sqlQuote(input.role)}`)
+  }
+
+  return `${buildBaseSelect(input.includeToolOutput)} where ${where.join(" and ")} order by p.time_created asc limit ${input.limit}`
 }
 
 const buildPartQuery = (partID: string, includeToolOutput: boolean) =>
@@ -159,11 +193,15 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
     tool: {
       conversation_recall: tool({
         description:
-          "Search or fetch exact conversation content from OpenCode's local session log. Use this when older wording may have been compressed out of context and you need the original text back. Defaults to the current session and includes normal text plus reasoning for parity with OpenCode session replay.",
+           "Search, list, or fetch exact conversation content from OpenCode's local session log. Use this when older wording may have been compressed out of context and you need the original text back. Defaults to the current session and includes normal text plus reasoning for parity with OpenCode session replay.",
         args: {
           action: tool.schema
-            .enum(["search", "get_part", "get_message"])
-            .describe("search by exact substring, fetch a specific part, or fetch all visible parts for one message"),
+            .enum(["search", "get_part", "get_message", "list"])
+            .describe("search by exact substring, fetch a specific part, fetch all visible parts for one message, or list parts chronologically"),
+          role: tool.schema
+            .string()
+            .optional()
+            .describe("Filter by message role (user, assistant, tool, system). Applies to search and list actions."),
           query: tool.schema
             .string()
             .optional()
@@ -183,22 +221,22 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
           scope: tool.schema
             .enum(["current", "all"])
             .optional()
-            .describe("For search only: current session or all sessions. Ignored when sessionID is set."),
+            .describe("For search and list: current session or all sessions. Ignored when sessionID is set."),
           limit: tool.schema
             .number()
             .int()
             .min(1)
             .max(10)
             .optional()
-            .describe("Maximum search results to return. Default is 5."),
+            .describe("Maximum results to return. Default is 5."),
           includeToolOutput: tool.schema
             .boolean()
             .optional()
-            .describe("Also search or include tool outputs. Default is false."),
+            .describe("Also search or include tool outputs. Default is false. Applies to search and get_message."),
           includeReasoning: tool.schema
             .boolean()
             .optional()
-            .describe("Include reasoning parts. Default is true to match OpenCode session replay."),
+            .describe("Include reasoning parts. Default is true to match OpenCode session replay. Applies to search, list, and get_message."),
         },
         async execute(args, context) {
           const action = args.action
@@ -217,6 +255,7 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
               metadata: {
                 action,
                 query: args.query.trim(),
+                role: args.role,
                 scope: args.sessionID ? "session" : scope,
                 includeReasoning,
               },
@@ -231,6 +270,7 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
                 limit,
                 includeToolOutput,
                 includeReasoning,
+                role: args.role,
               }),
             )
 
@@ -242,10 +282,11 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
                   : `current session ${context.sessionID}`
 
               return {
-                output: `No matches found for ${JSON.stringify(args.query.trim())} in ${searchedScope}.`,
+                output: `No matches found for ${JSON.stringify(args.query.trim())} in ${searchedScope}${args.role ? ` with role "${args.role}"` : ""}.`,
                 metadata: {
                   action,
                   query: args.query.trim(),
+                  role: args.role,
                   matches: 0,
                   includeReasoning,
                 },
@@ -261,6 +302,7 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
             const body = [
               `Search query: ${JSON.stringify(args.query.trim())}`,
               `Scope: ${searchedScope}`,
+              `Role: ${args.role ?? "all roles"}`,
               `Include reasoning: ${includeReasoning ? "yes" : "no"}`,
               `Matches: ${rows.length}`,
               "",
@@ -274,7 +316,73 @@ export const ConversationRecallPlugin: Plugin = async ({ $ }) => {
               metadata: {
                 action,
                 query: args.query.trim(),
+                role: args.role,
                 matches: rows.length,
+                sessionID: args.sessionID ?? (scope === "current" ? context.sessionID : null),
+                includeReasoning,
+              },
+            }
+          }
+
+          if (action === "list") {
+            const roleLabel = args.role ?? "all roles"
+            context.metadata({
+              title: `List: ${roleLabel}`,
+              metadata: {
+                action,
+                role: args.role,
+                scope: args.sessionID ? "session" : scope,
+                includeReasoning,
+              },
+            })
+
+            const rows = await runQuery<RecallRow>(
+              buildListQuery({
+                sessionID: args.sessionID,
+                scope,
+                currentSessionID: context.sessionID,
+                limit,
+                includeToolOutput,
+                includeReasoning,
+                role: args.role,
+              }),
+            )
+
+            const listedScope = args.sessionID
+              ? `session ${args.sessionID}`
+              : scope === "all"
+                ? "all sessions"
+                : `current session ${context.sessionID}`
+
+            if (!rows.length) {
+              return {
+                output: `No parts found in ${listedScope}${args.role ? ` with role "${args.role}"` : ""}.`,
+                metadata: {
+                  action,
+                  role: args.role,
+                  results: 0,
+                },
+              }
+            }
+
+            const body = [
+              `Scope: ${listedScope}`,
+              `Role: ${roleLabel}`,
+              `Include reasoning: ${includeReasoning ? "yes" : "no"}`,
+              `Results: ${rows.length}`,
+              `Order: chronological (oldest first)`,
+              "",
+              ...rows.map(formatSearchRow),
+              "",
+              'Use `action="get_part"` with a returned `partID` to fetch the exact full content.',
+            ].join("\n")
+
+            return {
+              output: body,
+              metadata: {
+                action,
+                role: args.role,
+                results: rows.length,
                 sessionID: args.sessionID ?? (scope === "current" ? context.sessionID : null),
                 includeReasoning,
               },

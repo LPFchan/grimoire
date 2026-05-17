@@ -12,6 +12,13 @@
 		to: number;
 		bins: number;
 		tokens: { input: Series; output: Series };
+		cache: {
+			read: {
+				tokens: Series;
+				cost: Series;
+			};
+			lifetime_tokens: number;
+		};
 		cost: {
 			total: number;
 			input: number;
@@ -23,6 +30,8 @@
 		cpu: { temp: Series; power: Series };
 		fans: { fan1: Series; fan2: Series };
 		ram: { system: Series; container: Series };
+		disk: Series;
+		card_order: string[] | null;
 	};
 
 	const WINDOWS = [
@@ -36,11 +45,24 @@
 		{ id: 'all', label: 'All' }
 	] as const;
 
+	type CardKey = string;
+
+	type CardDef = {
+		key: CardKey;
+		title: string;
+		value: string;
+		series: Array<number | null> | undefined;
+		accent: string;
+		formatFn: (n: number) => string;
+	};
+
 	let selectedWindow = $state<(typeof WINDOWS)[number]['id']>('1h');
 	let pollingMs = $state<number>(1000);
 	let data = $state<DashboardResponse | null>(null);
 	let error = $state<string | null>(null);
 	let loading = $state(false);
+	let cardOrder = $state<CardKey[] | null>(null);
+	let dragKey = $state<CardKey | null>(null);
 
 	async function refresh() {
 		loading = true;
@@ -49,6 +71,9 @@
 				`/stats/dashboard?window=${selectedWindow}`
 			);
 			data = result;
+			if (result.card_order) {
+				cardOrder = result.card_order;
+			}
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -117,6 +142,11 @@
 		return `${Math.round(mb)} MB`;
 	}
 
+	function fmtPct(n: number | null | undefined): string {
+		if (n == null) return '—';
+		return `${n.toFixed(0)}%`;
+	}
+
 	type Sparkline = { line: string; area: string; lo: number; hi: number };
 
 	function buildSparkline(
@@ -154,10 +184,6 @@
 		}
 		const area = `${line} L${width.toFixed(2)},${height.toFixed(2)} L0,${height.toFixed(2)} Z`;
 		return { line, area, lo, hi };
-	}
-
-	function gpuLabel(idx: number, suffix: string): string {
-		return `GPU${idx} ${suffix}`;
 	}
 
 	type HoverInfo = { idx: number; x: number; value: number };
@@ -200,7 +226,104 @@
 	const SPARK_W = 280;
 	const SPARK_H = 56;
 
-	let cardsForGpus = $derived(data?.gpus ?? []);
+	function buildCardDefs(d: DashboardResponse): CardDef[] {
+		const cards: CardDef[] = [
+			{ key: 'input_tokens', title: 'Input tokens', value: fmtTokens(d.tokens.input.current), series: d.tokens.input.series, accent: 'oklch(0.72 0.16 252)', formatFn: fmtTokens },
+			{ key: 'output_tokens', title: 'Output tokens', value: fmtTokens(d.tokens.output.current), series: d.tokens.output.series, accent: 'oklch(0.74 0.16 152)', formatFn: fmtTokens },
+		];
+
+		if (d.cache) {
+			cards.push({ key: 'cache_read_tokens', title: 'Cache read tokens', value: fmtTokens(d.cache.read.tokens.current), series: d.cache.read.tokens.series, accent: 'oklch(0.76 0.18 42)', formatFn: fmtTokens });
+			cards.push({ key: 'cache_read_cost', title: 'Cache read cost', value: fmtCost(d.cache.read.cost.current), series: d.cache.read.cost.series, accent: 'oklch(0.80 0.17 80)', formatFn: fmtCost });
+		}
+
+		cards.push(
+			{ key: 'cpu_temp', title: 'CPU temp', value: fmtTemp(d.cpu.temp.current), series: d.cpu.temp.series, accent: 'oklch(0.72 0.16 320)', formatFn: fmtTemp },
+			{ key: 'cpu_power', title: 'CPU power', value: fmtPower(d.cpu.power.current), series: d.cpu.power.series, accent: 'oklch(0.75 0.18 120)', formatFn: fmtPower },
+		);
+
+		for (const gpu of d.gpus) {
+			cards.push(
+				{ key: `gpu${gpu.index}_temp`, title: `GPU${gpu.index} temp`, value: fmtTemp(gpu.temp.current), series: gpu.temp.series, accent: 'oklch(0.72 0.18 30)', formatFn: fmtTemp },
+				{ key: `gpu${gpu.index}_power`, title: `GPU${gpu.index} power`, value: fmtPower(gpu.power.current), series: gpu.power.series, accent: 'oklch(0.78 0.16 80)', formatFn: fmtPower },
+				{ key: `gpu${gpu.index}_vram`, title: `GPU${gpu.index} VRAM`, value: fmtVram(gpu.vram.current), series: gpu.vram.series, accent: 'oklch(0.65 0.18 270)', formatFn: fmtVram },
+				{ key: `gpu${gpu.index}_tps`, title: `GPU${gpu.index} t/s`, value: fmtTps(gpu.tokens_per_sec.current), series: gpu.tokens_per_sec.series, accent: 'oklch(0.70 0.16 60)', formatFn: fmtTps },
+			);
+		}
+
+		cards.push(
+			{ key: 'system_ram', title: 'System RAM', value: fmtRam(d.ram.system.current), series: d.ram.system.series, accent: 'oklch(0.72 0.17 200)', formatFn: fmtRam },
+			{ key: 'grimoire_ram', title: 'Grimoire RAM', value: fmtRam(d.ram.container.current), series: d.ram.container.series, accent: 'oklch(0.74 0.16 222)', formatFn: fmtRam },
+			{ key: 'disk_usage', title: 'Disk usage', value: fmtPct(d.disk.current), series: d.disk.series, accent: 'oklch(0.70 0.15 160)', formatFn: fmtPct },
+			{ key: 'fan1', title: 'Fan 1', value: fmtRpm(d.fans.fan1.current), series: d.fans.fan1.series, accent: 'oklch(0.68 0.16 190)', formatFn: fmtRpm },
+			{ key: 'fan2', title: 'Fan 2', value: fmtRpm(d.fans.fan2.current), series: d.fans.fan2.series, accent: 'oklch(0.68 0.14 250)', formatFn: fmtRpm },
+		);
+
+		return cards;
+	}
+
+	let allCardDefs = $derived(data ? buildCardDefs(data) : []);
+	let allCardKeys = $derived(allCardDefs.map(c => c.key));
+
+	let visibleOrder = $derived.by(() => {
+		if (!cardOrder) return allCardKeys;
+		const ordered = cardOrder.filter(k => allCardKeys.includes(k));
+		const remaining = allCardKeys.filter(k => !cardOrder.includes(k));
+		return [...ordered, ...remaining];
+	});
+
+	let cardDefMap = $derived(
+		Object.fromEntries(allCardDefs.map(c => [c.key, c]))
+	);
+
+	let visibleCards = $derived(
+		visibleOrder.map(k => cardDefMap[k]).filter(Boolean)
+	);
+
+	function handleDragStart(e: DragEvent, key: CardKey) {
+		if (!e.dataTransfer) return;
+		dragKey = key;
+		e.dataTransfer.effectAllowed = 'move';
+		e.dataTransfer.setData('text/plain', key);
+	}
+
+	function handleDragOver(e: DragEvent, key: CardKey) {
+		e.preventDefault();
+		if (!e.dataTransfer) return;
+		e.dataTransfer.dropEffect = 'move';
+	}
+
+	function handleDrop(e: DragEvent, targetKey: CardKey) {
+		e.preventDefault();
+		if (!dragKey || dragKey === targetKey) {
+			dragKey = null;
+			return;
+		}
+
+		const newOrder = visibleOrder.filter(k => k !== dragKey);
+		const targetIdx = newOrder.indexOf(targetKey);
+		const dragIdx = visibleOrder.indexOf(dragKey);
+		if (targetIdx === -1 || dragIdx === -1) {
+			dragKey = null;
+			return;
+		}
+		newOrder.splice(targetIdx, 0, dragKey);
+		cardOrder = newOrder;
+		dragKey = null;
+
+		apiFetch('/stats/card-order', {
+			method: 'PUT',
+			body: JSON.stringify({ card_order: newOrder }),
+		}).catch(() => {});
+	}
+
+	function handleDragEnd() {
+		dragKey = null;
+	}
+
+	function gpuLabel(idx: number, suffix: string): string {
+		return `GPU${idx} ${suffix}`;
+	}
 </script>
 
 <svelte:head>
@@ -254,25 +377,39 @@
 		{/if}
 	</section>
 
-	<section class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-		{#snippet statCard(title: string, value: string, series: Array<number | null> | undefined, accent: string, formatFn: (n: number) => string)}
-			{@const spark = buildSparkline(series, SPARK_W, SPARK_H)}
-			{@const values = series ?? []}
-			{@const hov = hoverState[title]}
-			<div class="flex flex-col rounded-xl border bg-card/40 p-4">
-				<div class="text-xs font-medium uppercase tracking-widest text-muted-foreground">
-					{title}
+	<section
+		class="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+		role="list"
+	>
+		{#snippet statCard(card: CardDef)}
+			{@const spark = buildSparkline(card.series, SPARK_W, SPARK_H)}
+			{@const values = card.series ?? []}
+			{@const hov = hoverState[card.key]}
+			<div
+				role="listitem"
+				draggable="true"
+				class="flex flex-col rounded-xl border bg-card/40 p-4 {dragKey === card.key ? 'opacity-50 ring-2 ring-primary' : ''}"
+				ondragstart={(e) => handleDragStart(e, card.key)}
+				ondragover={(e) => handleDragOver(e, card.key)}
+				ondrop={(e) => handleDrop(e, card.key)}
+				ondragend={handleDragEnd}
+			>
+				<div class="flex items-center justify-between">
+					<div class="text-xs font-medium uppercase tracking-widest text-muted-foreground">
+						{card.title}
+					</div>
+					<div class="cursor-grab text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" style="opacity: 0.3;">⠿</div>
 				</div>
 				<div class="my-2 text-3xl font-semibold tabular-nums transition-colors" class:text-primary={hov != null}>
-					{hov != null ? formatFn(hov.value) : value}
+					{hov != null ? card.formatFn(hov.value) : card.value}
 				</div>
 				<svg
 					viewBox={`0 0 ${SPARK_W} ${SPARK_H}`}
 					class="h-14 w-full cursor-crosshair"
 					preserveAspectRatio="none"
-					style:color={accent}
-					onmousemove={(e) => handleSparkMouseMove(e, title, values, spark.lo, spark.hi)}
-					onmouseleave={() => clearHover(title)}
+					style:color={card.accent}
+					onmousemove={(e) => handleSparkMouseMove(e, card.key, values, spark.lo, spark.hi)}
+					onmouseleave={() => clearHover(card.key)}
 				>
 					{#if spark.area}
 						<path d={spark.area} fill="currentColor" fill-opacity="0.18" />
@@ -300,99 +437,8 @@
 			</div>
 		{/snippet}
 
-		{@render statCard(
-			'Input tokens',
-			fmtTokens(data?.tokens.input.current),
-			data?.tokens.input.series,
-			'oklch(0.72 0.16 252)',
-			fmtTokens
-		)}
-
-		{@render statCard(
-			'Output tokens',
-			fmtTokens(data?.tokens.output.current),
-			data?.tokens.output.series,
-			'oklch(0.74 0.16 152)',
-			fmtTokens
-		)}
-
-		{@render statCard(
-			'CPU temp',
-			fmtTemp(data?.cpu.temp.current),
-			data?.cpu.temp.series,
-			'oklch(0.72 0.16 320)',
-			fmtTemp
-		)}
-
-		{@render statCard(
-			'CPU power',
-			fmtPower(data?.cpu.power.current),
-			data?.cpu.power.series,
-			'oklch(0.75 0.18 120)',
-			fmtPower
-		)}
-
-		{#each cardsForGpus as gpu (gpu.index)}
-			{@render statCard(
-				gpuLabel(gpu.index, 'temp'),
-				fmtTemp(gpu.temp.current),
-				gpu.temp.series,
-				'oklch(0.72 0.18 30)',
-				fmtTemp
-			)}
-			{@render statCard(
-				gpuLabel(gpu.index, 'power'),
-				fmtPower(gpu.power.current),
-				gpu.power.series,
-				'oklch(0.78 0.16 80)',
-				fmtPower
-			)}
-			{@render statCard(
-				gpuLabel(gpu.index, 'VRAM'),
-				fmtVram(gpu.vram.current),
-				gpu.vram.series,
-				'oklch(0.65 0.18 270)',
-				fmtVram
-			)}
-			{@render statCard(
-				gpuLabel(gpu.index, 't/s'),
-				fmtTps(gpu.tokens_per_sec.current),
-				gpu.tokens_per_sec.series,
-				'oklch(0.70 0.16 60)',
-				fmtTps
-			)}
+		{#each visibleCards as card (card.key)}
+			{@render statCard(card)}
 		{/each}
-
-		{@render statCard(
-			'System RAM',
-			fmtRam(data?.ram.system.current),
-			data?.ram.system.series,
-			'oklch(0.72 0.17 200)',
-			fmtRam
-		)}
-
-		{@render statCard(
-			'Grimoire RAM',
-			fmtRam(data?.ram.container.current),
-			data?.ram.container.series,
-			'oklch(0.74 0.16 222)',
-			fmtRam
-		)}
-
-		{@render statCard(
-			'Fan 1',
-			fmtRpm(data?.fans.fan1.current),
-			data?.fans.fan1.series,
-			'oklch(0.68 0.16 190)',
-			fmtRpm
-		)}
-
-		{@render statCard(
-			'Fan 2',
-			fmtRpm(data?.fans.fan2.current),
-			data?.fans.fan2.series,
-			'oklch(0.68 0.14 250)',
-			fmtRpm
-		)}
 	</section>
 </div>

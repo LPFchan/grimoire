@@ -243,6 +243,7 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
                 usage["input_tokens"],
                 usage["output_tokens"],
                 cost_rates=model_cfg.get("cost"),
+                cache_read_input_tokens=usage.get("cached_tokens"),
             )
 
         if gpu_index is not None:
