@@ -20,11 +20,16 @@
 ### Near term
 
 - [x] Phase 1: Core DFlash decode pipeline — ring buffer, build_cross_data, Bee's dflash_draft.cpp
-- [ ] **Phase 1.5: Debug 0% draft acceptance** — cross-data interleave layout, ring offset accuracy
-  - [x] 1.5a Validate build_cross_data() interleave matches graph builder set_input() expectations — CONFIRMED MATCH
-  - [x] 1.5b Check ring_write() slot placement against Bee's ring_write() — LOGIC MATCHES
-  - [ ] 1.5c Test with temperature > 0 to check if greedy decode is the cause
-  - [ ] 1.5d if temp>0 still 0%: add binary comparison test (Bee vs TheTom on same prompt)
+- [x] Phase 1.5: Debug 0% draft acceptance
+  - [x] 1.5a Validate build_cross_data() interleave matches graph builder set_input() — CONFIRMED
+  - [x] 1.5b Check ring_write() — LOGIC MATCHES
+  - [x] 1.5c Binary comparison: Bee gets 100% acceptance (11/11), TheTom gets 0%
+  - [x] 1.5d Root cause found: missing `flush_prefill()` — ring only has 4 tokens vs Bee's 12
+- [ ] **Phase 1.6: Add flush_prefill() and prepare_batch_draft() from Bee**
+  - [ ] Port `flush_prefill()` — incremental ring population during target prefill
+  - [ ] Port `prepare_batch_draft()` — separate cross-data prep step
+  - [ ] Wire into server's prefill loop via `common_speculative_flush_prefill`
+- [ ] Phase 2: Server integration (reduced verifier, multi-slot, rollback)
 - [ ] Phase 2: Server integration (est. 5 days)
   - [ ] 2.1 Port `dflash_reduced_verify_plan()`
   - [ ] 2.2 Port `dflash_sample_reduced_verify()`

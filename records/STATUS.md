@@ -66,8 +66,8 @@ The served DFlash/PFlash stack runs on a Lucebox dflash base in production (`gri
 
 ## Immediate Next Steps
 
-1. ✅ Phase 1 core pipeline — ring buffer, Bee's dflash_draft.cpp, all 3 bugs fixed
-2. 🔴 Phase 1.5: Debug 0% draft acceptance (cross-data interleave layout, ring offset accuracy)
-3. Phase 2: Server integration (multi-slot, reduced verifier, rollback)
-4. Phase 3: Supporting infrastructure (GPU ring, KV cache)
-5. Verify: short-prompt decode with positive #gen drafts and >1.5x speedup
+1. ✅ Phase 1 core pipeline — ring buffer, Bee's dflash_draft.cpp, all bugs fixed
+2. ✅ Binary comparison test — Bee gets 100% acceptance (11/11), we get 0%
+3. 🔴 Root cause: missing `flush_prefill()` — ring only has 4 tokens vs Bee's 12
+4. Implement `flush_prefill()` and `prepare_batch_draft()` from Bee
+5. Then: Phase 2 server integration (reduced verifier, multi-slot, rollback)
