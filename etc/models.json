@@ -42,7 +42,7 @@
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
-    "dflash-native-qwen3.6-27B-canary": {
+    "dflash-canary-qwen3.6-27B": {
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
       "spec-draft-model": "gguf/dflash-draft-3.6-q8_0.gguf",
@@ -63,7 +63,7 @@
       "parallel": 1,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-native-qwen3.6-27B-canary",
+      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-canary-qwen3.6-27B",
       "kv-cache-disk-budget-gb": 30,
       "kv-cache-disk-ttl-hours": 24,
       "kv-cache-cap": 8

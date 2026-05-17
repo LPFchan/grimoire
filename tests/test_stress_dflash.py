@@ -36,7 +36,7 @@ API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
 FIXTURES_DIR = Path(
     os.environ.get("GRIMOIRE_OPENCODE_SESSION_FIXTURES", "/home/yeowool/opencode_splits")
 )
-MODEL = os.environ.get("STRESS_MODEL",     "dflash-native-qwen3.6-27B-canary")
+MODEL = os.environ.get("STRESS_MODEL",     "dflash-canary-qwen3.6-27B")
 MAX_TOKENS = int(os.environ.get("STRESS_MAX_TOKENS", "64"))
 CONTAINER_NAME = os.environ.get("GRIMOIRE_SMOKE_CONTAINER", "grimoire")
 
@@ -157,7 +157,7 @@ def _snapshot_store_usage():
 
     try:
         disk = subprocess.run(
-            ["docker", "exec", CONTAINER_NAME, "du", "-sm", "/var/lib/grimoire/snapshot_swap/"],
+            ["docker", "exec", CONTAINER_NAME, "du", "-sm", "/var/lib/grimoire/kv_cache/"],
             capture_output=True, text=True,
         )
         disk_mb = int(disk.stdout.split()[0]) if disk.returncode == 0 else 0

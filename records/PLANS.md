@@ -16,7 +16,7 @@
 - [x] Phase 1.6: Fix GPU ring + turbo4 hang — merged upstream as PR #19 (commit `0ef12a5`)
 - [x] Phase 2: Server integration — Bee binary deployed, web UI patches, Docker build
 - [x] Phase 7: Legacy cleanup
-  - [x] Extract pflash_daemon → `src/pflash/` (trimmed CMakeLists, removed DFlash-only sources)
+  - [x] Extract pflash_daemon → `src/grimoire/pflash/` (trimmed CMakeLists, removed DFlash-only sources)
   - [x] Remove `lucebox/`, `proxy/dflash.py`, `snapshot_swap.py`, `session_kv.py`, `prefix_cache.py`
   - [x] Remove `DflashDaemon` from `daemon.py`, update config.py, Dockerfile
   - [x] Remove `dflash-pflash-qwen3.6-27B` model entry, delete dflash model files (3.3 GB)
@@ -36,10 +36,10 @@
 - Verification: `test_pflash_pipeline.py`
 - Depends on: Phase 3 sign-off
 
-**Phase 5 — Remaining Optimization**
-- Block-aware long-prompt integration
-- Model registry test-harness cleanup
-- Verify: short-prompt decode with positive `#gen drafts` and speedup >1.5x
+**Phase 5 — Remaining Optimization** (stale doc refs cleaned up in Phase 3)
+- Block-aware long-prompt integration — done (in `prefill.py`)
+- Model registry test-harness cleanup — done (SPEC.md, README.md, test fixes)
+- Verify: short-prompt decode speedup >1.5x
 
 ### Deferred
 
@@ -50,7 +50,7 @@
 ## Final Gates
 
 1. Canonical base: Bee (`Anbeeld/beellama.cpp`)
-2. DFlash decode parity green for `dflash-native-qwen3.6-27B-canary`
+2. DFlash decode parity green for `dflash-canary-qwen3.6-27B`
 3. Content-hash KV caching green (cross-conversation sysprompt reuse, disk mirror, restart resilience)
 4. Preserved PFlash parity green (.kv slot, warm/cold, reconstruction)
 5. Served runtime free of `/opt/dflash` and legacy code

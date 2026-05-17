@@ -146,7 +146,7 @@ class SystemMonitor:
         except Exception:
             pass
         try:
-            out = self._run(["docker", "exec", self.container_name, "du", "-sm", "/var/lib/grimoire/snapshot_swap/"])
+            out = self._run(["docker", "exec", self.container_name, "du", "-sm", "/var/lib/grimoire/kv_cache/"])
             disk_mb = int(out.split()[0])
         except Exception:
             pass

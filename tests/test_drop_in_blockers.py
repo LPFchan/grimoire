@@ -34,15 +34,14 @@ class FakeRequest:
 
 
 class DropInBlockerTests(unittest.TestCase):
-    def test_required_legacy_model_aliases_are_registered(self):
+    def test_required_model_aliases_are_registered(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
         aliases = set(data["models"])
         self.assertTrue({
             "gemma-4-31B",
             "qwen-3.6-27B",
-            "huihui-qwen3.5-27B",
-            "huihui-gemma-4-31B",
-            "qwopus-3.6-27B",
+            "dflash-canary-qwen3.6-27B",
+            "pflash-qwen3.6-27B",
         }.issubset(aliases))
 
     def test_auth_fails_closed_without_api_key(self):
@@ -465,7 +464,7 @@ class DropInBlockerTests(unittest.TestCase):
 
         ld_library_path = captured["env"].get("LD_LIBRARY_PATH", "")
         self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
-        self.assertNotIn(mm_module.config.DFLASH_HOME, ld_library_path)
+        self.assertNotIn(mm_module.config.PFLASH_HOME, ld_library_path)
         self.assertNotIn("LD_PRELOAD", captured["env"])
 
     def test_park_model_still_uses_shim_without_global_opt_dflash_path(self):
@@ -492,7 +491,7 @@ class DropInBlockerTests(unittest.TestCase):
 
         ld_library_path = captured["env"].get("LD_LIBRARY_PATH", "")
         self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
-        self.assertNotIn(mm_module.config.DFLASH_HOME, ld_library_path)
+        self.assertNotIn(mm_module.config.PFLASH_HOME, ld_library_path)
         self.assertEqual(captured["env"].get("LD_PRELOAD"), mm_module.config.PFLASH_SHIM_PATH)
         self.assertEqual(captured["env"].get("PFLASH_SHIM_FIFO_BASE"), "/tmp/pflash_shim.pflash-park-qwen3.6-27B")
 
@@ -510,11 +509,10 @@ class DropInBlockerTests(unittest.TestCase):
 
     def test_llama_proxy_scopes_slot_files_and_serializes_slot_zero_per_model(self):
         llama_proxy = (ROOT / "src" / "grimoire" / "proxy" / "llama.py").read_text()
-        self.assertIn('return f"pflash-{model_safe}-{conv_safe}.kv"', llama_proxy)
         self.assertIn('lock = getattr(active, "_pflash_slot_lock", None)', llama_proxy)
         self.assertIn('await slot_guard.acquire()', llama_proxy)
         self.assertIn('slot_guard.release()', llama_proxy)
-        self.assertIn('kv_name = _slot_save_key(active, validated_conversation_id)', llama_proxy)
+        self.assertIn('store.kv_filename(hash_bytes)', llama_proxy)
 
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:
@@ -597,38 +595,18 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("build/", dockerignore)
         self.assertIn("*.egg-info/", dockerignore)
 
-    def test_models_json_contains_dormant_native_dflash_canary(self):
+    def test_models_json_contains_dflash_canary(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        cfg = data["models"]["dflash-native-qwen3.6-27B-canary"]
+        cfg = data["models"]["dflash-canary-qwen3.6-27B"]
         self.assertEqual(cfg["speculative-type"], "dflash")
         self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
-        self.assertEqual(cfg["draft"], "gguf/Qwen3.5-0.8B-Q8_0.gguf")
+        self.assertEqual(cfg["draft"], "gguf/dflash-draft-3.6-q8_0.gguf")
 
-    def test_served_dflash_alias_stays_on_safetensors_until_gguf_cutover_is_proven(self):
+    def test_native_dflash_canary_uses_gguf_draft(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        served = data["models"]["dflash-pflash-qwen3.6-27B"]
-        self.assertEqual(served["draft"], "dflash/Qwen3.6-27B-DFlash/model.safetensors")
-        self.assertNotIn("speculative-type", served)
-
-        readme = (ROOT / "README.md").read_text()
-        self.assertIn("the served DFlash alias still points at the proven `.safetensors` draft", readme)
-        self.assertIn("the native GGUF draft path is canary-only", readme)
-        self.assertIn('"dflash-pflash-qwen3.6-27B"', readme)
-        self.assertIn('"ctx-size": 60000', readme)
-        self.assertIn('"budget": 18', readme)
-
-        checklist = (ROOT / "MIGRATION_EXECUTION_CHECKLIST.md").read_text()
-        self.assertIn("served `.safetensors` draft remains pinned on `dflash-pflash-qwen3.6-27B`", checklist)
-        self.assertIn("streaming GGUF parsing instead of full-file reads", checklist)
-        self.assertIn("per-model shim FIFO bases, model-scoped `.kv` slot filenames", checklist)
-
-    def test_phase0_checklist_includes_behavior_matrix_and_inventory(self):
-        checklist = (ROOT / "MIGRATION_EXECUTION_CHECKLIST.md").read_text()
-        self.assertIn("## Phase 0 Status Artifacts", checklist)
-        self.assertIn("### Required-vs-Retired Behavior Matrix", checklist)
-        self.assertIn("### Served Model Inventory And Harness Mapping", checklist)
-        self.assertIn("dflash-native-qwen3.6-27B-canary", checklist)
-        self.assertIn("Stale alias `dflash-pflash-qwen-27B` is not a valid current registry entry", checklist)
+        canary = data["models"]["dflash-canary-qwen3.6-27B"]
+        self.assertEqual(canary["draft"], "gguf/dflash-draft-3.6-q8_0.gguf")
+        self.assertEqual(canary["speculative-type"], "dflash")
 
     def test_harness_defaults_match_current_registry_aliases(self):
         e2e = (ROOT / "tests" / "test_e2e_smoke.py").read_text()
@@ -637,11 +615,11 @@ class DropInBlockerTests(unittest.TestCase):
         tune_ctx = (ROOT / "tests" / "tune_ctx.py").read_text()
         pflash_ctx_tune = (ROOT / "tests" / "test_pflash_ctx_tune.py").read_text()
 
-        self.assertIn('DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL", "dflash-pflash-qwen3.6-27B")', e2e)
+        self.assertIn('"dflash-canary-qwen3.6-27B"', e2e)
         self.assertIn('LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")', e2e)
         self.assertIn('MODEL = DFLASH_SMOKE_MODEL', e2e)
         self.assertIn('MODEL = LLAMA_SMOKE_MODEL', e2e)
-        self.assertIn('MODEL = os.environ.get("STRESS_MODEL", "dflash-pflash-qwen3.6-27B")', stress)
+        self.assertIn('"dflash-canary-qwen3.6-27B"', stress)
         self.assertIn('MODEL = os.environ.get("MODEL", "pflash-qwen3.6-27B")', pflash)
         self.assertIn('MODEL = "pflash-qwen3.6-27B"', tune_ctx)
         self.assertIn('MODEL = "pflash-qwen3.6-27B"', pflash_ctx_tune)
@@ -653,7 +631,7 @@ class DropInBlockerTests(unittest.TestCase):
 
     def test_text_only_served_pflash_models_have_no_mmproj(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        for name in ("dflash-pflash-qwen3.6-27B", "pflash-qwen3.6-27B", "pflash-park-qwen3.6-27B", "dflash-native-qwen3.6-27B-canary"):
+        for name in ("pflash-qwen3.6-27B", "pflash-park-qwen3.6-27B", "dflash-canary-qwen3.6-27B"):
             cfg = data["models"][name]
             self.assertEqual(cfg.get("capabilities"), ["completion"], name)
             self.assertNotIn("mmproj", cfg, name)
@@ -729,118 +707,25 @@ class DropInBlockerTests(unittest.TestCase):
                 registry_mod.MODELS_DIR = old_models_dir
                 config.PFLASH_SHIM_PATH = old_shim
 
-    def test_native_dflash_patch_is_copied_and_build_patches_reapply_on_fresh_clone(self):
-        patch_path = ROOT / "patches" / "spec-dflash-contract.patch"
-        self.assertTrue(patch_path.exists(), "native dflash contract patch file is missing")
-        content = patch_path.read_text()
-        self.assertIn("--spec-draft-model", content)
-        self.assertIn("--spec-dflash-cross-ctx", content)
-        self.assertIn('COMMON_SPECULATIVE_TYPE_DFLASH', content)
-        self.assertIn('LLM_ARCH_DFLASH_DRAFT', content)
-        self.assertIn('"dflash-draft"', content)
-        self.assertIn('LLM_KV_DFLASH_BLOCK_SIZE', content)
-        self.assertIn('LLAMA_API int32_t llama_model_dflash_block_size', content)
-        self.assertIn('LLAMA_API int32_t llama_model_dflash_target_layer_ids', content)
-        self.assertIn('LLAMA_API void llama_model_share_tensors', content)
-        self.assertIn('LLAMA_API void llama_set_dflash_n_slots(struct llama_context * ctx, int n);', content)
-        self.assertIn('LLAMA_API void llama_set_dflash_verify_logits(struct llama_context * ctx, bool enabled, int top_k);', content)
-        self.assertIn('LLAMA_API void llama_set_dflash_consume_reduced(struct llama_context * ctx, bool enabled);', content)
-        self.assertIn('int32_t dflash_n_slots;', content)
-        self.assertIn('int32_t dflash_cross_ctx;', content)
-        self.assertIn('LLAMA_DFLASH_MAX_SLOTS    = 8', content)
-        self.assertIn('cparams.dflash_cross_ctx = params.speculative.dflash_cross_ctx;', content)
-        self.assertIn('int dflash_cross_ctx = LLAMA_DFLASH_PER_SLOT_CTX;', content)
-        self.assertIn('int dflash_n_slots = 1;', content)
-        self.assertIn('bool dflash_verify_logits = false;', content)
-        self.assertIn('int  dflash_verify_topk = 1;', content)
-        self.assertIn('bool dflash_reduced_consumer_active = false;', content)
-        self.assertIn('void set_dflash_verify_logits(bool enabled, int top_k);', content)
-        self.assertIn('void set_dflash_consume_reduced(bool enabled);', content)
-        self.assertIn('GGML_API struct ggml_tensor * ggml_argmax_ext(', content)
-        self.assertIn('GGML_API struct ggml_tensor * ggml_topk_ext(', content)
-        self.assertIn('void llama_context::set_dflash_n_slots(int n) {', content)
-        self.assertIn('void llama_context::set_dflash_verify_logits(bool enabled, int top_k) {', content)
-        self.assertIn('void llama_context::set_dflash_consume_reduced(bool enabled) {', content)
-        self.assertIn('const int clamped_top_k = std::max(1, std::min(top_k, 64));', content)
-        self.assertIn('cparams.dflash_verify_logits = enabled;', content)
-        self.assertIn('cparams.dflash_verify_topk = clamped_top_k;', content)
-        self.assertIn('cparams.dflash_reduced_consumer_active = enabled;', content)
-        self.assertIn('struct ggml_tensor * ggml_argmax_ext(', content)
-        self.assertIn('struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * a->ne[1]);', content)
-        self.assertIn('struct ggml_tensor * ggml_topk_ext(', content)
-        self.assertIn('GGML_ASSERT(k >= 1 && k <= 64);', content)
-        self.assertIn('struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2 * k * a->ne[1]);', content)
-        self.assertIn('ggml_set_op_params_i32(result, 3, (int32_t) k);', content)
-        self.assertIn('LLAMA_API int32_t * llama_get_logits_argmax(struct llama_context * ctx);', content)
-        self.assertIn('LLAMA_API float *   llama_get_logits_argmax_probs_ith(struct llama_context * ctx, int32_t i);', content)
-        self.assertIn('ggml_tensor * t_logits_argmax = nullptr;', content)
-        self.assertIn('int32_t * get_logits_argmax_ith(int32_t i);', content)
-        self.assertIn('std::vector<int32_t> logits_argmax_buf;', content)
-        self.assertIn('std::vector<float>   logits_argmax_prob_buf;', content)
-        self.assertIn('int32_t * llama_context::get_logits_argmax() {', content)
-        self.assertIn('float * llama_context::get_logits_argmax_probs_ith(int32_t i) {', content)
-        self.assertIn('auto * t_argmax = res->t_logits_argmax;', content)
-        self.assertIn('logits_argmax_count = n_outputs_prev + n_outputs;', content)
-        self.assertIn('const bool dflash_reduced_consumed = t_argmax != nullptr && cparams.dflash_reduced_consumer_active;', content)
-        self.assertIn('if (logits.data && t_logits && n_outputs > 0 && !dflash_reduced_consumed && needs_raw_logits(ubatch, sampling.samplers)) {', content)
-        self.assertIn('std::swap(logits_argmax_buf[i0*logits_argmax_k + k], logits_argmax_buf[i1*logits_argmax_k + k]);', content)
-        self.assertIn('int32_t * llama_get_logits_argmax(llama_context * ctx) {', content)
-        self.assertIn('float * llama_get_logits_argmax_probs(llama_context * ctx) {', content)
-        self.assertIn('void llama_set_dflash_consume_reduced(llama_context * ctx, bool enabled) {', content)
-        self.assertIn('if (cparams.dflash_verify_logits) {', content)
-        self.assertIn('const int topk = std::max(1, std::min(cparams.dflash_verify_topk, 64));', content)
-        self.assertIn('res->t_logits_argmax = ggml_topk_ext(ctx0, cur, topk, 0.0f, 0);', content)
-        self.assertIn('res->t_logits_argmax = ggml_argmax_ext(ctx0, cur, 0.0f, 0);', content)
-        self.assertIn('ggml_build_forward_expand(gf, res->t_logits_argmax);', content)
-        self.assertIn('bool common_sampler_supports_reduced(struct common_sampler * gsmpl);', content)
-        self.assertIn('bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);', content)
-        self.assertIn('std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(', content)
-        self.assertIn('return common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;', content)
-        self.assertIn('if (common_sampler_blocks_speculative(gsmpl)) {', content)
-        self.assertIn('static dflash_reduced_verify_plan dflash_select_reduced_verify_plan(', content)
-        self.assertIn('static bool dflash_batch_view_is_reduced_verify(', content)
-        self.assertIn('static std::vector<llama_token> dflash_sample_reduced_verify(', content)
-        self.assertIn('llama_set_dflash_consume_reduced(ctx, dflash_reduce_this_view);', content)
-        self.assertIn('accepted = dflash_sample_reduced_verify(', content)
-        self.assertIn('GGML_ABORT("DFlash reduced verifier output missing; raw logits were not copied for this decode view\\n");', content)
-        self.assertIn('llama_set_dflash_consume_reduced(ctx, false);', content)
-        self.assertIn('cparams.dflash_n_slots = std::clamp(params.dflash_n_slots <= 0 ? 1 : params.dflash_n_slots,', content)
-        self.assertIn('sched_need_reserve = true;', content)
-        self.assertIn('gf_res_prev->reset();', content)
-        self.assertIn('void llama_set_dflash_verify_logits(llama_context * ctx, bool enabled, int top_k) {', content)
-        self.assertIn('void llama_set_dflash_n_slots(llama_context * ctx, int n) {', content)
-        self.assertIn('cparams.dflash_verify_logits == other.cparams.dflash_verify_logits &&', content)
-        self.assertIn('cparams.dflash_verify_topk   == other.cparams.dflash_verify_topk &&', content)
-        self.assertIn('/*.dflash_cross_ctx            =*/ LLAMA_DFLASH_PER_SLOT_CTX', content)
-        self.assertIn('return model->arch == LLM_ARCH_DFLASH_DRAFT ? (int32_t) model->hparams.dflash_block_size : 0;', content)
-        self.assertIn('dst->tok_embd = src->tok_embd;', content)
-        self.assertIn('if (llama_model_dflash_block_size(model_dft.get()) > 0 &&', content)
-        self.assertIn('auto-detected DFlash drafter (block_size=%d)', content)
-        self.assertIn('struct llm_build_dflash_draft : public llm_graph_context {', content)
-        self.assertIn('llm_build_dflash_draft(const llama_model & model, const llm_graph_params & params);', content)
-        self.assertIn('void common_speculative_set_seq_id(common_speculative * spec, llama_seq_id seq_id) {', content)
-        self.assertIn('llama_set_dflash_capture(ctx_tgt, capture_layers.data(), n_target_layers);', content)
-        self.assertIn('llama_set_cross_data_seq(ctx_dft, seq_id, history.data(), n_target_features, cross_len);', content)
-        self.assertIn('common_speculative_set_seq_id(spec, 0);', content)
-        self.assertIn('common_speculative_set_seq_id(slot.spec.get(), slot.id);', content)
-        self.assertIn('llama_model_share_tensors(model_dft.get(), model_tgt);', content)
-        self.assertIn('llama_model_share_tensors(model_dft.get(), llama_get_model(ctx));', content)
-        self.assertIn('DFlash draft models are not supported by this example; use speculative-simple or server', content)
-        self.assertNotIn('DFlash launch contract recognized, but this build does not yet include a native DFlash implementation', content)
-        self.assertNotIn('native implementation not yet ported', content)
-        self.assertIn('@ModelBase.register("DFlashDraftModel")', content)
-        self.assertIn('model_arch = gguf.MODEL_ARCH.DFLASH_DRAFT', content)
-        self.assertIn('self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", block_size)', content)
-        self.assertIn('self.gguf_writer.add_array(f"{arch}.dflash.target_layer_ids", target_layer_ids)', content)
-        self.assertIn('MODEL_ARCH.DFLASH_DRAFT:     "dflash-draft"', content)
-        self.assertIn('MODEL_TENSOR.DFLASH_FC:                 "dflash_fc"', content)
-        self.assertIn('"fc",                  # dflash drafter', content)
+    def test_native_dflash_is_native_to_bee_not_patched(self):
+        """DFlash support is native to Bee — no separate contract patch needed.
 
-        dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("COPY patches/spec-dflash-contract.patch /app/patches/", dockerfile)
-        self.assertIn("patch_hash_file=/app/.cache/llama-cpp-build/.patch_hash", dockerfile)
-        self.assertIn("need_patches=1", dockerfile)
-        self.assertIn("printf '%s' \"$patch_hash\" > \"$patch_hash_file\"", dockerfile)
+        Verify that the only remaining build patch (slot-save-mtmd) is still
+        present and that the old spec-dflash-contract patch has been removed
+        (its contents are now upstream in Bee).
+        """
+        removed = ROOT / "patches" / "spec-dflash-contract.patch"
+        self.assertFalse(removed.exists(), "spec-dflash-contract.patch should be removed — DFlash is native in Bee")
+
+        slot_save = ROOT / "patches" / "slot-save-mtmd.patch"
+        self.assertTrue(slot_save.exists(), "slot-save-mtmd.patch must still be present")
+        content = slot_save.read_text()
+        self.assertIn("check_no_mtmd", content)
+
+        dockerfile = ROOT / "Dockerfile"
+        df = dockerfile.read_text()
+        self.assertIn("COPY patches/slot-save-mtmd.patch", df)
+        self.assertNotIn("COPY patches/spec-dflash-contract.patch", df)
 
     def test_webui_patches_reapply_on_fresh_clone_and_patch_change(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
@@ -860,27 +745,23 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("/src/patches/grimoire-webui-*.patch", dockerfile)
         self.assertIn("grimoire-webui-*", dockerfile)
 
-    def test_dflash_runtime_scopes_opt_dflash_to_preserved_components(self):
+    def test_pflash_build_stage_builds_only_pflash_daemon(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("-DDFLASH27B_TESTS=ON", dockerfile)
-        self.assertIn("--target test_dflash", dockerfile)
+        self.assertNotIn("-DDFLASH27B_TESTS=ON", dockerfile)
         self.assertIn("--target pflash_daemon", dockerfile)
-        self.assertIn("/app/.cache/dflash-build/build/test_dflash /opt/dflash/dflash", dockerfile)
-        self.assertIn("/app/.cache/dflash-build/build/pflash_daemon /opt/dflash/pflash_daemon", dockerfile)
-        self.assertIn("LD_LIBRARY_PATH=/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64", dockerfile)
-        self.assertNotIn("LD_LIBRARY_PATH=/opt/dflash:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64", dockerfile)
+        self.assertNotIn("test_dflash", dockerfile)
+        self.assertIn("/opt/pflash/pflash_daemon", dockerfile)
+        self.assertIn("/opt/pflash/pflash_shim.so", dockerfile)
 
     def test_preserved_dflash_binaries_and_lib_dir_are_individually_configurable(self):
         config_src = (ROOT / "src" / "grimoire" / "config.py").read_text()
         daemon_src = (ROOT / "src" / "grimoire" / "dflash" / "daemon.py").read_text()
 
-        self.assertIn('DFLASH_LIB_DIR = os.environ.get("GRIMOIRE_DFLASH_LIB_DIR", DFLASH_HOME)', config_src)
-        self.assertIn('DFLASH_BIN = os.environ.get("GRIMOIRE_DFLASH_BIN", os.path.join(DFLASH_HOME, "dflash"))', config_src)
-        self.assertIn('PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(DFLASH_HOME, "pflash_daemon"))', config_src)
-        self.assertIn('PFLASH_SHIM_PATH = os.environ.get("GRIMOIRE_PFLASH_SHIM_PATH", os.path.join(DFLASH_HOME, "pflash_shim.so"))', config_src)
-        self.assertIn('cmd = [config.DFLASH_BIN, self.target_path]', daemon_src)
-        self.assertIn('_prepend_library_dir(env, config.DFLASH_LIB_DIR)', daemon_src)
+        self.assertIn('PFLASH_LIB_DIR = os.environ.get("GRIMOIRE_PFLASH_LIB_DIR", PFLASH_HOME)', config_src)
+        self.assertIn('PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(PFLASH_HOME, "pflash_daemon"))', config_src)
+        self.assertIn('PFLASH_SHIM_PATH = os.environ.get("GRIMOIRE_PFLASH_SHIM_PATH", os.path.join(PFLASH_HOME, "pflash_shim.so"))', config_src)
         self.assertIn('config.PFLASH_DAEMON_BIN', daemon_src)
+        self.assertIn('config.PFLASH_LIB_DIR', daemon_src)
 
 
 if __name__ == "__main__":

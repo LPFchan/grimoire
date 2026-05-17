@@ -22,7 +22,6 @@ REGISTRY_PATH = os.environ.get("GRIMOIRE_REGISTRY_PATH", DEFAULT_REGISTRY_PATH)
 REGISTRY_SEED_PATH = os.environ.get("GRIMOIRE_REGISTRY_SEED_PATH", DEFAULT_REGISTRY_SEED_PATH)
 
 BACKEND_LLAMA = "llama"
-BACKEND_DFLASH = "dflash"
 
 _GGUF_MAGIC = 0x46554747
 _GGUF_SUPPORTED_VERSIONS = {2, 3}
@@ -390,7 +389,7 @@ def _validate_native_dflash_draft_gguf(path: str) -> Optional[str]:
 
 def _get_backend(cfg: dict) -> str:
     """Get the backend type for a model config. Defaults to llama."""
-    return cfg.get("backend", BACKEND_LLAMA)
+    return cfg.get("backend", "llama")
 
 
 def resolve_path(cfg: dict, key: str) -> Optional[str]:
@@ -684,7 +683,7 @@ class ModelRegistry:
             return False, f"Model '{model_name}' not found"
 
         backend = _get_backend(cfg)
-        if backend == BACKEND_LLAMA:
+        if backend == "llama":
             if not cfg.get("file"):
                 return False, "Missing 'file' field"
             model_path = os.path.join(MODELS_DIR, cfg["file"])
@@ -705,50 +704,6 @@ class ModelRegistry:
                 draft_error = _validate_native_dflash_draft_gguf(draft)
                 if draft_error:
                     return False, draft_error
-        elif backend == BACKEND_DFLASH:
-            target = resolve_path(cfg, "target")
-            if not target or not os.path.exists(target):
-                return False, f"Target model not found at {target}"
-            if cfg.get("snapshot-mode") != "compact-full":
-                return False, "DFlash models must set 'snapshot-mode' to 'compact-full'"
-            staging_slot = cfg.get("snapshot-staging-slot")
-            if staging_slot is None:
-                return False, "DFlash models must set 'snapshot-staging-slot'"
-            try:
-                staging_slot = int(staging_slot)
-            except (TypeError, ValueError):
-                return False, f"Invalid snapshot staging slot: {staging_slot}"
-            if not 0 <= staging_slot < 8:
-                return False, f"Snapshot staging slot must be in range 0-7: {staging_slot}"
-            session_cap = cfg.get("session-kv-slots")
-            if session_cap is None:
-                return False, "DFlash models must set 'session-kv-slots'"
-            try:
-                session_cap = int(session_cap)
-            except (TypeError, ValueError):
-                return False, f"Invalid session-kv-slots value: {session_cap}"
-            if session_cap < 0:
-                return False, f"session-kv-slots must be non-negative: {session_cap}"
-            use_dflash = cfg.get("dflash", True)
-            if use_dflash:
-                draft = resolve_path(cfg, "draft")
-                if not draft or not os.path.exists(draft):
-                    return False, f"Draft model not found at {draft}"
-            use_pflash = cfg.get("pflash", True)
-            if use_pflash:
-                drafter = resolve_path(cfg, "drafter")
-                if drafter and not os.path.exists(drafter):
-                    return False, f"Drafter model not found at {drafter}"
-            tokenizer = cfg.get("tokenizer")
-            if not tokenizer:
-                return False, (
-                    "Missing 'tokenizer' field: dflash backends need an explicit "
-                    "tokenizer (HF repo id or local path); runtime download is not safe"
-                )
-            if _looks_like_local_path(tokenizer):
-                tok_path = resolve_path(cfg, "tokenizer")
-                if tok_path and not os.path.exists(tok_path):
-                    return False, f"Tokenizer path not found at {tok_path}"
         else:
             return False, f"Unknown backend '{backend}'"
 

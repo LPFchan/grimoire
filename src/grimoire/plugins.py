@@ -168,7 +168,7 @@ class DflashPflashAwarenessPlugin(Plugin):
     """Inject a runtime note when retrieval-aware sessions run on DFlash/PFlash."""
 
     def before_request(self, payload, model_name, model_cfg):
-        if model_cfg.get("backend") != "dflash":
+        if model_cfg.get("speculative-type") != "dflash":
             return payload
         if model_cfg.get("prefill-compression", model_cfg.get("prefill_compression")) == "never":
             return payload

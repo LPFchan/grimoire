@@ -43,6 +43,7 @@ WORKDIR /app
 
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
 ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
@@ -52,8 +53,6 @@ ENV CCACHE_DIR=/root/.ccache \
 
 # Copy only non-webui patches for the build stage
 RUN mkdir -p /app/patches
-COPY patches/prefill-thinking-fix.patch /app/patches/
-COPY patches/spec-dflash-contract.patch /app/patches/
 COPY patches/slot-save-mtmd.patch /app/patches/
 
 RUN --mount=type=cache,target=/root/.ccache \
@@ -79,6 +78,11 @@ RUN --mount=type=cache,target=/root/.ccache \
     if [ ! -d /app/.cache/llama-cpp-src/repo/.git ]; then \
         rm -rf /app/.cache/llama-cpp-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /app/.cache/llama-cpp-src/repo; \
+        checked_out=$$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
+        if [ "$$checked_out" != "$GRIMOIRE_LLAMA_CPP_PINNED_SHA" ]; then \
+            echo "FATAL: cloned HEAD $$checked_out != pinned $GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
+            exit 1; \
+        fi; \
         need_patches=1; \
     else \
         old_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
@@ -87,6 +91,11 @@ RUN --mount=type=cache,target=/root/.ccache \
         new_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse FETCH_HEAD); \
         if [ "$old_ref" != "$new_ref" ]; then \
             git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
+            checked_out=$$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
+            if [ "$$checked_out" != "$GRIMOIRE_LLAMA_CPP_PINNED_SHA" ]; then \
+                echo "FATAL: fetched HEAD $$checked_out != pinned $GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
+                exit 1; \
+            fi; \
             need_patches=1; \
         fi; \
         for patch in /app/patches/*.patch; do \
@@ -140,7 +149,7 @@ FROM ${CUDA_BASE} AS pflash-build
 
 WORKDIR /app
 
-COPY src/pflash/ /app/pflash/
+COPY src/grimoire/pflash/ /app/pflash/
 
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates cmake build-essential && rm -rf /var/lib/apt/lists/*
 

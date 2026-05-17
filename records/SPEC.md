@@ -3,7 +3,7 @@
 **Project:** Grimoire — Model serving gateway with DFlash/PFlash speculative decoding
 **Canonical repo:** `git@github.com:LPFchan/grimoire.git` (refactor branch)
 **Operator:** LPFchan
-**Last updated:** 2026-05-16
+**Last updated:** 2026-05-18
 
 ## Mission
 
@@ -12,7 +12,7 @@ Migrate the served DFlash/PFlash stack onto the canonical `Anbeeld/beellama.cpp`
 ### Workstreams
 
 - **A**: Canonical DFlash decode on Bee.
-- **B**: DFlash `compact-full` persistence parity for `dflash-pflash-qwen3.6-27B`.
+- **B**: DFlash `compact-full` persistence parity for `dflash-canary-qwen3.6-27B`.
 - **C**: Preserved llama-side PFlash path, including its `.kv` slot contract, warm/cold behavior, and text-only reconstruction semantics.
 - A, B, and C are not validation-independent. Changes to prompt layout, effective prompt semantics, or snapshot formats can invalidate multiple tracks at once.
 
@@ -36,10 +36,9 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 ### Contract A: DFlash Decode
 | Property | Value |
 | --- | --- |
-| Primary served model | `dflash-pflash-qwen3.6-27B` |
+| Primary served model | `dflash-canary-qwen3.6-27B` |
 | Target artifact | `gguf/Qwen3.6-27B-Q4_K_M.gguf` |
-| Draft artifact (current) | `dflash/Qwen3.6-27B-DFlash/model.safetensors` |
-| Draft artifact (target) | GGUF (end-state) |
+| Draft artifact | `gguf/dflash-draft-3.6-q8_0.gguf` |
 | Semantics | Text-only chat, `parallel=1`, `ctx-size=60000`, `max-effective-context=60000`, `budget=18`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `<|im_end|>` stop |
 | Prompt handling | Block-aware; compression boundaries/message metadata/prompt layout must survive `_prompt_layout_from_messages` -> compression -> reconstruction |
 | Retirement | Final served decode path must not require the Lucebox decode daemon |
@@ -74,33 +73,26 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 
 ## Pinned Upstream Repos
 
-| Repo | URL | Local path | SHA |
-| --- | --- | --- | --- |
-| TheTom/llama-cpp-turboquant | `https://github.com/TheTom/llama-cpp-turboquant.git` (branch `feature-turboquant-kv-cache-b9079-69d8e4b`) | `tmp/spec-analysis/thetom-shallow/` | `69d8e4be47243e83b3d0d71e932bc7aa61c644dc` |
-| spiritbuun/buun-llama-cpp | `https://github.com/spiritbuun/buun-llama-cpp.git` | `tmp/spec-analysis/buun-shallow/` | `853eebdd02c2db4baf7bf781adadee6e7ce1d44e` |
-| Anbeeld/beellama.cpp | `https://github.com/Anbeeld/beellama.cpp.git` | `tmp/spec-analysis/bee-shallow/` | `2b9aa77aa67ef0af7ee6eaa3d1f970215c7310fe` |
-| ggml-org/llama.cpp PR 22105 | `https://github.com/ggml-org/llama.cpp.git` | `tmp/spec-analysis/ggml-pr22105/` | `320a6a44a5b1de6a074ba781e65f5fd79fb4051a` |
-| Luce-Org/lucebox-hub | `https://github.com/Luce-Org/lucebox-hub.git` | `tmp/spec-analysis/lucebox-hub/` | `e5347801719ad7d45a3d7bd096e9e57778ce23ea` |
+| Repo | URL | SHA |
+| --- | --- | --- |
+| Anbeeld/beellama.cpp | `https://github.com/Anbeeld/beellama.cpp.git` | `2b9aa77aa67ef0af7ee6eaa3d1f970215c7310fe` |
 
-Local native source of truth: `lucebox/dflash/`. Local control-plane source of truth: `src/grimoire/`. Required native fixes to carry forward: all `b4ed333` fixes plus `e4d4e32` (qwen3_5_0p8b_graph.cpp leak fix).
+Control-plane source of truth: `src/grimoire/`. Required native fixes: GPU ring + turbo4 hang fix (merged upstream at `0ef12a5`).
 
 ## Served Model Inventory
 
 | Alias | Backend | Draft/Drafter | Capabilities | Harness |
 | --- | --- | --- | --- | --- |
 | `qwen-3.6-27B` | llama | — | completion, multimodal | `test_e2e_smoke.py::LlamaCppSmokeTests` |
-| `dflash-pflash-qwen3.6-27B` | dflash | `model.safetensors` | completion (text-only) | `test_e2e_smoke.py::DFlashSmokeTests`, `test_stress_dflash.py` |
-| `dflash-native-qwen3.6-27B-canary` | llama (spec dflash) | `Qwen3.5-0.8B-Q8_0.gguf` | completion (text-only) | dormant — not a default harness target |
+| `dflash-canary-qwen3.6-27B` | llama (spec dflash) | `gguf/dflash-draft-3.6-q8_0.gguf` | completion (text-only) | `test_e2e_smoke.py` |
 | `pflash-qwen3.6-27B` | llama (pflash) | `Qwen3.5-0.8B-Q8_0.gguf` | completion (text-only) | `test_pflash_pipeline.py` |
 | `pflash-park-qwen3.6-27B` | llama (pflash+park) | `Qwen3.5-0.8B-Q8_0.gguf` | completion (text-only) | parameterized harness target only |
-
-Stale alias `dflash-pflash-qwen-27B` is not a valid registry entry and must not reappear in harness defaults or release-gate docs.
 
 ## Required Verification Suite
 
 | Suite | File | What it covers |
 | --- | --- | --- |
-| Semantic regression | `tests/test_dflash.py` | Prompt/block behavior, replay semantics, prefix/session helpers, protected blocks |
+| KV cache store | `tests/test_kv_cache_store.py` | Content-hash RAM/disk tiering, LRU eviction, TTL, manifest persistence |
 | Live smoke | `tests/test_e2e_smoke.py` | Basic chat completion on served models |
 | Long-prompt compressor | `tests/test_pflash_pipeline.py` | PFlash compression pipeline |
 | Soak/leak/snapshot-growth | `tests/test_stress_dflash.py` | Bounded RAM/disk growth |
@@ -115,17 +107,17 @@ Default regression budget: median TTFT no worse than +20%, median decode TPS no 
 
 | Surface | Must Preserve | Explicitly Retired / Not A Gate Yet |
 | --- | --- | --- |
-| `dflash-pflash-qwen3.6-27B` served decode | Text-only chat semantics, `parallel=1`, `ctx-size=60000`, `max-effective-context=60000`, `budget=18`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `<|im_end|>` stop-string behavior, block-aware prompt compression/reconstruction, `snapshot-mode=compact-full` | Lucebox decode daemon dependency. Early `.safetensors` -> GGUF draft cutover before proven. |
+| `dflash-canary-qwen3.6-27B` served decode | Text-only chat semantics, `ctx-size=60000`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `spec-dflash-cross-ctx=1024`, content-hash KV caching | N/A — canonical path |
 | `pflash-qwen3.6-27B` preserved PFlash path | Standalone `pflash_daemon`, raw `compress <path> <keep_x1000>` protocol, `Qwen3.5-0.8B Q8_0` drafter, token -> text -> message reconstruction | Multimodal serving and `mmproj` wiring |
 | `pflash-park-qwen3.6-27B` preserved park path | FIFO park/unpark via `pflash_shim.so`, same text-only compression semantics as above | Global `/opt/dflash` library-path coupling |
  | `qwen-3.6-27B` normal llama path | Canonical non-PFlash startup, multimodal config, resolves against Bee libraries without `/opt/dflash` | Hidden fallback that only works because `/opt/dflash` is in runtime search path |
-| `dflash-native-qwen3.6-27B-canary` native canary | Dormant native-control-plane launch contract | Treating canary as served replacement before real-hardware decode verification |
+| `dflash-canary-qwen3.6-27B` native canary | Dormant native-control-plane launch contract | Treating canary as served replacement before real-hardware decode verification |
 
 ## Final Gates
 
 1. Canonical base is Bee (`Anbeeld/beellama.cpp`).
-2. DFlash decode parity is green for `dflash-pflash-qwen3.6-27B`.
-3. DFlash `compact-full` persistence parity is green (restart resilience, staging-slot, hash invalidation, bounded snapshot-store growth).
+2. DFlash decode parity is green for `dflash-canary-qwen3.6-27B`.
+3. Content-hash KV caching parity is green (restart resilience, cross-conversation sysprompt reuse, bounded disk growth).
 4. Preserved llama-side PFlash parity is green (.kv slot contract, warm/cold, reconstruction, all required native fixes).
 5. `pflash-qwen3.6-27B` is text-only, no multimodal config or `mmproj` in served runtime.
 6. Served runtime is verified without `/opt/dflash` dependencies or image content.

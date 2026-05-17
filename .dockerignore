@@ -1,4 +1,6 @@
 .git
+.gitignore
+.gitattributes
 __pycache__/
 *.pyc
 *.pyo
@@ -11,4 +13,17 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.ccache/
+.cache/
+.venv/
+.venv*/
+venv/
+.test-venv/
+tmp/
+patches/
+dashboard/
+templates/
 tests/__pycache__/
+records/
+skills/
+node_modules/

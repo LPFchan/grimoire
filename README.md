@@ -49,92 +49,47 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
-    "dflash-pflash-qwen3.6-27B": {
-      "backend": "dflash",
-      "target": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "draft": "dflash/Qwen3.6-27B-DFlash/model.safetensors",
-      "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
-      "tokenizer": "tokenizers/qwen3.6-27B",
+    "dflash-canary-qwen3.6-27B": {
+      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
+      "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
+      "speculative-type": "dflash",
+      "spec-dflash-cross-ctx": 1024,
       "ctx-size": 60000,
-      "max-effective-context": 60000,
-      "budget": 18,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
       "fa-window": 2048,
-      "snapshot-mode": "compact-full",
-      "snapshot-ram-dir": "/dev/shm/grimoire-snapshots",
-      "snapshot-disk-dir": "/var/lib/grimoire/snapshot_swap/dflash-pflash-qwen3.6-27B",
-      "snapshot-ram-budget-gb": 20,
-      "snapshot-disk-budget-gb": 30,
-      "snapshot-disk-ttl-hours": 24,
-      "snapshot-staging-slot": 7,
-      "prefix-cache-slots": 0,
-      "session-kv-slots": 4,
-      "prefill-threshold": 48000,
-      "prefill-keep-ratio": 0.05,
-      "prefill-tail-budget": 16000,
-      "prefill-compression": "auto"
+      "budget": 18,
+      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-canary-qwen3.6-27B",
+      "kv-cache-ram-budget-mb": 512,
+      "kv-cache-disk-budget-mb": 2048,
+      "kv-cache-ttl-hours": 168
     }
   },
   "fixed": {}
 }
 ```
 
-- Current migration policy: the served DFlash alias still points at the proven `.safetensors` draft, while the native GGUF draft path is canary-only until hardware decode verification is green.
-
 - `models` — definitions, no GPU assignment
 - `fixed` — alias → GPU ID (pinned, never evicted)
 - Dynamic allocation: free GPU preferred, oldest non-pinned evicted when all busy
-- `backend: "llama"` (default, HTTP) vs `backend: "dflash"` (stdin/stdout)
+- All models use `backend: "llama"` (Bee `llama-server` HTTP) — the legacy `backend: "dflash"` daemon path is retired
 
-### DFlash Settings
+### KV Cache Store (Content-Hash)
+
+Content-hash KV caching replaces the legacy snapshot daemon. On every decode, the gateway saves a content-addressed KV persist to RAM (tmpfs) with async disk mirroring. On the next request with the same system prompt prefix, the cached KV is restored directly — no daemon round-trip.
 
 | Key | Description |
 | --- | --- |
-| `target` | Main model GGUF (~14.0 GB GPU, always resident) |
-| `draft` | DFlash speculative draft (3.3 GB, parked except during verify) |
-| `drafter` | Compression scorer GGUF (1.1 GB, parked except during compression) |
-| `tokenizer` | Local tokenizer dir |
-| `budget` | DDTree page pool (22 = 262K ctx) |
-| `max-effective-context` | Hard cap for prompt tokens after PFlash compression |
-| `max-raw-ceiling` | Hard cap for raw prompt tokens before compression; defaults to `ctx-size` |
-| `snapshot-mode` | Live snapshot format; `compact-full` is the default and only restore path |
-| `snapshot-ram-dir` | tmpfs hot path for persisted compact snapshot files |
-| `snapshot-disk-dir` | async mirrored disk backup for snapshots |
-| `snapshot-ram-budget-gb` | LRU budget for RAM-backed snapshot files |
-| `snapshot-staging-slot` | transient daemon slot used for `LOAD_SNAPSHOT` / `RESTORE` / `SNAPSHOT` / `SAVE_SNAPSHOT` |
-| `prefix-cache-slots` | max persisted prefix-cache entries |
-| `session-kv-slots` | max persisted per-conversation session snapshots |
-| `prefill-threshold` | Token count to trigger PFlash compression |
-| `prefill-keep-ratio` | Middle keep fraction (0.05 = 5%) |
-| `prefill-tail-budget` | Protected tail tokens (uncompressed) |
-| `prefill-compression` | `"auto"` or `"never"` |
+| `kv-cache-disk-dir` | Persistent KV cache directory |
+| `kv-cache-ram-budget-mb` | Max tmpfs usage before LRU eviction |
+| `kv-cache-disk-budget-mb` | Max disk usage before LRU eviction |
+| `kv-cache-ttl-hours` | Entry TTL in hours (default 168 = 7 days) |
 
-## DFlash Speculative Decoding
+Content-hash deduplication means two conversations with the same system prompt share a single cached KV entry, skipping re-prefill entirely.
 
-~3.4x decode speedup on RTX 3090 via DDTree + PFlash. Target model **never parked** — only draft/drafter cycle.
+### DFlash Speculative Decoding
 
-### VRAM Budget (24 GB RTX 3090)
-
-**Hard ceiling: 23.5 GB** (leaves 500 MB safety margin).
-
-```
-target weights (GPU, no token_embd):   ~14.0 GB  (always resident)
-draft model (bf16 safetensors):         ~3.3 GB  (loaded during verify)
-rollback cache (DDTree budget=22):      ~1.9 GB  (verify intermediates)
-SSM + conv states + target_feat:        ~0.35 GB (fixed)
-CUDA workspace + overhead:              ~0.5 GB
-─────────────────────────────────────────────────────
-total fixed during generation:          ~20.1 GB
-remaining for variable KV:              ~3.9 GB
-```
-
-**q8_0 KV cost:** 34,816 bytes/token  
-(16 full-attention layers × 2 (K+V) × 4 heads × 256 dims × 1.0625 bytes/q8_0 element)
-
-The ~113K figure is the steady-state headroom with only the active cache resident. The 100K `max-effective-context` limit assumes snapshots are persisted as files and no snapshot copy stays resident in a daemon slot between requests.
-
-Compact full snapshots still scale with the used KV prefix, but Grimoire routes them through one transient staging slot and frees that slot immediately after save/load completes.
+DFlash uses Bee's native `--spec-type dflash` with a GGUF draft model (`dflash-draft-3.6-q8_0.gguf`). The canary serves text-only chat with `ctx-size=60000`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, and `fa-window=2048`.
 
 ### PFlash Compression
 
@@ -147,63 +102,9 @@ Prompt split on `len(prompt_ids) >= prefill_threshold`:
 [ TOOLS: protected tool blocks stay exact     ]
 ```
 
-Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressible middle blocks are scored by the drafter (loads 1.2 GB, ~2s, parks).
-
-When a request includes the `conversation_recall` tool, Grimoire also injects a small DFlash runtime system note. It tells the model that older middle context may be compressed on long prompts and that exact older wording should be recovered with `conversation_recall` instead of assumed to be verbatim.
+Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressible middle blocks are scored by the standalone `pflash_daemon` (extracted to `src/grimoire/pflash/`).
 
 **Tuned values**: `max-effective-context=60000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `budget=18`.
-
-### Session KV
-
-SHA-1 prefix hash stored with each `(snapshot_key, prefix_len)`. On restore, the current prompt prefix is validated before loading the compact full snapshot from RAM or disk — mismatch evicts the stale entry.
-
-### Prefix Cache vs Session Snapshots
-
-| | **Prefix cache** | **Session KV** |
-|---|---|---|
-| **Purpose** | Skip prefill for shared prompt prefixes | Skip prefill on the next turn of the same conversation |
-| **Key** | SHA-1 of prefix tokens | stable `conversation_id` hash |
-| **Persistence** | compact full snapshot file | compact full snapshot file |
-| **Hot path** | `/dev/shm/grimoire-snapshots` | `/dev/shm/grimoire-snapshots` |
-| **Cold backup** | `/var/lib/grimoire/snapshot_swap/...` | `/var/lib/grimoire/snapshot_swap/...` |
-
-### Thin Snapshots
-
-The daemon supports two snapshot types:
-
-- **Compact full snapshot** — copies the full hybrid-model state the gateway needs to resume correctly: the used KV prefix `[0, cur_pos)`, all 48 SSM states, all 48 conv states, and the `target_feat` ring buffer. This is the gateway's default and only live restore format.
-- **Thin snapshot** — copies **only the used KV range** `[kv_start, kv_end)` and **skips SSM/conv/target_feat entirely**. This saves ~400 MB per snapshot but still costs 34 KiB per *used* token.
-
-Thin snapshots remain available in the daemon protocol, but the gateway does not use them for live session restores because qwen35 resume correctness depends on the non-KV hybrid state too.
-
-### RAM-Backed Compact Snapshots
-
-With q8_0 + DDTree budget=22 + draft loaded, only **~3.9 GB** remains for variable KV. That fits **~113K active tokens** with **zero** snapshots kept in VRAM between requests. To hold 100K context and preserve resumability, snapshots are saved to tmpfs immediately and the daemon slot is freed right away.
-
-Current behavior:
-
-- After generation: `SNAPSHOT` -> `SAVE_SNAPSHOT /dev/shm/...` -> daemon frees the slot
-- Prefix cache entries can reuse that just-written compact snapshot file instead of taking a second daemon snapshot
-- In the background: RAM copy is mirrored to `/var/lib/grimoire/snapshot_swap/...`
-- Before the next turn: `LOAD_SNAPSHOT` from RAM if present, otherwise from disk -> `RESTORE` -> `FREE_SNAPSHOT`
-
-```
-After generation:
-  SNAPSHOT <staging_slot>               → capture compact full state at cur_pos
-  SAVE_SNAPSHOT <staging_slot> <ram_path> → write /dev/shm copy and free the slot
-  [async] mirror ram_path -> disk_path  → non-blocking cold-start backup
-
-Before next turn:
-  LOAD_SNAPSHOT <staging_slot> <ram_or_disk_path>
-  RESTORE <staging_slot> ...
-  FREE_SNAPSHOT <staging_slot>
-```
-
-RAM restore is the fast path; disk restore is the cold-start fallback.
-
-### Snapshot Store
-
-Snapshots are stored as `.dfsn` files keyed by stable content/conversation hashes. The RAM store is LRU-evicted under the configured tmpfs budget; evicted entries remain recoverable from disk.
 
 ## Building
 
