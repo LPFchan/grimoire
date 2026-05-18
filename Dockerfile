@@ -8,9 +8,9 @@ ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/Anbeeld/beellama.cpp.git
 ARG GRIMOIRE_LLAMA_CPP_REF=main
-ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=2b9aa77aa67ef0af7ee6eaa3d1f970215c7310fe
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=4db14be0ac1ad332b289d8a145052ea328fee498
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=7
+ARG CACHE_BUST=8
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
