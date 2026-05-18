@@ -13,7 +13,7 @@ Ordered by expected impact vs effort:
 | ~~1~~ | ~~**PINNED_SHA enforcement** — verify cloned SHA at Docker build time~~ | ~~Done — `c90d2a0`~~ | ~~None~~ |
 | ~~2~~ | ~~**VRAM drift soak** — `soak_vram_drift.py` against live server, 10 iterations, 47K tokens each~~ | ~~Done — ZERO drift across all cycles~~ | ~~None~~ |
 | — | ~~**PFlash stale-thread deadlock** — concurrent `pipe_read` corruption on cancelled requests~~ | ~~Done — dedicated compressor thread (`78cd53b`, DEC-20260518-001)~~ | ~~None~~ |
-| 3 | **Real 20K sysprompt canary test** — verify KV cache speedup at production scale | Mechanism proven at 18 tokens (1.93x); same at any scale | None |
+| ~~3~~ | ~~**Real 20K sysprompt canary test** — verify KV cache speedup at production scale~~ | ~~Done — 20.6K tokens, 99.7% cache hit rate, content-hash slot save/restore verified~~ | ~~None~~ |
 | 4 | **VMM park/unpark** — CUDA VMM for PFlash drafter slot | SIGTERM fallback works; VMM needs isolated measurement | None |
 | 5 | **GPU tape recording** — tree-mode DDTree verify using `dflash_tape_*` | Only needed if single-spec throughput becomes a bottleneck | Multi-spec batch decode |
 
