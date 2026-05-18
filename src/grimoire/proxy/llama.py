@@ -100,6 +100,15 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
     model_cfg = active.cfg
 
+    # Capture daemon and pcfg BEFORE first await to avoid race with eviction.
+    # After start_model releases the lock, a concurrent request can evict this
+    # model from its GPU, setting pflash_daemon=None and prefill_config=None
+    # on the same ActiveModel object. Reading them before the first yield
+    # (await below) closes the race window.
+    daemon = getattr(active, 'pflash_daemon', None)
+    pcfg = getattr(active, 'prefill_config', None)
+    log = logging.getLogger(__name__)
+
     payload = copy.deepcopy(payload)
     payload = plugin_manager.before_request(payload, active.name, model_cfg)
     backend_model_id = await active.get_backend_model_id()
@@ -110,14 +119,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
 
     _save_hash: Optional[bytes] = None
 
-    # PFlash compression: if the model has a pflash daemon and the prompt
-    # exceeds the threshold, compress before proxying to llama-server.
-    # Compression is mandatory once the threshold is hit. If the daemon is
-    # unavailable or compression fails, reject the request instead of silently
-    # bypassing the long-prompt path.
-    daemon = getattr(active, 'pflash_daemon', None)
-    pcfg = getattr(active, 'prefill_config', None)
-    log = logging.getLogger(__name__)
     log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
 
     store = _kv_store(active)
@@ -187,6 +188,18 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         )
 
                 log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
+                if not fired:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"pflash compression required for {active.name} "
+                            f"(prompt={len(prompt_ids)} >= threshold={pcfg.threshold}) "
+                            "but compression declined: no compressible blocks found. "
+                            "The prompt is too long for uncompressed serving. "
+                            "Reduce prompt size or adjust prefill-threshold/keep-ratio/tail-budget."
+                        ),
+                    )
+
                 if fired:
                     msg_groups: dict[int, dict] = {}
                     for block in blocks:

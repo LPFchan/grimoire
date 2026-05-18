@@ -20,10 +20,6 @@ dist/
 venv/
 .test-venv/
 tmp/
-patches/
-dashboard/
-templates/
-tests/__pycache__/
 records/
 skills/
 node_modules/
