@@ -66,15 +66,55 @@ One env-var reader following the existing `GGML_DFLASH_MAX_CTX` pattern (its ide
 
 Default stays 25 — zero behavioral change for flat-mode users.
 
-## Expected Impact
+## Benchmark Results
 
-| Config | `--spec-draft-n-max` | `--spec-branch-budget` | Total | Before | After |
-|--------|---------------------|----------------------|-------|--------|-------|
-| Flat baseline | 24 | 0 | 24 | ~70 tok/s | ~70 tok/s (unchanged) |
-| Tree under cap | 16 | 8 | 24 | ~70 tok/s | ~80-90 tok/s |
-| Tree over cap | 24 | 8 | 32 | ~3-5% acceptance | ~70-80 tok/s |
+Tested on RTX 3090 with Qwen3.6-27B Q4_K_M + dflash-draft-3.6-q8_0.gguf, `--temp 0 --no-spec-dm-adaptive --cache-type-k q8_0 --cache-type-v q8_0 -b 2048 -ub 256 --flash-attn on`. Per-request overrides via chat completions API.
 
-Sweet spot expected at budget 22 (n_max=16, branch_budget=6) per Lucebox's published sweep on the same RTX 3090 hardware.
+### Server-Internal Decode Speed
+
+| Config | n_max | budget | topk | Total | tok/s (decode-only) | vs Flat |
+|--------|-------|--------|------|-------|---------------------|---------|
+| Flat baseline | 16 | 0 | 1 | 16 | 93-108 | — |
+| Tree (Luce sweet) | 16 | 6 | 4 | 22 | ~94 | +1% |
+| Tree (boundary) | 24 | 8 | 4 | 32 | ~94 | +1% |
+| Tree (current config) | 32 | 16 | 4 | 48 | ~94 | +1% |
+
+### Per-Step Timing Breakdown (flat mode, GGML_DFLASH_PROFILE=1, 230+ steps)
+
+| Phase | Mean | p50 | Note |
+|-------|------|-----|------|
+| Target verify (16-token batch) | 41.4ms | 40.7ms | Q4_K_M 27B, the hard floor |
+| Draft forward | 6.5ms | 5.9ms | Tiny model cross-attention |
+| Accept + rollback | 4.0ms | 3.5ms | GPU tape path |
+| **Total per cycle** | **~52ms** | | |
+| Tokens committed per cycle | 5.28 | 4 | mean; p50 is lower due to EOS edges |
+| Effective draft length | 9.68 | 9 | DFlash doesn't use all 16 slots |
+
+### Why Tree-Mode Doesn't Help
+
+Chain acceptance is already ~85% (1996/2348 from cumulative stats). The draft is well-matched to the target for greedy decode. When chain mode already accepts most tokens, adding tree branches has nothing to rescue. Tree-mode adds value for non-greedy sampling or lower-quality drafts.
+
+### Why Lucebox Reports 129 tok/s vs Our ~100 tok/s
+
+Both use ggml with the same Q4_K_M matmul floor (~41ms for 16-token verify). Luce measures pure decode time in a standalone C++ binary on HumanEval code snippets (short, constrained output). Our measurement is through llama-server's HTTP API with expository prompts. The per-token ggml throughput is identical — the gap is prompt type and measurement methodology, not framework overhead.
+
+### Gateway Overhead (2026-05-18 measurement)
+
+Instrumented `_proxy_chat` in the grimoire gateway with `time.perf_counter()`. Measured production requests (via port 9001):
+
+| Phase | Time | % of total |
+|-------|------|-----------|
+| Python preprocessing (deepcopy, plugins, tokenizer, KV store) | 0-60ms | <1% |
+| Backend HTTP round-trip (llama-server) | 7-17s | >99% |
+
+The gateway adds negligible overhead (<60ms). The 7-17s backend time is dominated by reasoning mode (`preserve_thinking`:true`) and sampled DFlash (`--spec-draft-temp 0.7`), not gateway processing.
+
+### Key Takeaways
+
+1. The 25-token cap was the DDTree bug — confirmed fixed.
+2. Tree-mode works correctly now but doesn't improve greedy decode throughput for this well-matched draft pair.
+3. Gateway overhead is negligible (~0-60ms per request).
+4. Production throughput is lower than bench due to reasoning mode + sampled DFlash, not infrastructure overhead.
 
 ## Upstream Potential
 

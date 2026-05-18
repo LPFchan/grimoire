@@ -213,12 +213,14 @@ RUN --mount=type=cache,target=/cache/webui-src \
             git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
             need_webui_patches=1; \
         fi; \
-        for patch in /src/patches/grimoire-webui-*.patch; do \
-            [ -f "$patch" ] || continue; \
-            echo "Applying webui patch: $patch"; \
-            git -C /cache/webui-src/repo apply "$patch"; \
-        done; \
-        touch /cache/webui-src/.patched; \
+        if [ "$need_webui_patches" = "1" ] || [ ! -f /cache/webui-src/.patched ]; then \
+            for patch in /src/patches/grimoire-webui-*.patch; do \
+                [ -f "$patch" ] || continue; \
+                echo "Applying webui patch: $patch"; \
+                git -C /cache/webui-src/repo apply "$patch"; \
+            done; \
+            touch /cache/webui-src/.patched; \
+        fi; \
     fi; \
     if [ "$need_webui_patches" = "1" ] || [ ! -f /cache/webui-src/.patched ]; then \
         git -C /cache/webui-src/repo checkout -- .; \

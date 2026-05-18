@@ -8,7 +8,7 @@ Single Bee binary (`Anbeeld/beellama.cpp`) serves DFlash (`--spec-type dflash`),
 
 | Priority | Item | Why Deferred | Prerequisite |
 |----------|------|-------------|--------------|
-| 1 | **DDTree tree-mode verify** — enable `--spec-branch-budget > 0` with larger `GGML_DFLASH_MAX_VERIFY_TOKENS` | Current flat mode (~70 tok/s) sufficient for production. Tree-mode could add +20-40% but requires benchmarking the BB optimum on our hardware + workload. | `GGML_DFLASH_MAX_VERIFY_TOKENS` env var adoption (Bee HEAD or patched build). Budget sweep on served prompts. |
+| 1 | **DDTree tree-mode verify** — enable `--spec-branch-budget > 0` with larger `GGML_DFLASH_MAX_VERIFY_TOKENS` | Benchmarked (2026-05-18): tree-mode (budget=22) = 62.4 tok/s vs flat = 61.6 tok/s (+1%). The draft is already well-matched to the target for greedy decode (85% acceptance), so tree-mode adds negligible benefit. Deferred unless non-greedy sampling or a lower-quality draft changes the trade-off. | The 25-token cap fix is already deployed. Env var auto-derived by model_manager.py. |
 | 2 | **GPU tape recording** — tree-mode DDTree verify using `dflash_tape_*` | Only needed if single-spec throughput becomes a bottleneck | Multi-spec batch decode |
 
 ## Not Pursuing

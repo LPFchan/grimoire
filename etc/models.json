@@ -48,8 +48,11 @@
       "spec-draft-model": "gguf/dflash-draft-3.6-q8_0.gguf",
       "speculative-type": "dflash",
       "spec-dflash-cross-ctx": 1024,
-      "tokenizer": "tokenizers/qwen3.6-27B",
-      "tokenizer-trust-remote-code": true,
+      "spec-dflash-max-slots": 4,
+      "spec-draft-n-max": 32,
+      "spec-branch-budget": 16,
+      "spec-draft-top-k": 4,
+      "spec-draft-temp": 0.7,
       "family": "qwen",
       "capabilities": [
         "completion"
@@ -63,10 +66,12 @@
       "parallel": 1,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-canary-qwen3.6-27B",
+      "tokenizer": "tokenizers/qwen3.6-27B",
+      "tokenizer-trust-remote-code": true,
+      "kv-cache-cap": 8,
       "kv-cache-disk-budget-gb": 30,
-      "kv-cache-disk-ttl-hours": 24,
-      "kv-cache-cap": 8
+      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-canary-qwen3.6-27B",
+      "kv-cache-disk-ttl-hours": 24
     },
     "pflash-qwen3.6-27B": {
       "pflash": true,
