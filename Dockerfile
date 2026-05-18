@@ -43,6 +43,7 @@ WORKDIR /app
 
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
 ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
@@ -83,10 +84,15 @@ RUN --mount=type=cache,target=/root/.ccache \
         git -C /app/.cache/llama-cpp-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
         git -C /app/.cache/llama-cpp-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
         new_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse FETCH_HEAD); \
-        if [ "$old_ref" != "$new_ref" ]; then \
-            git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
-            need_patches=1; \
-        fi; \
+    if [ "$old_ref" != "$new_ref" ]; then \
+        git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
+        need_patches=1; \
+    fi; \
+fi; \
+    current_sha=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
+    if [ "$current_sha" != "$GRIMOIRE_LLAMA_CPP_PINNED_SHA" ]; then \
+        echo "ERROR: cloned SHA $current_sha != pinned $GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
+        exit 1; \
     fi; \
     if [ "$need_patches" = "1" ] || [ ! -f /app/.cache/llama-cpp-build/.patched ]; then \
         git -C /app/.cache/llama-cpp-src/repo checkout -- .; \
