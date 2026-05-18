@@ -11,7 +11,7 @@ Ordered by expected impact vs effort:
 | Priority | Item | Why Deferred | Prerequisite |
 |----------|------|-------------|--------------|
 | ~~1~~ | ~~**PINNED_SHA enforcement** — verify cloned SHA at Docker build time~~ | ~~Done — `c90d2a0`~~ | ~~None~~ |
-| 2 | **VRAM drift soak** — `test_pflash_pipeline.py` against live server, measure VRAM across repeated compression cycles | PFlash models verified manually but no systematic soak | None |
+| ~~2~~ | ~~**VRAM drift soak** — `soak_vram_drift.py` against live server, 10 iterations, 47K tokens each~~ | ~~Done — ZERO drift across all cycles~~ | ~~None~~ |
 | 3 | **Real 20K sysprompt canary test** — verify KV cache speedup at production scale | Mechanism proven at 18 tokens (1.93x); same at any scale | None |
 | 4 | **VMM park/unpark** — CUDA VMM for PFlash drafter slot | SIGTERM fallback works; VMM needs isolated measurement | None |
 | 5 | **GPU tape recording** — tree-mode DDTree verify using `dflash_tape_*` | Only needed if single-spec throughput becomes a bottleneck | Multi-spec batch decode |
