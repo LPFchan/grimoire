@@ -4,20 +4,14 @@
 
 Single Bee binary (`Anbeeld/beellama.cpp`) serves DFlash (`--spec-type dflash`), PFlash (via standalone `pflash_daemon`), and normal traffic. Content-hash KV caching provides cross-conversation sysprompt reuse. Legacy `backend:dflash` daemon retired. See git history for the completed migration (Phases 1-7).
 
-## Deferred Items
-
-Ordered by expected impact vs effort:
+## Backlog (Future Interest)
 
 | Priority | Item | Why Deferred | Prerequisite |
 |----------|------|-------------|--------------|
-| ~~1~~ | ~~**PINNED_SHA enforcement** — verify cloned SHA at Docker build time~~ | ~~Done — `c90d2a0`~~ | ~~None~~ |
-| ~~2~~ | ~~**VRAM drift soak** — `soak_vram_drift.py` against live server, 10 iterations, 47K tokens each~~ | ~~Done — ZERO drift across all cycles~~ | ~~None~~ |
-| — | ~~**PFlash stale-thread deadlock** — concurrent `pipe_read` corruption on cancelled requests~~ | ~~Done — dedicated compressor thread (`78cd53b`, DEC-20260518-001)~~ | ~~None~~ |
-| ~~3~~ | ~~**Real 20K sysprompt canary test** — verify KV cache speedup at production scale~~ | ~~Done — 20.6K tokens, 99.7% cache hit rate, content-hash slot save/restore verified~~ | ~~None~~ |
-| 4 | **VMM park/unpark** — CUDA VMM for PFlash drafter slot | SIGTERM fallback works; VMM needs isolated measurement | None |
-| 5 | **GPU tape recording** — tree-mode DDTree verify using `dflash_tape_*` | Only needed if single-spec throughput becomes a bottleneck | Multi-spec batch decode |
+| 1 | **GPU tape recording** — tree-mode DDTree verify using `dflash_tape_*` | Only needed if single-spec throughput becomes a bottleneck | Multi-spec batch decode |
 
 ## Not Pursuing
 
 - Multi-spec batched decode — single-spec sufficient for current workload
 - Monitoring for 413 path — (user decision)
+- VMM park/unpark — measured (RSH-20260518-005): adds 2.5 GB VRAM overhead with no TTFT benefit for single-model. Unnecessary unless multi-model GPU sharing is needed later.
