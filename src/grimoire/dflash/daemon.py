@@ -3,13 +3,22 @@
 Manages the standalone pflash_daemon subprocess for compression-only
 prompt prefill. The daemon loads a Qwen3.5-0.8B drafter GGUF and
 accepts compress commands on stdin.
+
+All compress() calls are serialized through a dedicated background
+thread so cancellation of an individual HTTP request never leaves a
+stale thread reading from the shared stream pipe.
 """
 
+import asyncio
 import logging
 import os
 import struct
 import subprocess
 import tempfile
+import threading
+from concurrent.futures import Future
+from dataclasses import dataclass
+from queue import Queue
 from typing import Optional
 
 from grimoire import config
@@ -22,21 +31,34 @@ def _prepend_library_dir(env: dict[str, str], path: str) -> None:
     env["LD_LIBRARY_PATH"] = ":".join([path, *existing]) if path else ":".join(existing)
 
 
+@dataclass
+class _CompressJob:
+    prompt_ids: list[int]
+    drafter_path: str
+    keep_ratio: float
+    future: Future
+
+
 class PflashDaemon:
     """Manage a standalone pflash_daemon subprocess for compression-only.
 
     The pflash_daemon binary loads only the Qwen3.5-0.8B drafter GGUF
     (no target model). It accepts compress commands on stdin and emits
     compressed token IDs via a stream fd.
+
+    A dedicated background thread owns all access to the daemon's pipes
+    so that cancelled asyncio tasks never orphan competing readers.
     """
 
     def __init__(self, drafter_path: str, gpu_id: int = 0):
         self.drafter_path = drafter_path
         self.gpu_id = gpu_id
         self._proc: Optional[subprocess.Popen] = None
-        self._pipe_r: Optional[int] = None  # read end of stream pipe
-        self._pipe_w: Optional[int] = None  # write end (closed after spawn)
+        self._pipe_r: Optional[int] = None
         self._temp_files: list[str] = []
+        self._queue: Queue[Optional[_CompressJob]] = Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def start(self) -> None:
         """Spawn the pflash daemon. Creates a pipe for compressed token output."""
@@ -109,16 +131,39 @@ class PflashDaemon:
                     logger.warning(f"[pflash-daemon] {err}")
             raise RuntimeError(f"pflash daemon failed to start (see logs for details)")
 
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker.start()
+
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def compress(self, prompt_ids: list[int], drafter_path: str = "",
-                 keep_ratio: float = 0.05) -> list[int]:
+    async def compress(self, prompt_ids: list[int], drafter_path: str = "",
+                       keep_ratio: float = 0.05) -> list[int]:
         if not self.is_running():
             raise RuntimeError("pflash daemon not running")
         if self._pipe_r is None:
             raise RuntimeError("pflash daemon pipe not initialized")
 
+        self._loop = asyncio.get_running_loop()
+        future = self._loop.create_future()
+        self._queue.put(_CompressJob(prompt_ids, drafter_path, keep_ratio, future))
+        return await future
+
+    def _worker_loop(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                break
+            try:
+                result = self._do_compress(job.prompt_ids, job.drafter_path, job.keep_ratio)
+                if not job.future.cancelled():
+                    self._loop.call_soon_threadsafe(job.future.set_result, result)
+            except Exception as e:
+                if not job.future.cancelled():
+                    self._loop.call_soon_threadsafe(job.future.set_exception, e)
+
+    def _do_compress(self, prompt_ids: list[int], drafter_path: str = "",
+                     keep_ratio: float = 0.05) -> list[int]:
         fd, path = tempfile.mkstemp(suffix=".bin")
         self._temp_files.append(path)
         try:
@@ -147,6 +192,9 @@ class PflashDaemon:
                 pass
 
     def stop(self) -> None:
+        if self._worker and self._worker.is_alive():
+            self._queue.put(None)
+            self._worker.join(timeout=5)
         if self._proc:
             try:
                 self._proc.stdin.write(b"quit\n")

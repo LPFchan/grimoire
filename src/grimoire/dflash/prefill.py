@@ -13,7 +13,6 @@ protected tool blocks, but only compresses whole blocks so metadata survives the
 raw -> effective prompt transform.
 """
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -232,7 +231,6 @@ async def maybe_compress(
     )
 
     t0 = time.monotonic()
-    loop = asyncio.get_running_loop()
 
     MAX_BLOCK = 14000  # keep under daemon MAX_S=16384
 
@@ -244,17 +242,13 @@ async def maybe_compress(
         compressed_ids = raw_ids
         compressed_block = False
         if index in compressible_indexes:
-            # Chunk large blocks so daemon doesn't OOM
             chunks = [raw_ids[i:i+MAX_BLOCK] for i in range(0, len(raw_ids), MAX_BLOCK)]
             chunked = []
             for ch in chunks:
-                c = await loop.run_in_executor(
-                    None,
-                    lambda g=ch: daemon.compress(
-                        g,
-                        drafter_path=config.drafter_path,
-                        keep_ratio=config.keep_ratio,
-                    ),
+                c = await daemon.compress(
+                    ch,
+                    drafter_path=config.drafter_path,
+                    keep_ratio=config.keep_ratio,
                 )
                 chunked.extend(c)
             compressed_ids = chunked
