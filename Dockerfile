@@ -54,6 +54,7 @@ ENV CCACHE_DIR=/root/.ccache \
 # Copy only non-webui patches for the build stage
 RUN mkdir -p /app/patches
 COPY patches/slot-save-mtmd.patch /app/patches/
+COPY patches/dflash-max-verify-tokens.patch /app/patches/
 
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/llama-cpp-src \

@@ -71,6 +71,26 @@ def _append_native_dflash_args(cmd, cfg):
     if cross_ctx is not None:
         cmd.extend(["--spec-dflash-cross-ctx", str(cross_ctx)])
 
+    max_slots = cfg.get("spec-dflash-max-slots")
+    if max_slots is not None:
+        cmd.extend(["--spec-dflash-max-slots", str(max_slots)])
+
+    draft_n_max = cfg.get("spec-draft-n-max")
+    if draft_n_max is not None:
+        cmd.extend(["--spec-draft-n-max", str(draft_n_max)])
+
+    branch_budget = cfg.get("spec-branch-budget")
+    if branch_budget is not None:
+        cmd.extend(["--spec-branch-budget", str(branch_budget)])
+
+    draft_topk = cfg.get("spec-draft-top-k")
+    if draft_topk is not None:
+        cmd.extend(["--spec-draft-top-k", str(draft_topk)])
+
+    draft_temp = cfg.get("spec-draft-temp")
+    if draft_temp is not None:
+        cmd.extend(["--spec-draft-temp", str(draft_temp)])
+
 
 def _prepend_library_paths(env, paths, exclude_prefixes=()):
     existing = []
@@ -198,6 +218,22 @@ class ActiveModel:
             env["LD_PRELOAD"] = f"{shim_path}:" + existing_pre if existing_pre else shim_path
             env["PFLASH_SHIM_FIFO_BASE"] = f"/tmp/pflash_shim.{self.name}"
             logger.info(f"park-unpark enabled, LD_PRELOAD={env['LD_PRELOAD']}")
+
+        # Auto-derive GGML_DFLASH_MAX_VERIFY_TOKENS from DFlash tree config
+        # so the C++ binary's tape/hidden-GPU path isn't silently capped at 25.
+        if self.cfg.get("speculative-type") == "dflash":
+            n_max = self.cfg.get("spec-draft-n-max", 16)
+            branch_budget = self.cfg.get("spec-branch-budget", 0)
+            draft_topk = self.cfg.get("spec-draft-top-k", 1)
+            tree_budget = min(n_max + branch_budget, n_max * max(1, draft_topk))
+            verify_tokens = tree_budget + 4  # small headroom for root + bonus
+            if "GGML_DFLASH_MAX_VERIFY_TOKENS" not in env:
+                env["GGML_DFLASH_MAX_VERIFY_TOKENS"] = str(verify_tokens)
+                logger.info(
+                    "Auto-set GGML_DFLASH_MAX_VERIFY_TOKENS=%d "
+                    "(n_max=%d, branch_budget=%d, topk=%d, tree_budget=%d)",
+                    verify_tokens, n_max, branch_budget, draft_topk, tree_budget
+                )
 
         logger.info(f"Starting {self.name} (llama) on GPU {self.gpu}, port {self.port}")
         logger.info(f"Command: {' '.join(cmd)}")
