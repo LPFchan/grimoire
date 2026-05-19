@@ -264,22 +264,20 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 payload, active.name, model_cfg, backend_model_id, client, url, headers
             )
 
-            # KV prefix cache: restore by content hash, always save hash for later
+            # Three-tier KV cache: VRAM → RAM (tmpfs) → SSD
+            # Within same conversation: slot stays alive, cache_prompt handles delta.
+            # On conversation switch: save old to tmpfs, restore target if cached.
             slot_url = f"http://127.0.0.1:{active.port}/slots/0"
-            if _save_hash is None:
-                try:
-                    tokenizer = active.get_tokenizer()
-                    messages = payload.get("messages", [])
-                    pids, _ = _prompt_layout_from_messages(
-                        tokenizer, messages, add_generation_prompt=True,
-                        model_cfg=model_cfg, active=active,
-                    )
-                    _save_hash = store.hash_prefix(pids)
-                    await _try_restore_kv(client, slot_url, pids, store, log)
-                except Exception as e:
-                    log.warning(f"kv cache: setup failed: {e}")
-            else:
+            prev_conv = getattr(active, "_current_conv_id", None)
+            if _save_hash is not None:
+                # pflash path: restore by compressed content hash
                 await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
+            elif validated_conversation_id and validated_conversation_id != prev_conv:
+                # Same-model conversation switch: save old slot, restore target
+                if prev_conv:
+                    await store.save_conv(client, slot_url, prev_conv)
+                await store.restore_conv(client, slot_url, validated_conversation_id)
+                active._current_conv_id = validated_conversation_id
 
             upstream = await client.send(
                 client.build_request(
@@ -333,7 +331,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         finally:
             await upstream.aclose()
             await client.aclose()
-            # KV prefix cache: save slot by content hash after response
+            # KV prefix cache: save slot by content hash (pflash path only)
             if _save_hash:
                 async with httpx.AsyncClient(timeout=5) as sc:
                     await _save_kv(sc, slot_url, _save_hash, store, log)

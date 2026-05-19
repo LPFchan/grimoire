@@ -1,12 +1,16 @@
-"""Content-hash KV cache store with RAM→disk tiering.
+"""Content-hash KV cache store with RAM→disk tiering and conversation-level slot persistence.
 
-Manages llama-server `.kv` files by content hash of the prompt prefix.
-RAM (tmpfs) is the primary tier; disk (SSD) is the backup for restart
-resilience. Used by proxy/llama.py for content-hash-based slot save/restore.
+Manages llama-server `.kv` files by content hash or conversation ID.
+RAM (tmpfs) is the primary tier; disk (SSD) is the backup.
+Conversation-level save/restore provides three-tier waterfall:
+  1. VRAM cell cache (active conversation, slot stays alive)
+  2. RAM tmpfs (saved when switching conversations, LRU evicted)
+  3. SSD (mirrored from RAM, LRU + TTL evicted)
 """
 
 import asyncio
 import hashlib
+import httpx
 import json
 import logging
 import os
@@ -71,6 +75,39 @@ class KVCacheStore:
         h.update(b"\x00")
         h.update(struct.pack("<I", self.fa_window))
         return h.digest()[:16]
+
+    def conv_key(self, conversation_id: str) -> bytes:
+        h = hashlib.sha1(conversation_id.encode())
+        return h.digest()[:16]
+
+    async def save_conv(self, http_client, slot_url: str, conversation_id: str) -> bool:
+        key = self.conv_key(conversation_id)
+        filename = self.kv_filename(key)
+        async with httpx.AsyncClient(timeout=10) as sc:
+            rr = await sc.post(
+                f"{slot_url}?action=save",
+                json={"filename": filename},
+                timeout=10,
+            )
+            if rr.status_code == 200:
+                self.register(key)
+                return True
+            return False
+
+    async def restore_conv(self, http_client, slot_url: str, conversation_id: str) -> bool:
+        key = self.conv_key(conversation_id)
+        path = self.lookup(key)
+        if path is None:
+            return False
+        try:
+            rr = await http_client.post(
+                f"{slot_url}?action=restore",
+                json={"filename": path.name},
+                timeout=10,
+            )
+            return rr.status_code == 200
+        except Exception:
+            return False
 
     def kv_filename(self, hash_bytes: bytes) -> str:
         return f"{KV_PREFIX}{hash_bytes.hex()[:16]}{KV_SUFFIX}"
