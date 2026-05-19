@@ -7,7 +7,6 @@ dist/
 build/
 *.so
 *.egg
-docker-compose.yml
 .venv/
 .sisyphus/
 opencode/node_modules/
@@ -19,6 +18,9 @@ venv/
 .DS_Store
 Thumbs.db
 .tmp_commit_msg_*
+
+# secrets
+.env
 
 # build artifacts
 tmp/

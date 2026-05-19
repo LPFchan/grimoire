@@ -9,20 +9,26 @@ services:
     ports:
       - "9001:9001"
     volumes:
-      - /home/yeowool/models:/models:ro
-      - /home/yeowool/templates:/templates:ro
-      - /home/yeowool/structured-cot/grammars:/etc/grimoire/grammars:ro
-      - /path/to/token-stats.json:/var/lib/grimoire/token-stats.json:ro
+      - ${MODELS_DIR}:/models:ro
+      - ${TEMPLATES_DIR}:/templates:ro
+      - ${GRAMMARS_DIR}:/etc/grimoire/grammars:ro
+      - ${TOKEN_STATS_PATH}:/var/lib/grimoire/token-stats.json:ro
       - grimoire_state:/var/lib/grimoire
-      - /path/to/grimoire/etc/models.json:/etc/grimoire/models.json:ro
+      - ${MODELS_JSON_PATH}:/etc/grimoire/models.json:ro
+      # Dev override: bind-mount Python source so code changes apply immediately.
+      - ${DEV_SRC_BIND}:/opt/grimoire-venv/lib/python3.11/site-packages/grimoire:ro
       - /sys/devices/virtual/powercap:/host-powercap:ro
       - type: tmpfs
         target: /dev/shm/grimoire-snapshots
         tmpfs:
           size: 21474836480
+      - type: tmpfs
+        target: /dev/shm/grimoire-slots
+        tmpfs:
+          size: 10737418240
           mode: 1777
     environment:
-      - GRIMOIRE_API_KEY=changeme
+      - GRIMOIRE_API_KEY=${GRIMOIRE_API_KEY}
       - TURBO_AUTO_ASYMMETRIC=0
       - STRUCTURED_COT=0
       - STRUCTURED_TOOL=0
