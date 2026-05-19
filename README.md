@@ -54,7 +54,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
       "speculative-type": "dflash",
       "spec-dflash-cross-ctx": 1024,
-      "ctx-size": 60000,
+      "ctx-size": 184832,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
       "fa-window": 2048,

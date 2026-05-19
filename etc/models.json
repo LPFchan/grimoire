@@ -11,7 +11,7 @@
       "cost": {
         "input": 0.33,
         "output": 3.25,
-        "cache_read": 0.10
+        "cache_read": 0.1
       },
       "ctx-size": 262144,
       "predict": 16384,
@@ -59,7 +59,7 @@
         "input": 0.33,
         "output": 3.25
       },
-      "ctx-size": 60000,
+      "ctx-size": 184832,
       "predict": 16384,
       "parallel": 1,
       "cache-type-k": "q8_0",
@@ -84,7 +84,7 @@
       "cost": {
         "input": 0.33,
         "output": 3.25,
-        "cache_read": 0.10
+        "cache_read": 0.1
       },
       "ctx-size": 65000,
       "max-effective-context": 65000,
@@ -111,7 +111,7 @@
       "cost": {
         "input": 0.33,
         "output": 3.25,
-        "cache_read": 0.10
+        "cache_read": 0.1
       },
       "ctx-size": 140000,
       "max-effective-context": 140000,
