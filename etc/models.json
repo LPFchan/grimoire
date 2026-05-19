@@ -49,10 +49,8 @@
       "speculative-type": "dflash",
       "spec-dflash-cross-ctx": 1024,
       "spec-dflash-max-slots": 4,
-      "spec-draft-n-max": 32,
-      "spec-branch-budget": 16,
-      "spec-draft-top-k": 4,
-      "spec-draft-temp": 0.7,
+      "spec-draft-n-max": 16,
+      "spec-draft-temp": 0,
       "family": "qwen",
       "capabilities": [
         "completion"
