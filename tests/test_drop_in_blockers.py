@@ -40,7 +40,7 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertTrue({
             "gemma-4-31B",
             "qwen-3.6-27B",
-            "dflash-canary-qwen3.6-27B",
+            "dflash-qwen3.6-27B",
             "pflash-qwen3.6-27B",
         }.issubset(aliases))
 
@@ -597,14 +597,14 @@ class DropInBlockerTests(unittest.TestCase):
 
     def test_models_json_contains_dflash_canary(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        cfg = data["models"]["dflash-canary-qwen3.6-27B"]
+        cfg = data["models"]["dflash-qwen3.6-27B"]
         self.assertEqual(cfg["speculative-type"], "dflash")
         self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
         self.assertEqual(cfg["draft"], "gguf/dflash-draft-3.6-q8_0.gguf")
 
     def test_native_dflash_canary_uses_gguf_draft(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        canary = data["models"]["dflash-canary-qwen3.6-27B"]
+        canary = data["models"]["dflash-qwen3.6-27B"]
         self.assertEqual(canary["draft"], "gguf/dflash-draft-3.6-q8_0.gguf")
         self.assertEqual(canary["speculative-type"], "dflash")
 
@@ -615,11 +615,11 @@ class DropInBlockerTests(unittest.TestCase):
         tune_ctx = (ROOT / "tests" / "tune_ctx.py").read_text()
         pflash_ctx_tune = (ROOT / "tests" / "test_pflash_ctx_tune.py").read_text()
 
-        self.assertIn('"dflash-canary-qwen3.6-27B"', e2e)
+        self.assertIn('"dflash-qwen3.6-27B"', e2e)
         self.assertIn('LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")', e2e)
         self.assertIn('MODEL = DFLASH_SMOKE_MODEL', e2e)
         self.assertIn('MODEL = LLAMA_SMOKE_MODEL', e2e)
-        self.assertIn('"dflash-canary-qwen3.6-27B"', stress)
+        self.assertIn('"dflash-qwen3.6-27B"', stress)
         self.assertIn('MODEL = os.environ.get("MODEL", "pflash-qwen3.6-27B")', pflash)
         self.assertIn('MODEL = "pflash-qwen3.6-27B"', tune_ctx)
         self.assertIn('MODEL = "pflash-qwen3.6-27B"', pflash_ctx_tune)
@@ -631,7 +631,7 @@ class DropInBlockerTests(unittest.TestCase):
 
     def test_text_only_served_pflash_models_have_no_mmproj(self):
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        for name in ("pflash-qwen3.6-27B", "pflash-park-qwen3.6-27B", "dflash-canary-qwen3.6-27B"):
+        for name in ("pflash-qwen3.6-27B", "pflash-park-qwen3.6-27B", "dflash-qwen3.6-27B"):
             cfg = data["models"][name]
             self.assertEqual(cfg.get("capabilities"), ["completion"], name)
             self.assertNotIn("mmproj", cfg, name)

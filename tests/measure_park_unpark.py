@@ -65,7 +65,7 @@ def measure_model(model_name, label):
     # Stop any running model first
     stop_model("pflash-qwen3.6-27B")
     stop_model("pflash-park-qwen3.6-27B")
-    stop_model("dflash-canary-qwen3.6-27B")
+    stop_model("dflash-qwen3.6-27B")
     time.sleep(3)
 
     vr_before = vram_mb()

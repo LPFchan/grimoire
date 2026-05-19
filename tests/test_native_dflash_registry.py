@@ -1,3 +1,4 @@
+import json
 import struct
 import sys
 import tempfile
@@ -225,6 +226,58 @@ class NativeDflashRegistryTests(unittest.TestCase):
         self.assertIn("_scan_gguf_tensor_names", registry_src)
         self.assertIn("blk.{layer_idx}.attn_norm.weight", registry_src)
         self.assertIn("output_norm.weight", registry_src)
+
+
+    def test_resolve_exact_normalized_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "models.json")
+            with open(path, "w") as f:
+                json.dump({"models": {"My-Model": {"file": "m.gguf"}}}, f)
+            reg = registry_mod.ModelRegistry(path=path, seed_path=None)
+            self.assertEqual(reg.resolve("my-model"), "My-Model")
+
+    def test_resolve_by_file_basename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "models.json")
+            with open(path, "w") as f:
+                json.dump({"models": {"m": {"file": "gguf/My-Model-Q4_K_M.gguf"}}}, f)
+            reg = registry_mod.ModelRegistry(path=path, seed_path=None)
+            self.assertEqual(reg.resolve("My-Model-Q4_K_M.gguf"), "m")
+
+    def test_resolve_by_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "models.json")
+            with open(path, "w") as f:
+                json.dump({"models": {"m": {"file": "m.gguf", "aliases": ["nickname"]}}}, f)
+            reg = registry_mod.ModelRegistry(path=path, seed_path=None)
+            self.assertEqual(reg.resolve("nickname"), "m")
+
+    def test_resolve_returns_none_for_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "models.json")
+            with open(path, "w") as f:
+                json.dump({"models": {"m": {"file": "m.gguf"}}}, f)
+            reg = registry_mod.ModelRegistry(path=path, seed_path=None)
+            self.assertIsNone(reg.resolve("nobody"))
+
+    def test_resolve_no_false_positive_substring(self):
+        """Substring of normalized name must NOT match.
+        e.g. 'dflash-qwen3.6-27B' must NOT resolve to 'qwen-3.6-27B'
+        just because normalize('qwen-3.6-27B') == 'qwen3627b'
+        is a substring of normalize('dflash-qwen3.6-27B') == 'dflashqwen3627b'.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "models.json")
+            with open(path, "w") as f:
+                json.dump({
+                    "models": {
+                        "qwen-3.6-27B": {"file": "gguf/Qwen3.6-27B.gguf"},
+                    }
+                }, f)
+            reg = registry_mod.ModelRegistry(path=path, seed_path=None)
+            self.assertIsNone(reg.resolve("dflash-qwen3.6-27B"))
+            self.assertIsNone(reg.resolve("pflash-qwen3.6-27B"))
+            self.assertIsNone(reg.resolve("dflashqwen3627b"))
 
 
 if __name__ == "__main__":

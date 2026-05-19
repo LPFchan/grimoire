@@ -12,7 +12,7 @@ Migrate the served DFlash/PFlash stack onto the canonical `Anbeeld/beellama.cpp`
 ### Workstreams
 
 - **A**: Canonical DFlash decode on Bee.
-- **B**: DFlash `compact-full` persistence parity for `dflash-canary-qwen3.6-27B`.
+- **B**: DFlash `compact-full` persistence parity for `dflash-qwen3.6-27B`.
 - **C**: Preserved llama-side PFlash path, including its `.kv` slot contract, warm/cold behavior, and text-only reconstruction semantics.
 - A, B, and C are not validation-independent. Changes to prompt layout, effective prompt semantics, or snapshot formats can invalidate multiple tracks at once.
 
@@ -36,7 +36,7 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 ### Contract A: DFlash Decode
 | Property | Value |
 | --- | --- |
-| Primary served model | `dflash-canary-qwen3.6-27B` |
+| Primary served model | `dflash-qwen3.6-27B` |
 | Target artifact | `gguf/Qwen3.6-27B-Q4_K_M.gguf` |
 | Draft artifact | `gguf/dflash-draft-3.6-q8_0.gguf` |
 | Semantics | Text-only chat, `parallel=1`, `ctx-size=60000`, `max-effective-context=60000`, `budget=18`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `<|im_end|>` stop |
@@ -84,7 +84,7 @@ Control-plane source of truth: `src/grimoire/`. Required native fixes: GPU ring 
 | Alias | Backend | Draft/Drafter | Capabilities | Harness |
 | --- | --- | --- | --- | --- |
 | `qwen-3.6-27B` | llama | — | completion, multimodal | `test_e2e_smoke.py::LlamaCppSmokeTests` |
-| `dflash-canary-qwen3.6-27B` | llama (spec dflash) | `gguf/dflash-draft-3.6-q8_0.gguf` | completion (text-only) | `test_e2e_smoke.py` |
+| `dflash-qwen3.6-27B` | llama (spec dflash) | `gguf/dflash-draft-3.6-q8_0.gguf` | completion (text-only) | `test_e2e_smoke.py` |
 | `pflash-qwen3.6-27B` | llama (pflash) | `Qwen3.5-0.8B-Q8_0.gguf` | completion (text-only) | `test_pflash_pipeline.py` |
 | `pflash-park-qwen3.6-27B` | llama (pflash+park) | `Qwen3.5-0.8B-Q8_0.gguf` | completion (text-only) | parameterized harness target only |
 
@@ -107,16 +107,16 @@ Default regression budget: median TTFT no worse than +20%, median decode TPS no 
 
 | Surface | Must Preserve | Explicitly Retired / Not A Gate Yet |
 | --- | --- | --- |
-| `dflash-canary-qwen3.6-27B` served decode | Text-only chat semantics, `ctx-size=60000`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `spec-dflash-cross-ctx=1024`, content-hash KV caching | N/A — canonical path |
+| `dflash-qwen3.6-27B` served decode | Text-only chat semantics, `ctx-size=60000`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `spec-dflash-cross-ctx=1024`, content-hash KV caching | N/A — canonical path |
 | `pflash-qwen3.6-27B` preserved PFlash path | Standalone `pflash_daemon`, raw `compress <path> <keep_x1000>` protocol, `Qwen3.5-0.8B Q8_0` drafter, token -> text -> message reconstruction | Multimodal serving and `mmproj` wiring |
 | `pflash-park-qwen3.6-27B` preserved park path | FIFO park/unpark via `pflash_shim.so`, same text-only compression semantics as above | Global `/opt/dflash` library-path coupling |
  | `qwen-3.6-27B` normal llama path | Canonical non-PFlash startup, multimodal config, resolves against Bee libraries without `/opt/dflash` | Hidden fallback that only works because `/opt/dflash` is in runtime search path |
-| `dflash-canary-qwen3.6-27B` native canary | Dormant native-control-plane launch contract | Treating canary as served replacement before real-hardware decode verification |
+| `dflash-qwen3.6-27B` native canary | Dormant native-control-plane launch contract | Treating canary as served replacement before real-hardware decode verification |
 
 ## Final Gates
 
 1. Canonical base is Bee (`Anbeeld/beellama.cpp`).
-2. DFlash decode parity is green for `dflash-canary-qwen3.6-27B`.
+2. DFlash decode parity is green for `dflash-qwen3.6-27B`.
 3. Content-hash KV caching parity is green (restart resilience, cross-conversation sysprompt reuse, bounded disk growth).
 4. Preserved llama-side PFlash parity is green (.kv slot contract, warm/cold, reconstruction, all required native fixes).
 5. `pflash-qwen3.6-27B` is text-only, no multimodal config or `mmproj` in served runtime.

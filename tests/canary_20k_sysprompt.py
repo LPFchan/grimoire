@@ -2,14 +2,14 @@
 """20K sysprompt KV cache canary test.
 
 Measures cold vs warm TTFT using the content-hash KV cache on the
-dflash-canary-qwen3.6-27B model. A ~20K token system prompt is built
+dflash-qwen3.6-27B model. A ~20K token system prompt is built
 from real opencode_splits transcripts.
 
 Usage:
     python tests/canary_20k_sysprompt.py
 
 Environment:
-    MODEL       Model name (default: dflash-canary-qwen3.6-27B)
+    MODEL       Model name (default: dflash-qwen3.6-27B)
     BASE_URL    Gateway URL (default: http://localhost:9001)
     API_KEY     Auth key
     PROMPT_TOK  Target sysprompt size in tokens (default: 20000)
@@ -24,7 +24,7 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("canary")
 
-MODEL = os.environ.get("MODEL", "dflash-canary-qwen3.6-27B")
+MODEL = os.environ.get("MODEL", "dflash-qwen3.6-27B")
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:9001")
 API_KEY = os.environ.get("API_KEY", "7JcW7xX82ypTQPlsYle6XdjlBSWfG3NwbtYSRSXZQ88")
 TARGET_TOK = int(os.environ.get("PROMPT_TOK", "20000"))

@@ -49,7 +49,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4"
     },
-    "dflash-canary-qwen3.6-27B": {
+    "dflash-qwen3.6-27B": {
       "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
       "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
       "speculative-type": "dflash",
@@ -59,7 +59,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "cache-type-v": "q8_0",
       "fa-window": 2048,
       "budget": 18,
-      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-canary-qwen3.6-27B",
+      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-qwen3.6-27B",
       "kv-cache-ram-budget-mb": 512,
       "kv-cache-disk-budget-mb": 2048,
       "kv-cache-ttl-hours": 168

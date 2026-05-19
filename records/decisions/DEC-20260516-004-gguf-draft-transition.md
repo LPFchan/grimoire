@@ -5,7 +5,7 @@ Recorded by agent: opencode
 
 ## Decision
 
-GGUF is the end-state artifact format for DFlash draft models, but the served config stays on the existing `.safetensors` draft until the converted GGUF is proven on hardware and versioned. The native canary (`dflash-canary-qwen3.6-27B`) uses the GGUF path as a testing ground.
+GGUF is the end-state artifact format for DFlash draft models, but the served config stays on the existing `.safetensors` draft until the converted GGUF is proven on hardware and versioned. The native canary (`dflash-qwen3.6-27B`) uses the GGUF path as a testing ground.
 
 ## Context
 
@@ -28,5 +28,5 @@ The current DFlash draft lives at `dflash/Qwen3.6-27B-DFlash/model.safetensors`.
 ## Consequences
 
 - The served `dflash-pflash-qwen3.6-27B` config stays on safetensors.
-- The canary `dflash-canary-qwen3.6-27B` uses GGUF draft.
+- The canary `dflash-qwen3.6-27B` uses GGUF draft.
 - A future decision record will document the cutover after hardware validation completes.

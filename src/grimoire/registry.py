@@ -484,8 +484,11 @@ class ModelRegistry:
             return {"models": {}, "fixed": {}}
 
     def _stat_stamp(self):
+        path = self.path
+        if not os.path.exists(path) and self.seed_path and os.path.exists(self.seed_path):
+            path = self.seed_path
         try:
-            return os.stat(self.path).st_mtime_ns
+            return os.stat(path).st_mtime_ns
         except FileNotFoundError:
             return None
 
@@ -579,16 +582,6 @@ class ModelRegistry:
                     if candidate and self.normalize_model_id(candidate) == normalized:
                         return name
 
-            matches = []
-            for name, cfg in models.items():
-                candidates = [name, cfg.get("file"), Path(str(cfg.get("file", ""))).name]
-                candidates.extend(cfg.get("aliases", []) or [])
-                candidate_norms = [self.normalize_model_id(c) for c in candidates if c]
-                if any(normalized in c or c in normalized for c in candidate_norms):
-                    matches.append(name)
-
-            if len(matches) == 1:
-                return matches[0]
             return None
 
     def model_metadata(self, model_name):
