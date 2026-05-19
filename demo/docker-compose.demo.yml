@@ -1,0 +1,74 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://grimoire:9001
+      - OPENAI_API_KEY=7JcW7xX82ypTQPlsYle6XdjlBSWfG3NwbtYSRSXZQ88
+      - WEBUI_SECRET_KEY=QsE40suDucdlDeRaVpY1Dbh0ls4-ld_SYqEXr3k6RTI
+      - ENABLE_SIGNUP=true
+      - DEFAULT_MODELS=dflash-canary-qwen3.6-27B
+    volumes:
+      - open-webui-data:/app/backend/data
+    networks:
+      - grimoire-demo
+    restart: unless-stopped
+
+  librechat:
+    image: ghcr.io/danny-avila/librechat:latest
+    container_name: librechat
+    ports:
+      - "3080:3080"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    env_file:
+      - librechat.env
+    environment:
+      - DOMAIN_CLIENT=https://librechat.lost.plus
+      - DOMAIN_SERVER=https://librechat.lost.plus
+      - TRUST_PROXY=1
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      - REDIS_URI=redis://redis:6379
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml:ro
+      - ./librechat.env:/app/.env:ro
+    networks:
+      - grimoire-demo
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:7
+    container_name: librechat-mongodb
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - grimoire-demo
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: librechat-redis
+    volumes:
+      - redis-data:/data
+    networks:
+      - grimoire-demo
+    restart: unless-stopped
+
+volumes:
+  open-webui-data:
+  mongo-data:
+  redis-data:
+
+networks:
+  grimoire-demo:
+    external: true
