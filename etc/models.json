@@ -1,127 +1,70 @@
 {
   "models": {
-    "qwen-3.6-27B": {
-      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "mmproj": "gguf/Qwen3.6-27B-mmproj-BF16.gguf",
+    "qwen3.6-mtp-27B": {
+      "file": "gguf/Qwen3.6-27B-MTP-Q4_K_M.gguf",
+      "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
-        "completion",
-        "multimodal"
+        "completion"
       ],
       "cost": {
         "input": 0.33,
         "output": 3.25,
-        "cache_read": 0.1
+        "cache_read": 0.10
       },
-      "ctx-size": 262144,
+      "ctx-size": 120000,
       "predict": 16384,
       "parallel": 1,
-      "image-min-tokens": 1024,
-      "image-max-tokens": 1024,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4"
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "extra-args": [
+        "--draft-max", "2",
+        "--draft-min", "1"
+      ]
     },
-    "gemma-4-31B": {
-      "file": "gguf/gemma-4-31B-it-UD-Q4_K_XL.gguf",
-      "mmproj": "gguf/mmproj-BF16.gguf",
+    "huihui-qwen3.6-mtp-27B": {
+      "file": "gguf/Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K.gguf",
+      "speculative-type": "nextn",
+      "family": "qwen",
+      "capabilities": [
+        "completion"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.10
+      },
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "extra-args": [
+        "--draft-max", "2",
+        "--draft-min", "1"
+      ]
+    },
+    "gemma-4-mtp-31B": {
+      "file": "gguf/gemma-4-31B-it-Q4_K_M.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/gemma-4-31B-it-assistant.Q4_K_M.gguf",
       "family": "gemma",
       "capabilities": [
-        "completion",
-        "multimodal"
+        "completion"
       ],
       "cost": {
         "input": 0.14,
         "output": 0.4,
         "cache_read": 0.04
       },
-      "ctx-size": 131072,
-      "predict": 16384,
-      "parallel": 1,
-      "image-min-tokens": 280,
-      "image-max-tokens": 280,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4"
-    },
-    "dflash-qwen3.6-27B": {
-      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
-      "spec-draft-model": "gguf/dflash-draft-3.6-q8_0.gguf",
-      "speculative-type": "dflash",
-      "spec-dflash-cross-ctx": 1024,
-      "spec-dflash-max-slots": 4,
-      "spec-draft-n-max": 16,
-      "spec-draft-temp": 0,
-      "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25
-      },
-      "ctx-size": 184832,
+      "ctx-size": 120000,
       "predict": 16384,
       "parallel": 1,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "tokenizer": "tokenizers/qwen3.6-27B",
-      "tokenizer-trust-remote-code": true,
-      "kv-cache-cap": 8,
-      "kv-cache-disk-budget-gb": 30,
-      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-qwen3.6-27B",
-      "kv-cache-disk-ttl-hours": 24
-    },
-    "pflash-qwen3.6-27B": {
-      "pflash": true,
-      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "drafter": "gguf/Qwen3.5-0.8B-Q8_0.gguf",
-      "tokenizer": "tokenizers/qwen3.6-27B",
-      "tokenizer-trust-remote-code": true,
-      "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.1
-      },
-      "ctx-size": 65000,
-      "max-effective-context": 65000,
-      "predict": 16384,
-      "parallel": 1,
-      "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0",
-      "prefill-threshold": 36000,
-      "prefill-keep-ratio": 0.1,
-      "prefill-tail-budget": 16000,
-      "park-unpark": false
-    },
-    "pflash-park-qwen3.6-27B": {
-      "pflash": true,
-      "park-unpark": true,
-      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "drafter": "gguf/Qwen3.5-0.8B-Q8_0.gguf",
-      "tokenizer": "tokenizers/qwen3.6-27B",
-      "tokenizer-trust-remote-code": true,
-      "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.1
-      },
-      "ctx-size": 140000,
-      "max-effective-context": 140000,
-      "predict": 16384,
-      "parallel": 1,
-      "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0",
-      "prefill-threshold": 36000,
-      "prefill-keep-ratio": 0.1,
-      "prefill-tail-budget": 16000
+      "extra-args": [
+        "--draft-block-size", "2"
+      ]
     }
   },
   "fixed": {},

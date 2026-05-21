@@ -26,8 +26,8 @@ def _env_bool(name, default=False):
 
 # Backend binary
 LLAMA_SERVER_BIN = "/opt/grimoire-llama-cpp/bin/llama-server"
-TURBOQUANT_LIB_DIR = "/opt/grimoire-llama-cpp/lib"
-TURBOQUANT_LIB64_DIR = "/opt/grimoire-llama-cpp/lib64"
+TURBOQUANT_LIB_DIR = os.environ.get("GRIMOIRE_TURBOQUANT_LIB_DIR", "/opt/grimoire-llama-cpp/lib")
+TURBOQUANT_LIB64_DIR = os.environ.get("GRIMOIRE_TURBOQUANT_LIB64_DIR", "/opt/grimoire-llama-cpp/lib64")
 PFLASH_HOME = os.environ.get("GRIMOIRE_PFLASH_HOME", "/opt/pflash")
 PFLASH_LIB_DIR = os.environ.get("GRIMOIRE_PFLASH_LIB_DIR", PFLASH_HOME)
 PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(PFLASH_HOME, "pflash_daemon"))

@@ -157,6 +157,20 @@ def build_cmd(cfg, port, alias=None):
     _extend_optional_arg(cmd, cfg, "image-max-tokens")
     _append_native_dflash_args(cmd, cfg)
 
+    spec_type = cfg.get("speculative-type")
+    if spec_type in ("nextn", "mtp"):
+        cmd.extend(["--spec-type", spec_type])
+        if spec_type == "nextn":
+            draft_path = _resolve_config_path(cfg.get("spec-draft-model") or cfg.get("draft") or cfg["file"])
+            if draft_path and os.path.exists(draft_path):
+                cmd.extend(["-md", draft_path])
+        elif spec_type == "mtp":
+            mtp_head = _resolve_config_path(cfg.get("mtp-head"))
+            if mtp_head and os.path.exists(mtp_head):
+                cmd.extend(["--mtp-head", mtp_head])
+        # Remove spec-type from extra-args to avoid duplication
+        cfg["extra-args"] = [a for a in cfg.get("extra-args", []) if a != "--spec-type" and a not in ("nextn", "mtp", "dflash")]
+
     for bias in cfg.get("logit-bias", []) or []:
         cmd.extend(["--logit-bias", str(bias)])
 

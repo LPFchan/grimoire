@@ -17,6 +17,8 @@ services:
       - ${MODELS_JSON_PATH}:/etc/grimoire/models.json:ro
       # Dev override: bind-mount Python source so code changes apply immediately.
       - ${DEV_SRC_BIND}:/opt/grimoire-venv/lib/python3.11/site-packages/grimoire:ro
+      - /home/yeowool/grimoire/atomic/llama-server:/opt/grimoire-llama-cpp/bin/llama-server:ro
+      - /home/yeowool/grimoire/atomic:/opt/atomic:ro
       - /sys/devices/virtual/powercap:/host-powercap:ro
       - type: tmpfs
         target: /dev/shm/grimoire-snapshots
@@ -35,8 +37,9 @@ services:
       - STRUCTURED_TOOL_FALLBACK=0
       - TOOL_STRUCTURED_PLAN_TIMEOUT_S=8
       - TOOL_STRUCTURED_PLAN_MAX_TOKENS=192
-      # Keep llama.cpp's CPU prompt checkpoint cache from exhausting host RAM.
       - LLAMA_ARG_CACHE_RAM=2048
+      - LD_LIBRARY_PATH=/opt/atomic:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64
+      - GRIMOIRE_TURBOQUANT_LIB_DIR=/opt/atomic
     deploy:
       resources:
         reservations:
