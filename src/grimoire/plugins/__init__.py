@@ -1,0 +1,32 @@
+"""Plugin hooks for Grimoire request and response transforms."""
+
+import json
+
+from grimoire.plugins.base import Plugin, PluginManager
+from grimoire.plugins.structured_cot import QwenStructuredCotPlugin
+from grimoire.plugins.dflash_awareness import DflashPflashAwarenessPlugin
+from grimoire.plugins.huihui import HuihuiPlugin
+from grimoire.plugins.tool_plan import StructuredToolPlanPlugin
+
+plugin_manager = PluginManager([
+    QwenStructuredCotPlugin(),
+    DflashPflashAwarenessPlugin(),
+    StructuredToolPlanPlugin(),
+    HuihuiPlugin(),
+])
+
+
+def restore_plugin_states(user_hash: str, store):
+    """Restore persisted plugin toggle states from the settings store."""
+    try:
+        all_settings = store.get_all(user_hash)
+        for key, raw in all_settings.items():
+            if key.startswith("plugin."):
+                plugin_key = key[len("plugin."):]
+                try:
+                    enabled = json.loads(raw)
+                    plugin_manager.set_enabled(plugin_key, enabled)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+    except Exception:
+        pass

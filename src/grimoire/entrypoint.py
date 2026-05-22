@@ -97,6 +97,8 @@ from grimoire.proxy.llama import (
 from grimoire.routes.history import router as history_router
 from grimoire.routes.dashboard import router as dashboard_router
 from grimoire.routes.models import router as models_router
+from grimoire.routes.plugins import router as plugins_router
+from grimoire.routes.settings import router as settings_router
 from grimoire.proxy.sse import (
     _extract_assistant_text,
     _usage_from_object,
@@ -170,6 +172,8 @@ app.include_router(auth_router)
 app.include_router(history_router)
 app.include_router(dashboard_router)
 app.include_router(models_router)
+app.include_router(plugins_router)
+app.include_router(settings_router)
 
 
 @app.get("/health")
@@ -372,6 +376,7 @@ def _mount_webui():
             WEBUI_DIR,
         )
         return
+
     app.mount("/", StaticFiles(directory=WEBUI_DIR, html=True), name="webui")
     logger.info("Serving llama.cpp webui from %s", WEBUI_DIR)
 
