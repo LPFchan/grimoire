@@ -381,6 +381,63 @@ def _mount_webui():
     logger.info("Serving llama.cpp webui from %s", WEBUI_DIR)
 
 
+@app.api_route("/cors-proxy", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def cors_proxy(request: Request):
+    """CORS proxy for MCP server connections — enables browser-to-MCP via the gateway."""
+    target_url = request.query_params.get("url")
+    if not target_url:
+        return JSONResponse(status_code=400, content={"error": "Missing 'url' query parameter"})
+
+    if request.method == "OPTIONS":
+        origin = request.headers.get("origin", "*")
+        return Response(
+            status_code=204,
+            headers={
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD",
+                "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, x-proxy-header-*",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+
+    body = await request.body()
+    headers = {}
+    for key, value in request.headers.items():
+        low = key.lower()
+        if low in ("host", "content-length", "x-forwarded-for"):
+            continue
+        if low.startswith("x-proxy-header-"):
+            original_key = key[len("x-proxy-header-"):]
+            headers[original_key] = value
+            continue
+        headers[key] = value
+    headers.setdefault("Accept", "application/json, text/event-stream")
+
+    async with httpx.AsyncClient(timeout=300) as client:
+        try:
+            upstream = await client.request(
+                method=request.method,
+                url=target_url,
+                headers=headers,
+                content=body or None,
+            )
+        except httpx.RequestError as e:
+            return JSONResponse(status_code=502, content={"error": f"Proxy error: {e}"})
+
+    resp_headers = {}
+    for key, value in upstream.headers.items():
+        low = key.lower()
+        if low not in ("transfer-encoding", "content-encoding", "content-length"):
+            resp_headers[key] = value
+    resp_headers["Access-Control-Allow-Origin"] = request.headers.get("origin", "*")
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=resp_headers,
+    )
+
+
 _mount_webui()
 
 
