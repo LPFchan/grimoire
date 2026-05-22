@@ -201,6 +201,8 @@ class StructuredToolPlanPlugin(Plugin):
     @staticmethod
     def _inject_tool_plan(payload, plan):
         final_payload = copy.deepcopy(payload)
+        for key in ("grammar", "json_schema", "response_format"):
+            final_payload.pop(key, None)
         messages = copy.deepcopy(final_payload.get("messages") or [])
         context = (
             "Structured tool-routing plan from a bounded prepass. Use it only as routing context; "

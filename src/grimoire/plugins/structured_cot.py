@@ -63,7 +63,7 @@ class QwenStructuredCotPlugin(Plugin):
             return payload
 
         has_tools = any(key in payload for key in ("tools", "tool_choice", "functions", "function_call"))
-        if has_tools and self.tool_fallback:
+        if has_tools and not self.tool_fallback:
             return payload
 
         payload["grammar"] = self.grammar
