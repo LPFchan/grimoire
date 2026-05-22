@@ -153,13 +153,13 @@ Legacy import (`GRIMOIRE_LEGACY_STATS_PATH=/path/to/token-stats.json`) is idempo
 
 ## Chat UI
 
-Stock llama.cpp SvelteKit webui at `https://chat.lost.plus/`. Router-mode API: `GET /props`, `GET /v1/models`, `POST /models/load`, `POST /models/unload`.
+Forked llama.cpp SvelteKit webui at `https://chat.lost.plus/` (submodule at `webui/`). Router-mode API: `GET /props`, `GET /v1/models`, `POST /models/load`, `POST /models/unload`.
 
 `GRIMOIRE_WEBUI_DIR` overrides asset path.
 
 ### Server-Side History
 
-`patches/grimoire-webui-history.patch` swaps IndexedDB for HTTP to `/history` (tree-aware: branches, forks, cascade delete). Per `user_hash` (SHA-256 of API key).
+The `webui/src/lib/services/database.service.ts` replaces IndexedDB with HTTP to `/history` (tree-aware: branches, forks, cascade delete). Per `user_hash` (SHA-256 of API key).
 
 | Method | Path |
 | --- | --- |

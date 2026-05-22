@@ -1,0 +1,3 @@
+[submodule "webui"]
+	path = webui
+	url = git@github.com:LPFchan/llama-cpp-webui.git

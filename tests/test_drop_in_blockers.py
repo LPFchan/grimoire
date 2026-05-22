@@ -707,44 +707,6 @@ class DropInBlockerTests(unittest.TestCase):
                 registry_mod.MODELS_DIR = old_models_dir
                 config.PFLASH_SHIM_PATH = old_shim
 
-    def test_native_dflash_is_native_to_bee_not_patched(self):
-        """DFlash support is native to Bee — no separate contract patch needed.
-
-        Verify that the only remaining build patch (slot-save-mtmd) is still
-        present and that the old spec-dflash-contract patch has been removed
-        (its contents are now upstream in Bee).
-        """
-        removed = ROOT / "patches" / "spec-dflash-contract.patch"
-        self.assertFalse(removed.exists(), "spec-dflash-contract.patch should be removed — DFlash is native in Bee")
-
-        slot_save = ROOT / "patches" / "slot-save-mtmd.patch"
-        self.assertTrue(slot_save.exists(), "slot-save-mtmd.patch must still be present")
-        content = slot_save.read_text()
-        self.assertIn("check_no_mtmd", content)
-
-        dockerfile = ROOT / "Dockerfile"
-        df = dockerfile.read_text()
-        self.assertIn("COPY patches/slot-save-mtmd.patch", df)
-        self.assertNotIn("COPY patches/spec-dflash-contract.patch", df)
-
-    def test_webui_patches_reapply_on_fresh_clone_and_patch_change(self):
-        dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("webui_patch_hash_file=/cache/webui-src/.patch_hash", dockerfile)
-        self.assertIn("need_webui_patches=1", dockerfile)
-        self.assertIn("printf '%s' \"$webui_patch_hash\" > \"$webui_patch_hash_file\"", dockerfile)
-
-    def test_webui_history_patch_is_well_formed(self):
-        patch_path = ROOT / "patches" / "grimoire-webui-history.patch"
-        self.assertTrue(patch_path.exists(), "webui history patch file is missing")
-        content = patch_path.read_text()
-        self.assertIn("diff --git", content)
-        self.assertIn("tools/server/webui/src/lib/services/database.service.ts", content)
-        self.assertIn("apiFetch", content)
-        # The webui stage selectively applies grimoire-webui-* patches
-        dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn("/src/patches/grimoire-webui-*.patch", dockerfile)
-        self.assertIn("grimoire-webui-*", dockerfile)
-
     def test_pflash_build_stage_builds_only_pflash_daemon(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertNotIn("-DDFLASH27B_TESTS=ON", dockerfile)

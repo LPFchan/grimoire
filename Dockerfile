@@ -6,11 +6,11 @@
 
 ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
-ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/Anbeeld/beellama.cpp.git
-ARG GRIMOIRE_LLAMA_CPP_REF=main
-ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=4db14be0ac1ad332b289d8a145052ea328fee498
+ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
+ARG GRIMOIRE_LLAMA_CPP_REF=master
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=24cabf4d08d460cfb6e73fa308a15b34e2b04600
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=8
+ARG CACHE_BUST=9
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -51,35 +51,23 @@ ENV CCACHE_DIR=/root/.ccache \
     CCACHE_COMPRESS=1 \
     CCACHE_MAXSIZE=5G
 
-# Copy only non-webui patches for the build stage
-RUN mkdir -p /app/patches
-COPY patches/slot-save-mtmd.patch /app/patches/
-COPY patches/dflash-max-verify-tokens.patch /app/patches/
-
 RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/app/.cache/llama-cpp-src \
     --mount=type=cache,target=/app/.cache/llama-cpp-build \
     set -eux; \
     # If CACHE_BUST changed, invalidate the built marker so cmake re-runs
     cache_bust_file=/app/.cache/llama-cpp-build/.cache_bust; \
-    patch_hash_file=/app/.cache/llama-cpp-build/.patch_hash; \
-    patch_hash=$( (sha256sum /app/patches/*.patch 2>/dev/null || true) | sha256sum | cut -d' ' -f1 ); \
-    need_patches=0; \
     if [ -f "$cache_bust_file" ]; then \
         old_bust=$(cat "$cache_bust_file"); \
         if [ "$old_bust" != "$CACHE_BUST" ]; then \
             echo "CACHE_BUST changed: $old_bust -> $CACHE_BUST, forcing rebuild"; \
-            rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
+            rm -f /app/.cache/llama-cpp-build/.built; \
         fi; \
-    fi; \
-    if [ ! -f "$patch_hash_file" ] || [ "$(cat "$patch_hash_file" 2>/dev/null || true)" != "$patch_hash" ]; then \
-        need_patches=1; \
     fi; \
     echo "$CACHE_BUST" > "$cache_bust_file"; \
     if [ ! -d /app/.cache/llama-cpp-src/repo/.git ]; then \
         rm -rf /app/.cache/llama-cpp-src/repo; \
         git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /app/.cache/llama-cpp-src/repo; \
-        need_patches=1; \
     else \
         old_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
         git -C /app/.cache/llama-cpp-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
@@ -87,25 +75,13 @@ RUN --mount=type=cache,target=/root/.ccache \
         new_ref=$(git -C /app/.cache/llama-cpp-src/repo rev-parse FETCH_HEAD); \
     if [ "$old_ref" != "$new_ref" ]; then \
         git -C /app/.cache/llama-cpp-src/repo reset --hard FETCH_HEAD; \
-        need_patches=1; \
+        rm -f /app/.cache/llama-cpp-build/.built; \
     fi; \
 fi; \
     current_sha=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
     if [ "$current_sha" != "$GRIMOIRE_LLAMA_CPP_PINNED_SHA" ]; then \
         echo "ERROR: cloned SHA $current_sha != pinned $GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
         exit 1; \
-    fi; \
-    if [ "$need_patches" = "1" ] || [ ! -f /app/.cache/llama-cpp-build/.patched ]; then \
-        git -C /app/.cache/llama-cpp-src/repo checkout -- .; \
-        git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
-        for patch in /app/patches/*.patch; do \
-            [ -f "$patch" ] || continue; \
-            echo "Applying $patch"; \
-            git -C /app/.cache/llama-cpp-src/repo apply "$patch"; \
-        done; \
-        rm -f /app/.cache/llama-cpp-build/.built /app/.cache/llama-cpp-build/.patched; \
-        touch /app/.cache/llama-cpp-build/.patched; \
-        printf '%s' "$patch_hash" > "$patch_hash_file"; \
     fi; \
     if [ ! -f /app/.cache/llama-cpp-build/.built ]; then \
         rm -f /app/.cache/llama-cpp-build/CMakeCache.txt; \
@@ -168,80 +144,18 @@ RUN gcc -shared -o /opt/pflash/pflash_shim.so -fPIC -I/usr/local/cuda/include \
 
 
 # =============================================================================
-# WebUI stage: Build the stock llama.cpp SvelteKit chat UI
+# WebUI stage: Build the forked llama.cpp SvelteKit chat UI
 # =============================================================================
 
 FROM node:20-bookworm-slim AS webui
 
-ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /src/webui
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates git \
-    && rm -rf /var/lib/apt/lists/*
+COPY webui/ /src/webui/
 
-ARG GRIMOIRE_LLAMA_CPP_REPO_URL
-ARG GRIMOIRE_LLAMA_CPP_REF
+RUN VITE_PUBLIC_APP_NAME=chat.lost.plus npm ci && npm run build
 
-WORKDIR /src
-
-# Webui-only patches (e.g. grimoire-webui-history.patch which swaps the upstream
-# Dexie/IndexedDB DatabaseService for fetch calls to grimoire's /history endpoints).
-COPY patches/ /src/patches/
-
-# Dashboard page is owned as a standalone file, not a patch.
-COPY dashboard/ /src/dashboard/
-
-RUN --mount=type=cache,target=/cache/webui-src \
-    --mount=type=cache,target=/root/.npm \
-    set -eux; \
-    webui_patch_hash_file=/cache/webui-src/.patch_hash; \
-    webui_patch_hash=$( (sha256sum /src/patches/grimoire-webui-*.patch 2>/dev/null || true) | sha256sum | cut -d' ' -f1 ); \
-    need_webui_patches=0; \
-    if [ ! -f "$webui_patch_hash_file" ] || [ "$(cat "$webui_patch_hash_file" 2>/dev/null || true)" != "$webui_patch_hash" ]; then \
-        need_webui_patches=1; \
-    fi; \
-    if [ ! -d /cache/webui-src/repo/.git ]; then \
-        rm -rf /cache/webui-src/repo; \
-        git clone --depth 1 --branch "$GRIMOIRE_LLAMA_CPP_REF" --single-branch "$GRIMOIRE_LLAMA_CPP_REPO_URL" /cache/webui-src/repo; \
-        need_webui_patches=1; \
-    else \
-        old_ref=$(git -C /cache/webui-src/repo rev-parse HEAD); \
-        git -C /cache/webui-src/repo remote set-url origin "$GRIMOIRE_LLAMA_CPP_REPO_URL"; \
-        git -C /cache/webui-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_REF"; \
-        new_ref=$(git -C /cache/webui-src/repo rev-parse FETCH_HEAD); \
-        if [ "$old_ref" != "$new_ref" ]; then \
-            git -C /cache/webui-src/repo reset --hard FETCH_HEAD; \
-            need_webui_patches=1; \
-        fi; \
-        if [ "$need_webui_patches" = "1" ] || [ ! -f /cache/webui-src/.patched ]; then \
-            for patch in /src/patches/grimoire-webui-*.patch; do \
-                [ -f "$patch" ] || continue; \
-                echo "Applying webui patch: $patch"; \
-                git -C /cache/webui-src/repo apply "$patch"; \
-            done; \
-            touch /cache/webui-src/.patched; \
-        fi; \
-    fi; \
-    if [ "$need_webui_patches" = "1" ] || [ ! -f /cache/webui-src/.patched ]; then \
-        git -C /cache/webui-src/repo checkout -- .; \
-        git -C /cache/webui-src/repo clean -fdx -- tools/server/webui tools/server/public; \
-        for patch in /src/patches/grimoire-webui-*.patch; do \
-            [ -f "$patch" ] || continue; \
-            echo "Applying webui patch: $patch"; \
-            git -C /cache/webui-src/repo apply "$patch"; \
-        done; \
-        rm -f /cache/webui-src/.built; \
-        touch /cache/webui-src/.patched; \
-        printf '%s' "$webui_patch_hash" > "$webui_patch_hash_file"; \
-    fi; \
-    cp -r /cache/webui-src/repo/tools /src/tools; \
-    mkdir -p /src/tools/server/webui/src/routes/dashboard; \
-    cp /src/dashboard/* /src/tools/server/webui/src/routes/dashboard/; \
-    cd /src/tools/server/webui; \
-    npm ci; \
-    npm run build; \
-    mkdir -p /opt/grimoire-webui; \
-    cp -r /src/tools/server/public/. /opt/grimoire-webui/
+RUN mkdir -p /opt/grimoire-webui && cp -r /src/webui/build/. /opt/grimoire-webui/
 
 
 # =============================================================================

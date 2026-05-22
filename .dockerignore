@@ -8,6 +8,8 @@ __pycache__/
 .eggs/
 build/
 dist/
+webui/build/
+webui/node_modules/
 *.so
 *.egg
 .pytest_cache/
