@@ -4,76 +4,102 @@
       "file": "gguf/Qwen3.6-27B-MTP-Q4_K_M.gguf",
       "speculative-type": "nextn",
       "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.10
-      },
-      "ctx-size": 120000,
+      "capabilities": ["completion"],
+      "cost": {"input": 0.33, "output": 3.25, "cache_read": 0.10},
+      "ctx-size": 210000,
       "predict": 16384,
       "parallel": 1,
+      "n-gpu-layers": 999,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "extra-args": [
-        "--draft-max", "2",
-        "--draft-min", "1"
-      ]
+      "extra-args": ["--draft-max","2","--draft-min","1"]
+    },
+    "qwen3.6-mtp-mmproj-27B": {
+      "file": "gguf/Qwen3.6-27B-MTP-Q4_K_M.gguf",
+      "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
+      "speculative-type": "nextn",
+      "family": "qwen",
+      "capabilities": ["completion","multimodal"],
+      "cost": {"input": 0.33, "output": 3.25, "cache_read": 0.10},
+      "ctx-size": 186000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "extra-args": ["--draft-max","2","--draft-min","1"]
     },
     "huihui-qwen3.6-mtp-27B": {
       "file": "gguf/Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K.gguf",
       "speculative-type": "nextn",
       "family": "qwen",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.10
-      },
-      "ctx-size": 120000,
+      "capabilities": ["completion"],
+      "cost": {"input": 0.33, "output": 3.25, "cache_read": 0.10},
+      "ctx-size": 210000,
       "predict": 16384,
       "parallel": 1,
+      "n-gpu-layers": 999,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "extra-args": [
-        "--draft-max", "2",
-        "--draft-min", "1"
-      ]
+      "extra-args": ["--draft-max","2","--draft-min","1"]
+    },
+    "huihui-qwen3.6-mtp-mmproj-27B": {
+      "file": "gguf/Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K.gguf",
+      "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
+      "speculative-type": "nextn",
+      "family": "qwen",
+      "capabilities": ["completion","multimodal"],
+      "cost": {"input": 0.33, "output": 3.25, "cache_read": 0.10},
+      "ctx-size": 186000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "extra-args": ["--draft-max","2","--draft-min","1"]
     },
     "gemma-4-mtp-31B": {
       "file": "gguf/gemma-4-31B-it-Q4_K_M.gguf",
       "speculative-type": "mtp",
       "mtp-head": "gguf/gemma-4-31B-it-assistant.Q4_K_M.gguf",
       "family": "gemma",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "ctx-size": 120000,
+      "capabilities": ["completion"],
+      "cost": {"input": 0.14, "output": 0.4, "cache_read": 0.04},
+      "ctx-size": 120550,
       "predict": 16384,
       "parallel": 1,
+      "n-gpu-layers": 999,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
-      "extra-args": [
-        "--draft-block-size", "2"
-      ]
+      "extra-args": ["--draft-block-size","2"]
+    },
+    "gemma-4-mtp-mmproj-31B": {
+      "file": "gguf/gemma-4-31B-it-Q4_K_M.gguf",
+      "mmproj": "gguf/gemma4-mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/gemma-4-31B-it-assistant.Q4_K_M.gguf",
+      "family": "gemma",
+      "capabilities": ["completion","multimodal"],
+      "cost": {"input": 0.14, "output": 0.4, "cache_read": 0.04},
+      "ctx-size": 180000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 280,
+      "image-max-tokens": 280,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": ["--draft-block-size","2"]
     }
   },
   "fixed": {},
   "family_defaults": {
     "qwen": {
-      "extra-args": [
-        "--chat-template-kwargs",
-        "{\"preserve_thinking\":true}"
-      ]
+      "extra-args": ["--chat-template-kwargs","{\"preserve_thinking\":true}"]
     }
   }
 }
