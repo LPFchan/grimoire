@@ -7,8 +7,8 @@
 ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
-ARG GRIMOIRE_LLAMA_CPP_REF=master
-ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=24cabf4d08d460cfb6e73fa308a15b34e2b04600
+ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=0a635dcd92ba66c75fccfef91c3e106f4668f367
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
 ARG CACHE_BUST=10
 
