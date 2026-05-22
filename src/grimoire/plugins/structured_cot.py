@@ -66,5 +66,9 @@ class QwenStructuredCotPlugin(Plugin):
         if has_tools and not self.tool_fallback:
             return payload
 
+        messages = payload.get("messages", [])
+        if messages and isinstance(messages[-1], dict) and messages[-1].get("role") in ("tool", "function"):
+            return payload
+
         payload["grammar"] = self.grammar
         return payload
