@@ -17,7 +17,10 @@ services:
       - ${MODELS_JSON_PATH}:/etc/grimoire/models.json:ro
       # Dev override: bind-mount Python source so code changes apply immediately.
       - ${DEV_SRC_BIND}:/opt/grimoire-venv/lib/python3.11/site-packages/grimoire:ro
-      - /home/yeowool/grimoire/atomic/llama-server:/opt/grimoire-llama-cpp/bin/llama-server:ro
+      # Host-built webui — shadows the image's COPY --from=webui.
+      - ./webui/build:/opt/grimoire-webui:ro
+      # FIXME: restore when atomic/llama-server binary is available
+      #- /home/yeowool/grimoire/atomic/llama-server:/opt/grimoire-llama-cpp/bin/llama-server:ro
       - /home/yeowool/grimoire/atomic:/opt/atomic:ro
       - /sys/devices/virtual/powercap:/host-powercap:ro
       - type: tmpfs

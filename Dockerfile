@@ -10,7 +10,7 @@ ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/AtomicBot-ai/atomic-llama-cpp
 ARG GRIMOIRE_LLAMA_CPP_REF=master
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=24cabf4d08d460cfb6e73fa308a15b34e2b04600
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=9
+ARG CACHE_BUST=10
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -149,11 +149,15 @@ RUN gcc -shared -o /opt/pflash/pflash_shim.so -fPIC -I/usr/local/cuda/include \
 
 FROM node:20-bookworm-slim AS webui
 
+# Bump to force rebuild of the webui (e.g. after submodule update)
+ARG WEBUI_BUST=1
+
 WORKDIR /src/webui
 
 COPY webui/ /src/webui/
 
-RUN VITE_PUBLIC_APP_NAME=chat.lost.plus npm ci && npm run build
+RUN echo "webui-bust=${WEBUI_BUST}" && \
+    VITE_PUBLIC_APP_NAME=chat.lost.plus npm ci && npm run build
 
 RUN mkdir -p /opt/grimoire-webui && cp -r /src/webui/build/. /opt/grimoire-webui/
 
