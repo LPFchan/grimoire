@@ -1,4 +1,4 @@
-# RSH-20260519-011: DFlash ctx-size VRAM Sweep (dflash-qwen3.6-27B)
+# RSH-20260519-001: DFlash ctx-size VRAM Sweep (dflash-qwen3.6-27B)
 
 Opened: 2026-05-19 18-56-47 KST
 Recorded by agent: mimo-v2.5-pro-precision

@@ -15,4 +15,4 @@ Single Bee binary (`Anbeeld/beellama.cpp`) serves DFlash (`--spec-type dflash`),
 
 - Multi-spec batched decode — single-spec sufficient for current workload
 - Monitoring for 413 path — (user decision)
-- VMM park/unpark — measured (RSH-20260518-005): adds 2.5 GB VRAM overhead with no TTFT benefit for single-model. Unnecessary unless multi-model GPU sharing is needed later.
+- VMM park/unpark — measured (RSH-20260518-001): adds 2.5 GB VRAM overhead with no TTFT benefit for single-model. Unnecessary unless multi-model GPU sharing is needed later.

@@ -1,4 +1,4 @@
-# RSH-20260520-013: MTP Migration — Deployment and Parameter Tuning
+# RSH-20260520-001: MTP Migration — Deployment and Parameter Tuning
 
 Opened: 2026-05-20 21-00-00 KST
 Recorded by agent: mimo-v2.5-pro-precision

@@ -1,4 +1,4 @@
-# RSH-20260519-012: DFlash vs MTP vs Baseline — Three-Way Comparison
+# RSH-20260519-002: DFlash vs MTP vs Baseline — Three-Way Comparison
 
 Opened: 2026-05-19 18-56-47 KST
 Recorded by agent: mimo-v2.5-pro-precision
@@ -73,7 +73,7 @@ This reserves a backup `seq_id` for speculative rollback (recurrent state restor
 
 **Result**: DFlash's effective per-sequence context is capped at ~92k on a 24 GB card (184832 / 2). At 100k tokens, the request is rejected with HTTP 400.
 
-The VRAM ctx-size sweep (RSH-20260519-011) found 184832 as the physical GPU limit. The effective per-sequence limit for DFlash is 92416.
+The VRAM ctx-size sweep (RSH-20260519-001) found 184832 as the physical GPU limit. The effective per-sequence limit for DFlash is 92416.
 
 ### 2. Prefill Hit
 

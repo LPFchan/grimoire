@@ -11,7 +11,7 @@ from Bee's `beellama.cpp` (DFlash) to `AtomicBot-ai/atomic-llama-cpp-turboquant`
 
 ## Rationale
 
-Benchmarks (RSH-20260519-012) showed:
+Benchmarks (RSH-20260519-002) showed:
 
 1. **DFlash is worse than MTP on every dimension except short-prompt decode:**
    - Prefill: DFlash 31-38% slower vs MTP 9-25% slower (both vs baseline)
