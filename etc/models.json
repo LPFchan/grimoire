@@ -12,7 +12,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 210000,
+      "ctx-size": 180000,
       "predict": 16384,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -48,8 +48,9 @@
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0"
     },
-    "huihui-qwen3.6-mtp-27B": {
-      "file": "gguf/Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K.gguf",
+
+    "qwen3.6-hereticv2-mtp-27B": {
+      "file": "gguf/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
@@ -60,7 +61,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 210000,
+      "ctx-size": 180000,
       "predict": 16384,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -73,8 +74,8 @@
         "1"
       ]
     },
-    "huihui-qwen3.6-mtp-mmproj-27B": {
-      "file": "gguf/Huihui-Qwen3.6-27B-abliterated-MTP-Q4_K.gguf",
+    "qwen3.6-hereticv2-mtp-mmproj-27B": {
+      "file": "gguf/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf",
       "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
       "speculative-type": "nextn",
       "family": "qwen",
@@ -88,6 +89,55 @@
         "cache_read": 0.1
       },
       "ctx-size": 186000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0"
+    },
+
+    "qwopus3.6v2-mtp-27B": {
+      "file": "gguf/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf",
+      "speculative-type": "nextn",
+      "family": "qwen",
+      "capabilities": [
+        "completion"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 150000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "extra-args": [
+        "--draft-max",
+        "2",
+        "--draft-min",
+        "1"
+      ]
+    },
+    "qwopus3.6v2-mtp-mmproj-27B": {
+      "file": "gguf/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf",
+      "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
+      "speculative-type": "nextn",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 150000,
       "predict": 16384,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -119,6 +169,44 @@
         "--draft-block-size",
         "2"
       ]
+    },
+    "gemma-4-heretic-31B": {
+      "file": "gguf/gemma-4-31B-it-uncensored-heretic-Q4_K_M.gguf",
+      "family": "gemma4",
+      "capabilities": [
+        "completion"
+      ],
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "ctx-size": 40000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0"
+    },
+    "gemma-4-heretic-mmproj-31B": {
+      "file": "gguf/gemma-4-31B-it-uncensored-heretic-Q4_K_M.gguf",
+      "mmproj": "gguf/gemma4-mmproj-BF16.gguf",
+      "family": "gemma4",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "ctx-size": 40000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0"
     },
     "gemma-4-mtp-mmproj-31B": {
       "file": "gguf/gemma-4-31B-it-Q4_K_M.gguf",
