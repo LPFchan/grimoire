@@ -1,0 +1,968 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index ec3dc0d87..38ab1bd9c 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -25,6 +25,8 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdio>
++#include <mutex>
++#include <set>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -1158,6 +1160,15 @@ struct ggml_cuda_pool_alloc {
+ };
+ 
+ 
++// V2 shared V_is_K_view predicate (RSH-20260523-001 §2).
++// Used by both the sizing helper in fattn.cu and launch_fattn() in
++// fattn-common.cuh — kept in one place so the two callers cannot drift on
++// upstream rebase. A prior bug class was copy-pasting this predicate between
++// sites and having one inline copy disagree with the other.
++static inline bool ggml_cuda_fattn_V_is_K_view(const ggml_tensor * V, const ggml_tensor * K) {
++    return V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
++}
++
+ // backend interface
+ 
+ struct ggml_tensor_extra_gpu {
+@@ -1172,6 +1183,12 @@ struct ggml_tensor_extra_gpu {
+ 
+ struct ggml_cuda_graph {
+ #ifdef USE_CUDA_GRAPH
++    // V2 (RSH-20260523-001 §6): these CUDA_CHECK calls can abort the process on
++    // driver error. That is acceptable at process teardown — by contract the
++    // libllama destructor has already joined the MTP worker and torn down all
++    // schedulers, so anything reaching here is graceful shutdown best-effort.
++    // A non-aborting variant remains a future refactor option; do not change
++    // the abort behavior as part of V2 to keep scope tight.
+     ~ggml_cuda_graph() {
+         if (instance != nullptr) {
+             CUDA_CHECK(cudaGraphExecDestroy(instance));
+@@ -1198,6 +1215,16 @@ struct ggml_cuda_graph {
+         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+     }
++
++    // V2 FA scratch invalidation tracking (RSH-20260523-001 §1, §3 step 5):
++    // Records which FA scratch stream slots were borrowed during the most recent
++    // capture for this graph entry. On scratch growth for slot s, §3 step 5
++    // traverses cuda_graphs and destroys every entry whose set contains s — so
++    // no graph executable can replay reading from the freed scratch pointer.
++    // The §4 borrower only adds; the set is cleared on instance destruction
++    // (step 5 invalidation, recapture, or ~ggml_cuda_graph()).
++    // Invariant after step 5: (fa_borrowed_streams.size() > 0) ⇒ (instance != nullptr).
++    std::set<int> fa_borrowed_streams;
+ #endif
+ };
+ 
+@@ -1352,6 +1379,41 @@ struct ggml_cuda_stream_context {
+     }
+ };
+ 
++// V2 FA scratch owner (RSH-20260523-001 §1).
++// Holds the stable K/V f16 dequant pointers borrowed by launch_fattn() instead of
++// allocating from the VMM pool. One slot per (device, stream_no); a given cuda_ctx
++// only reads its own [device] row, the other rows are intentionally dead memory.
++struct fattn_scratch_slot {
++    half * k = nullptr;
++    half * v = nullptr;
++    size_t k_capacity = 0; // bytes
++    size_t v_capacity = 0; // bytes
++};
++
++// V2 retired-pointer entry (RSH-20260523-001 §3 step 5, §6).
++// On growth for slot (device, stream_no), the old K/V pointers are moved here
++// alongside a set of cudaEvent_t records — one per populated stream slot of the
++// device, plus first-use events for slots created after retirement. Step 1 of
++// the next compute window polls cudaEventQuery on every event; once all signal
++// cudaSuccess, the pointers are cudaFree'd and the events cudaEventDestroy'd.
++// `cudaGraphLaunch` runs through the launch stream (`cuda_ctx->stream()`), not
++// the capture-time slot, so a single event on slot `s` would miss past replays
++// on slot 0. Recording on all populated slots is cheap (rare op) and correct.
++struct retired_fattn_alloc {
++    half * k = nullptr;
++    half * v = nullptr;
++    int    device = 0;
++    int    stream_no = 0;
++    std::vector<cudaEvent_t> events;
++    // Stream slots that existed (i.e. streams[device][s] != nullptr) at the
++    // moment of retire. During drain, any currently-populated slot NOT in this
++    // set was created AFTER retire — its first-use event (recorded by V2 the
++    // first time the slot was used) must also signal before this entry is
++    // safe to reclaim. Closes the race where a slot springs into existence
++    // between growth-time event recording and reclaim time.
++    bool populated_slots_at_retire[GGML_CUDA_MAX_STREAMS] = {false};
++};
++
+ struct ggml_backend_cuda_context {
+     int device;
+     std::string name;
+@@ -1362,11 +1424,46 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // V2 FA scratch state (RSH-20260523-001 §1).
++    // fattn_scratch[device][stream] tracks the stable K/V pointers owned by this
++    // context. retired_fattn_allocs holds growth-retired pointers awaiting their
++    // event sets to signal completion (drained at the start of the next compute
++    // window by §3 step 1 and again in the destructor for graceful shutdown).
++    // fattn_stream_first_use_event[device][stream] is the event recorded the
++    // first time a freshly-created stream slot was used; §3 step 1 also polls
++    // these so a slot born between growth and reclaim cannot leak a stale
++    // reference to a retired pointer.
++    fattn_scratch_slot fattn_scratch[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
++    std::vector<retired_fattn_alloc> retired_fattn_allocs;
++    cudaEvent_t fattn_stream_first_use_event[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {{nullptr}};
++
++    // V2 concurrency primitive (RSH-20260523-001 §8).
++    // Lock order: fattn_compute_mu BEFORE ggml_cuda_lock; never reverse.
++    // - graph_compute and graph_optimize each take fattn_compute_mu at function entry.
++    // - The compute path may then briefly take ggml_cuda_lock around the existing
++    //   capture-counter increment/decrement blocks.
++    // - The destructor takes ggml_cuda_lock and waits on counter==0; it MUST NOT
++    //   acquire fattn_compute_mu — the libllama-level destructor contract
++    //   (llama_context joins the MTP worker and destroys sched/sched_mtp before
++    //   backend tear-down) guarantees no other thread is inside graph_compute /
++    //   graph_optimize when this destructor runs, so the lock is unnecessary
++    //   and acquiring it under ggml_cuda_lock would invert the lock order.
++    std::mutex fattn_compute_mu;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+ 
++    // V2 active-capture pointer (RSH-20260523-001 §1, §4).
++    // Set by graph_compute immediately after cudaStreamBeginCapture and cleared
++    // by an RAII guard at graph_compute scope. The §4 borrower in launch_fattn
++    // reads this pointer to decide whether to record the current stream slot
++    // into the current graph entry's fa_borrowed_streams (capture active) or
++    // skip recording (direct-execute / warmup / properties-changed reset).
++    // Single source of truth; the borrower must NOT call cudaStreamIsCapturing.
++    ggml_cuda_graph * active_capture_graph = nullptr;
++
+     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+         auto it = cuda_graphs.find(first_node_ptr);
+         if (it == cuda_graphs.end()) {
+@@ -1405,6 +1502,18 @@ struct ggml_backend_cuda_context {
+ 
+     ggml_cuda_stream_context concurrent_stream_context;
+ 
++    // Destructor pre-condition (RSH-20260523-001 §6, §8):
++    // The libllama destructor (llama_context::~llama_context, src/llama-context.cpp
++    // ~411) joins the MTP worker thread and destroys sched/sched_mtp before
++    // backend tear-down. By the time this destructor runs, no other host thread
++    // is inside ggml_backend_cuda_graph_compute() or graph_optimize(), so:
++    //   - fattn_compute_mu must NOT be acquired here (would invert lock order
++    //     against ggml_cuda_lock taken in the destructor body);
++    //   - the §6 step-3 retired-list drain may issue blocking cudaEventSynchronize
++    //     because no fattn_compute_mu acquirer can deadlock against it.
++    // If a future refactor breaks this pre-condition (backend destroyed while
++    // the MTP worker is still alive), §6 step 3 can deadlock — keep this
++    // comment as the contract anchor.
+     ~ggml_backend_cuda_context();
+ 
+     cudaStream_t stream(int device, int stream) {
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 861d84467..b884e79c5 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1275,7 +1275,8 @@ void launch_fattn(
+     const ggml_tensor * K = dst->src[1];
+     const ggml_tensor * V = dst->src[2];
+ 
+-    const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
++    // V2: shared predicate; do not inline the old expression here. See fattn.cuh.
++    const bool V_is_K_view = ggml_cuda_fattn_V_is_K_view(V, K);
+ 
+     const ggml_tensor * mask  = dst->src[3];
+     const ggml_tensor * sinks = dst->src[4];
+@@ -1320,8 +1321,56 @@ void launch_fattn(
+     hip_f16_alloc K_f16(main_stream);
+     hip_f16_alloc V_f16(main_stream);
+ #else
+-    ggml_cuda_pool_alloc<half>   K_f16(pool);
+-    ggml_cuda_pool_alloc<half>   V_f16(pool);
++    // V2 §4 (RSH-20260523-001): non-owning scratch borrower.
++    // Returns the stable pointer reserved by graph_compute's §3 preflight for
++    // the current (device, stream slot). Records the slot into the current
++    // active_capture_graph's fa_borrowed_streams when capture is active. Never
++    // calls cudaMalloc / cudaFree / cudaStreamSynchronize / VMM ops — those
++    // would resurrect V1's failure mode.
++    enum class fa_scratch_side { K, V };
++    struct fa_scratch_borrower {
++        ggml_backend_cuda_context * ctx;
++        fa_scratch_side side;
++        half * ptr = nullptr;
++
++        fa_scratch_borrower(ggml_backend_cuda_context * c, fa_scratch_side s)
++            : ctx(c), side(s) {}
++
++        void alloc(size_t nelements) {
++            const int d = ctx->device;
++            const int s = ctx->curr_stream_no;
++            const fattn_scratch_slot & slot = ctx->fattn_scratch[d][s];
++
++            const size_t request_bytes = nelements * sizeof(half);
++            const size_t capacity = (side == fa_scratch_side::K) ? slot.k_capacity : slot.v_capacity;
++            ptr = (side == fa_scratch_side::K) ? slot.k : slot.v;
++
++#ifndef NDEBUG
++            // V2 debug invariant: preflight in graph_compute must have already
++            // reserved adequate scratch for this (d, s). A null ptr or short
++            // capacity here is a §3/§7 defect — release builds will fall through
++            // and the kernel will likely fault; debug builds panic loudly.
++            if (ptr == nullptr || capacity < request_bytes) {
++                GGML_LOG_ERROR(
++                    "V2 borrower assert: device=%d slot=%d side=%s request=%zu capacity=%zu ptr=%p\n",
++                    d, s, (side == fa_scratch_side::K) ? "K" : "V",
++                    request_bytes, capacity, (void *) ptr);
++                GGML_ABORT("V2 fa-scratch borrower preconditions violated");
++            }
++#endif
++
++#ifdef USE_CUDA_GRAPH
++            // Record the borrowed slot into the current capture's tracking set
++            // so §3 step 5 knows which graph entries to invalidate on growth.
++            // Single source of truth — do not call cudaStreamIsCapturing here.
++            if (ctx->active_capture_graph != nullptr) {
++                ctx->active_capture_graph->fa_borrowed_streams.insert(s);
++            }
++#endif
++        }
++    };
++    fa_scratch_borrower K_f16(&ctx, fa_scratch_side::K);
++    fa_scratch_borrower V_f16(&ctx, fa_scratch_side::V);
+ #endif
+     ggml_cuda_pool_alloc<int>    KV_max(pool);
+     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 38d222b70..6e5df6cda 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -599,6 +599,66 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     return BEST_FATTN_KERNEL_TILE;
+ }
+ 
++// V2 sizing helper (RSH-20260523-001 §2). See fattn.cuh for the contract.
++// Mirrors the K_f16/V_f16 allocation gates in launch_fattn() (fattn-common.cuh
++// ~1340, ~1367). The earlier "VEC contributes zero" shortcut is wrong: when
++// the FATTN_VEC_CASE macro (line 223-231) accepts runtime K->type == F32 and
++// routes it through the F16 template, need_f16_K becomes true and the gate
++// fires. Correct VEC rule: K allocates when K->type == GGML_TYPE_F32;
++// V allocates when V->type == GGML_TYPE_F32 AND !V_is_K_view.
++void ggml_cuda_flash_attn_ext_f16_scratch_size(
++    int device, const ggml_tensor * dst, size_t * k_bytes, size_t * v_bytes) {
++
++    *k_bytes = 0;
++    *v_bytes = 0;
++
++    if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT) {
++        return;
++    }
++    if (dst->src[1] == nullptr || dst->src[2] == nullptr) {
++        return;
++    }
++
++    const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(device, dst);
++    if (kernel == BEST_FATTN_KERNEL_NONE) {
++        return; // launch_fattn() will abort at execution; sizing returns 0.
++    }
++
++    const ggml_tensor * K = dst->src[1];
++    const ggml_tensor * V = dst->src[2];
++
++    const bool V_is_K_view = ggml_cuda_fattn_V_is_K_view(V, K);
++
++    bool need_k_scratch = false;
++    bool need_v_scratch = false;
++
++    if (kernel == BEST_FATTN_KERNEL_VEC) {
++        // VEC: need_f16_K iff template's type_K==F16 and runtime K is F32
++        // (the FATTN_VEC_CASE macro at fattn.cu:223-231 accepts F32 routed
++        // through the F16 template). Same for V.
++        need_k_scratch = (K->type == GGML_TYPE_F32);
++        need_v_scratch = (V->type == GGML_TYPE_F32);
++    } else {
++        // TILE, WMMA, MMA: launch_fattn called with need_f16_K = need_f16_V = true.
++        // Each side allocates when its tensor is not native F16.
++        need_k_scratch = (K->type != GGML_TYPE_F16);
++        need_v_scratch = (V->type != GGML_TYPE_F16);
++    }
++
++    if (V_is_K_view) {
++        // launch_fattn short-circuits V_data = K_data when V_is_K_view
++        // (fattn-common.cuh ~1368-1372). V scratch is unused.
++        need_v_scratch = false;
++    }
++
++    if (need_k_scratch) {
++        *k_bytes = (size_t) ggml_nelements(K) * sizeof(half);
++    }
++    if (need_v_scratch) {
++        *v_bytes = (size_t) ggml_nelements(V) * sizeof(half);
++    }
++}
++
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+diff --git a/ggml/src/ggml-cuda/fattn.cuh b/ggml/src/ggml-cuda/fattn.cuh
+index 78705d599..5f302594f 100644
+--- a/ggml/src/ggml-cuda/fattn.cuh
++++ b/ggml/src/ggml-cuda/fattn.cuh
+@@ -3,3 +3,14 @@
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
++
++// V2 sizing helper (RSH-20260523-001 §2). Read-only over the cgraph node: must
++// not mutate node_props, warmup_complete, or any graph state. Implementation in
++// fattn.cu so it can call the file-local ggml_cuda_get_best_fattn_kernel.
++// Returns the K/V f16 dequant scratch needs (bytes) for the FA node `dst` on
++// `device`. Both outputs are zero when the kernel does not need that side's
++// scratch (e.g. native f16 tensor, V is a view of K, BEST_FATTN_KERNEL_NONE).
++// The shared ggml_cuda_fattn_V_is_K_view predicate lives in common.cuh so both
++// this helper and launch_fattn() pull from one source.
++void ggml_cuda_flash_attn_ext_f16_scratch_size(
++    int device, const ggml_tensor * dst, size_t * k_bytes, size_t * v_bytes);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index bacfc3c34..7326fbe92 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -581,6 +581,75 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
++    // V2 (RSH-20260523-001 §6): explicit teardown sequence — do NOT rely on
++    // member declaration order. Pre-condition (enforced by libllama, see
++    // destructor comment in common.cuh): no other host thread is inside
++    // graph_compute() or graph_optimize() on this context, so fattn_compute_mu
++    // is intentionally NOT acquired (would invert lock order against
++    // ggml_cuda_lock held above).
++
++#ifdef USE_CUDA_GRAPH
++    // Step 2: destroy every cudaGraphExec_t / cudaGraph_t while no other thread
++    // is mid-capture (the counter wait above guarantees this). Without this
++    // explicit clear(), captured graphs would be destroyed AFTER fattn_scratch
++    // below by reverse-declaration-order destruction — too late.
++    cuda_graphs.clear();
++#endif // USE_CUDA_GRAPH
++
++    // Step 3: drain the retired-pointer list. Destructor is the only place a
++    // blocking sync on retired memory is permitted; poll first, fall back to
++    // cudaEventSynchronize for entries not yet signalled. cudaEventDestroy on
++    // each event after the entry's pointers are freed so handles do not leak.
++    // Runs unconditionally — fattn_scratch is used by FA regardless of
++    // USE_CUDA_GRAPH, so retired entries can exist in either build.
++    for (auto & entry : retired_fattn_allocs) {
++        for (cudaEvent_t e : entry.events) {
++            if (e == nullptr) {
++                continue;
++            }
++            cudaError_t qstat = cudaEventQuery(e);
++            if (qstat == cudaErrorNotReady) {
++                CUDA_CHECK(cudaEventSynchronize(e));
++            } else if (qstat != cudaSuccess) {
++                GGML_LOG_DEBUG("V2: cudaEventQuery on retired fattn event returned %s\n",
++                               cudaGetErrorString(qstat));
++            }
++        }
++        if (entry.k != nullptr) {
++            CUDA_CHECK(cudaFree(entry.k));
++        }
++        if (entry.v != nullptr) {
++            CUDA_CHECK(cudaFree(entry.v));
++        }
++        for (cudaEvent_t e : entry.events) {
++            if (e != nullptr) {
++                CUDA_CHECK(cudaEventDestroy(e));
++            }
++        }
++    }
++    retired_fattn_allocs.clear();
++
++    // Step 4: cudaFree the live fattn_scratch[][] K/V pointers; reset capacities.
++    // Per-slot first-use events are destroyed here too. Unconditional.
++    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
++        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
++            if (fattn_scratch[i][j].k != nullptr) {
++                CUDA_CHECK(cudaFree(fattn_scratch[i][j].k));
++                fattn_scratch[i][j].k = nullptr;
++                fattn_scratch[i][j].k_capacity = 0;
++            }
++            if (fattn_scratch[i][j].v != nullptr) {
++                CUDA_CHECK(cudaFree(fattn_scratch[i][j].v));
++                fattn_scratch[i][j].v = nullptr;
++                fattn_scratch[i][j].v_capacity = 0;
++            }
++            if (fattn_stream_first_use_event[i][j] != nullptr) {
++                CUDA_CHECK(cudaEventDestroy(fattn_stream_first_use_event[i][j]));
++                fattn_stream_first_use_event[i][j] = nullptr;
++            }
++        }
++    }
++
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
+@@ -596,6 +665,474 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     }
+ }
+ 
++// V2 retired-list reclaim (RSH-20260523-001 §3 step 1, §6).
++// Called by graph_compute at the start of every compute window with
++// fattn_compute_mu held. Polls cudaEventQuery on each retired entry's event set
++// AND on the per-slot first-use events for slots created after retire; reclaims
++// any entry whose event set has fully signalled. Never blocks under the lock
++// except at the threshold-recovery path (§3 step 1 path (a)).
++// Bootstrap regression threshold = 4 entries (see RSH; retune on validation).
++static constexpr size_t GGML_V2_RETIRED_FATTN_THRESHOLD = 4;
++
++static void ggml_cuda_v2_drain_retired_fattn(ggml_backend_cuda_context * ctx) {
++    auto entry_ready = [ctx](const retired_fattn_alloc & entry) -> bool {
++        for (cudaEvent_t e : entry.events) {
++            if (e == nullptr) {
++                continue;
++            }
++            cudaError_t qstat = cudaEventQuery(e);
++            if (qstat == cudaErrorNotReady) {
++                return false;
++            }
++            if (qstat != cudaSuccess) {
++                GGML_LOG_DEBUG("V2: cudaEventQuery on retired fattn event returned %s\n",
++                               cudaGetErrorString(qstat));
++                return false;
++            }
++        }
++        // Also poll any first-use event for a slot created after retire.
++        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
++            if (entry.populated_slots_at_retire[s]) {
++                continue;
++            }
++            cudaEvent_t fue = ctx->fattn_stream_first_use_event[entry.device][s];
++            if (fue == nullptr) {
++                continue;
++            }
++            cudaError_t qstat = cudaEventQuery(fue);
++            if (qstat == cudaErrorNotReady) {
++                return false;
++            }
++            if (qstat != cudaSuccess) {
++                GGML_LOG_DEBUG("V2: cudaEventQuery on first-use event returned %s\n",
++                               cudaGetErrorString(qstat));
++                return false;
++            }
++        }
++        return true;
++    };
++
++    auto reclaim = [](retired_fattn_alloc & entry) {
++        if (entry.k != nullptr) {
++            cudaError_t s = cudaFree(entry.k);
++            if (s != cudaSuccess) {
++                GGML_LOG_DEBUG("V2: cudaFree(retired K) returned %s\n", cudaGetErrorString(s));
++            }
++            entry.k = nullptr;
++        }
++        if (entry.v != nullptr) {
++            cudaError_t s = cudaFree(entry.v);
++            if (s != cudaSuccess) {
++                GGML_LOG_DEBUG("V2: cudaFree(retired V) returned %s\n", cudaGetErrorString(s));
++            }
++            entry.v = nullptr;
++        }
++        for (cudaEvent_t e : entry.events) {
++            if (e != nullptr) {
++                cudaError_t s = cudaEventDestroy(e);
++                if (s != cudaSuccess) {
++                    GGML_LOG_DEBUG("V2: cudaEventDestroy(retired event) returned %s\n",
++                                   cudaGetErrorString(s));
++                }
++            }
++        }
++        entry.events.clear();
++    };
++
++    // First pass: opportunistic poll-based drain.
++    for (auto it = ctx->retired_fattn_allocs.begin(); it != ctx->retired_fattn_allocs.end();) {
++        if (entry_ready(*it)) {
++            reclaim(*it);
++            it = ctx->retired_fattn_allocs.erase(it);
++        } else {
++            ++it;
++        }
++    }
++
++    if (ctx->retired_fattn_allocs.size() <= GGML_V2_RETIRED_FATTN_THRESHOLD) {
++        return;
++    }
++
++    // §3 step 1 path (a): regression-class signal + per-slot blocking sync.
++    // We are inside fattn_compute_mu but cudaStreamSynchronize is allowed on
++    // populated slots (it is NOT cudaDeviceSynchronize, which is reserved for
++    // the destructor). Avoids calling ctx->stream(...) which would lazily
++    // create empty slots inside the lock window.
++    GGML_LOG_WARN("V2: retired fattn list = %zu entries (threshold %zu); forcing per-stream sync\n",
++                  ctx->retired_fattn_allocs.size(), GGML_V2_RETIRED_FATTN_THRESHOLD);
++
++    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
++        cudaStream_t stream = ctx->streams[ctx->device][s];
++        if (stream == nullptr) {
++            continue;
++        }
++        cudaError_t sstat = cudaStreamSynchronize(stream);
++        if (sstat != cudaSuccess) {
++            GGML_LOG_DEBUG("V2: cudaStreamSynchronize during retired drain returned %s\n",
++                           cudaGetErrorString(sstat));
++        }
++    }
++
++    // Re-drain. After per-stream sync everything queued before this point
++    // has completed, so all events for entries on this device should signal.
++    for (auto it = ctx->retired_fattn_allocs.begin(); it != ctx->retired_fattn_allocs.end();) {
++        if (entry_ready(*it)) {
++            reclaim(*it);
++            it = ctx->retired_fattn_allocs.erase(it);
++        } else {
++            ++it;
++        }
++    }
++}
++
++// V2 debug failure injection (RSH-20260523-001 §Validation Requirements).
++// Env GGML_DEBUG_FORCE_FA_SCRATCH_FAIL=1 causes the next reserve/grow to
++// return cudaErrorMemoryAllocation. Single-shot via atomic compare-exchange so
++// each set of the env produces exactly one forced failure. Tests poll the env
++// before each attempt by re-reading getenv each time the gate fires.
++static bool ggml_cuda_v2_consume_fa_scratch_failure_injection() {
++#ifdef NDEBUG
++    return false;
++#else
++    const char * env = getenv("GGML_DEBUG_FORCE_FA_SCRATCH_FAIL");
++    if (env == nullptr || atoi(env) != 1) {
++        return false;
++    }
++    static std::atomic<int> consumed_count{0};
++    int prev = consumed_count.fetch_add(1, std::memory_order_relaxed);
++    // Re-arm semantics: this returns true once per process unless the test
++    // harness explicitly resets `GGML_DEBUG_FORCE_FA_SCRATCH_FAIL_GEN` between
++    // calls (read via the gen helper below) to drive cases (a), (b), (c) from
++    // the RSH validation matrix.
++    const char * gen_env = getenv("GGML_DEBUG_FORCE_FA_SCRATCH_FAIL_GEN");
++    int gen_target = gen_env != nullptr ? atoi(gen_env) : 0;
++    return prev <= gen_target;
++#endif
++}
++
++// V2 §7 side-effect-free stream-slot predictor (RSH-20260523-001).
++// Parallel implementation of the live state machine in
++// ggml_cuda_graph_evaluate_and_capture (try_launch_concurrent_event closure
++// plus the in_concurrent_event branch of the per-node loop). MUST NOT call
++// cudaEventRecord, cudaStreamWaitEvent, concurrent_events.clear(), nor
++// mutate curr_stream_no on the cuda_ctx — all of those have side effects on
++// the live path that would corrupt subsequent compute.
++//
++// Returns the predicted execution stream slot for the FA node at `fa_node_idx`
++// in cgraph. Production (no concurrent_events populated, OR
++// should_launch_concurrent_events == false) deterministically returns 0, which
++// matches the live path's behavior of clearing concurrent_events at
++// evaluate_and_capture entry and running everything on the main stream.
++//
++// Approximation: this walker does not replicate the live path's fusion-skip
++// logic (i - prev_i > 1 → try_launch on prev_node). Fusion does not directly
++// involve FA nodes; the affected case is when a concurrent event fires on a
++// non-immediately-previous node. The debug assert at the FA enqueue site
++// inside evaluate_and_capture, under fattn_compute_mu, catches any drift
++// before stale scratch is captured into a graph.
++static int ggml_cuda_v2_predict_fa_slot(
++    ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int fa_node_idx) {
++
++    const ggml_cuda_stream_context & stream_ctx = ctx->concurrent_stream_context;
++    if (stream_ctx.concurrent_events.empty()) {
++        return 0;
++    }
++
++    bool should_launch = true;
++    for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
++        if (!event.is_valid()) {
++            should_launch = false;
++            break;
++        }
++    }
++    if (!should_launch) {
++        // Live path clears concurrent_events for this compute window;
++        // every FA node executes on slot 0.
++        return 0;
++    }
++
++    int  predicted_slot = 0;
++    bool active = false;
++    const ggml_cuda_concurrent_event * cur = nullptr;
++
++    for (int i = 0; i <= fa_node_idx; ++i) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if (node == nullptr) {
++            continue;
++        }
++        if (active) {
++            if (node == cur->join_node) {
++                predicted_slot = 0;
++                active = false;
++                cur = nullptr;
++            } else {
++                auto it = cur->stream_mapping.find(node);
++                if (it != cur->stream_mapping.end()) {
++                    predicted_slot = it->second;
++                }
++                // else: keep previous slot (matches live path which would
++                // also keep curr_stream_no when the node isn't in the map).
++            }
++        } else {
++            auto it = stream_ctx.concurrent_events.find(node);
++            if (it != stream_ctx.concurrent_events.end()) {
++                cur = &it->second;
++                active = true;
++                // Live path: try_launch_concurrent_event records the fork
++                // event on slot 0 (= predicted_slot). The launched node itself
++                // executes on slot mapping[node] if it's in the map; otherwise
++                // it remains the fork node on slot 0.
++                auto m = cur->stream_mapping.find(node);
++                if (m != cur->stream_mapping.end()) {
++                    predicted_slot = m->second;
++                }
++            }
++        }
++    }
++    return predicted_slot;
++}
++
++// V2 §3 steps 2-5 (RSH-20260523-001): preflight FA scratch reservation for the
++// upcoming compute window. Called by graph_compute with fattn_compute_mu held.
++//
++// Step 2: sweep cgraph for OP_FLASH_ATTN_EXT nodes; per-node call the §2
++// sizing helper to get K/V byte needs.
++// Step 3: predict the execution stream slot for each FA node (V2-5 §7 will
++// implement the live predictor; for now all FA nodes are predicted to slot 0,
++// which is correct in production: Atomic graph optimization early-exits unless
++// `ggml_backend_cuda_get_device_count() == 1`, and on the dual-GPU Grimoire
++// host that branch never fires; CUDA_VISIBLE_DEVICES single-GPU tests will
++// exercise the nonzero-stream code path once §7 lands).
++// Step 4: reserve or grow fattn_scratch[device][slot] using raw cudaError_t.
++// Step 5: on growth, invalidate every cuda_graphs entry whose
++// fa_borrowed_streams contains the grown slot, and move the old pointer to
++// the retired list with events recorded on every populated launch stream.
++//
++// Returns true on success; false on allocation failure (caller returns
++// GGML_STATUS_ALLOC_FAILED without entering the existing decision/capture/
++// launch block, without advancing node_props, without changing warmup state,
++// and without leaving partial state).
++static bool ggml_cuda_v2_preflight_fa_scratch(
++    ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph) {
++
++    if (cgraph == nullptr) {
++        return true;
++    }
++
++    // Step 2 + 3: read-only sweep, build per-slot byte needs.
++    size_t need_k[GGML_CUDA_MAX_STREAMS] = {0};
++    size_t need_v[GGML_CUDA_MAX_STREAMS] = {0};
++
++    bool any_fa = false;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        const ggml_tensor * node = cgraph->nodes[i];
++        if (node == nullptr || node->op != GGML_OP_FLASH_ATTN_EXT) {
++            continue;
++        }
++        size_t k_bytes = 0, v_bytes = 0;
++        ggml_cuda_flash_attn_ext_f16_scratch_size(ctx->device, node, &k_bytes, &v_bytes);
++        if (k_bytes == 0 && v_bytes == 0) {
++            continue;
++        }
++        any_fa = true;
++        const int slot = ggml_cuda_v2_predict_fa_slot(ctx, cgraph, i);
++        if (slot < 0 || slot >= GGML_CUDA_MAX_STREAMS) {
++            GGML_LOG_ERROR("V2: stream-slot predictor returned out-of-range slot %d for FA node %d\n", slot, i);
++            return false;
++        }
++        if (k_bytes > need_k[slot]) need_k[slot] = k_bytes;
++        if (v_bytes > need_v[slot]) need_v[slot] = v_bytes;
++    }
++
++    if (!any_fa) {
++        return true;
++    }
++
++    // Step 4 + 5: reserve/grow per slot.
++    const int d = ctx->device;
++    for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
++        if (need_k[s] == 0 && need_v[s] == 0) {
++            continue;
++        }
++
++        fattn_scratch_slot & slot = ctx->fattn_scratch[d][s];
++        const bool grow_k = need_k[s] > slot.k_capacity;
++        const bool grow_v = need_v[s] > slot.v_capacity;
++        if (!grow_k && !grow_v) {
++            continue;
++        }
++
++        // Assert no active capture on this slot — guards against a future
++        // edit that moves reservation below cudaStreamBeginCapture in the
++        // same function. The §8 lock already prevents cross-thread interference.
++        if (ctx->streams[d][s] != nullptr) {
++            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
++            cudaError_t cs = cudaStreamIsCapturing(ctx->streams[d][s], &cap_status);
++            if (cs == cudaSuccess && cap_status == cudaStreamCaptureStatusActive) {
++                GGML_LOG_ERROR("V2: stream %d on device %d is mid-capture at reservation site\n",
++                               s, d);
++                return false;
++            }
++        }
++
++        // Step 4: allocate new pointers (raw cudaError_t; preserve old on failure).
++        half * new_k = nullptr;
++        half * new_v = nullptr;
++        const size_t new_k_cap = grow_k ? need_k[s] : slot.k_capacity;
++        const size_t new_v_cap = grow_v ? need_v[s] : slot.v_capacity;
++
++        if (ggml_cuda_v2_consume_fa_scratch_failure_injection()) {
++            GGML_LOG_WARN("V2: failure injection: forcing fa-scratch reserve to fail (device %d slot %d)\n", d, s);
++            return false;
++        }
++
++        if (grow_k) {
++            cudaError_t status = cudaMalloc(reinterpret_cast<void **>(&new_k), new_k_cap);
++            if (status != cudaSuccess) {
++                GGML_LOG_ERROR("V2: cudaMalloc(K f16 scratch, %zu bytes) failed: %s\n",
++                               new_k_cap, cudaGetErrorString(status));
++                return false;
++            }
++        }
++        if (grow_v) {
++            cudaError_t status = cudaMalloc(reinterpret_cast<void **>(&new_v), new_v_cap);
++            if (status != cudaSuccess) {
++                GGML_LOG_ERROR("V2: cudaMalloc(V f16 scratch, %zu bytes) failed: %s\n",
++                               new_v_cap, cudaGetErrorString(status));
++                if (new_k != nullptr) {
++                    // Clean up the partial K-only allocation.
++                    cudaError_t fs = cudaFree(new_k);
++                    if (fs != cudaSuccess) {
++                        GGML_LOG_DEBUG("V2: cudaFree(partial K) returned %s\n", cudaGetErrorString(fs));
++                    }
++                }
++                return false;
++            }
++        }
++
++        // Step 5: prepare retired entry for the OLD pointers before swapping.
++        retired_fattn_alloc retired;
++        retired.device = d;
++        retired.stream_no = s;
++        if (grow_k) retired.k = slot.k;
++        if (grow_v) retired.v = slot.v;
++
++        // Snapshot which slots are populated NOW so step-1 drain knows which
++        // slots came into existence after retire (those need first-use events).
++        for (int s2 = 0; s2 < GGML_CUDA_MAX_STREAMS; ++s2) {
++            retired.populated_slots_at_retire[s2] = (ctx->streams[d][s2] != nullptr);
++        }
++
++        // Record one event on every populated launch stream for device d.
++        // cudaGraphLaunch enqueues through the launch stream (cuda_ctx->stream()
++        // at the call site), not the capture-time slot — a single event on
++        // slot s would miss past replays launched on slot 0 or other slots.
++        bool retire_event_ok = true;
++        for (int s2 = 0; s2 < GGML_CUDA_MAX_STREAMS; ++s2) {
++            if (!retired.populated_slots_at_retire[s2]) {
++                continue;
++            }
++            cudaEvent_t ev = nullptr;
++            cudaError_t status = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
++            if (status != cudaSuccess) {
++                GGML_LOG_ERROR("V2: cudaEventCreateWithFlags failed: %s\n", cudaGetErrorString(status));
++                retire_event_ok = false;
++                break;
++            }
++            status = cudaEventRecord(ev, ctx->streams[d][s2]);
++            if (status != cudaSuccess) {
++                GGML_LOG_ERROR("V2: cudaEventRecord on slot %d failed: %s\n", s2, cudaGetErrorString(status));
++                cudaError_t ds = cudaEventDestroy(ev);
++                if (ds != cudaSuccess) {
++                    GGML_LOG_DEBUG("V2: cudaEventDestroy(unrecorded ev) returned %s\n", cudaGetErrorString(ds));
++                }
++                retire_event_ok = false;
++                break;
++            }
++            retired.events.push_back(ev);
++        }
++
++        if (!retire_event_ok) {
++            // Roll back: destroy any events we managed to record, free the
++            // new allocations, leave old pointers intact, propagate failure.
++            for (cudaEvent_t ev : retired.events) {
++                cudaError_t s2 = cudaEventDestroy(ev);
++                if (s2 != cudaSuccess) {
++                    GGML_LOG_DEBUG("V2: cudaEventDestroy(rollback) returned %s\n", cudaGetErrorString(s2));
++                }
++            }
++            if (grow_k && new_k != nullptr) {
++                cudaError_t fs = cudaFree(new_k);
++                if (fs != cudaSuccess) GGML_LOG_DEBUG("V2: cudaFree(rollback K) returned %s\n", cudaGetErrorString(fs));
++            }
++            if (grow_v && new_v != nullptr) {
++                cudaError_t fs = cudaFree(new_v);
++                if (fs != cudaSuccess) GGML_LOG_DEBUG("V2: cudaFree(rollback V) returned %s\n", cudaGetErrorString(fs));
++            }
++            return false;
++        }
++
++        // Swap in the new pointers. Old pointers move into `retired` (already done).
++        if (grow_k) {
++            slot.k = new_k;
++            slot.k_capacity = new_k_cap;
++        }
++        if (grow_v) {
++            slot.v = new_v;
++            slot.v_capacity = new_v_cap;
++        }
++
++#ifdef USE_CUDA_GRAPH
++        // Step 5 (continued): invalidate every cuda_graphs entry whose
++        // fa_borrowed_streams contains slot s. Use raw cudaError_t — a single
++        // bad entry must not abort iteration mid-map.
++        for (auto & [key, gp] : ctx->cuda_graphs) {
++            if (gp == nullptr || gp->fa_borrowed_streams.count(s) == 0) {
++                continue;
++            }
++            if (gp->instance != nullptr) {
++                cudaError_t st = cudaGraphExecDestroy(gp->instance);
++                if (st != cudaSuccess) {
++                    GGML_LOG_DEBUG("V2: cudaGraphExecDestroy in step 5 returned %s\n", cudaGetErrorString(st));
++                }
++                gp->instance = nullptr;
++            }
++            if (gp->graph != nullptr) {
++                cudaError_t st = cudaGraphDestroy(gp->graph);
++                if (st != cudaSuccess) {
++                    GGML_LOG_DEBUG("V2: cudaGraphDestroy in step 5 returned %s\n", cudaGetErrorString(st));
++                }
++                gp->graph = nullptr;
++            }
++            // Defensive: reset warmup_complete so the entry re-enters warmup
++            // even if a future edit to the existing :4252-equivalent block
++            // gates recapture on properties_changed instead of instance-null.
++            gp->warmup_complete = false;
++            gp->fa_borrowed_streams.clear();
++            // node_props is intentionally not cleared — preserving it costs
++            // nothing and avoids re-running property detection.
++        }
++#endif // USE_CUDA_GRAPH
++
++        // Move retire into the list (only if the old pointer was non-null;
++        // first-time allocation has nothing to retire).
++        if (retired.k != nullptr || retired.v != nullptr) {
++            ctx->retired_fattn_allocs.push_back(std::move(retired));
++        } else {
++            // First-time allocation: events recorded but no pointers to free.
++            // Destroy the events now to keep handles balanced.
++            for (cudaEvent_t ev : retired.events) {
++                cudaError_t s2 = cudaEventDestroy(ev);
++                if (s2 != cudaSuccess) {
++                    GGML_LOG_DEBUG("V2: cudaEventDestroy(first-alloc) returned %s\n", cudaGetErrorString(s2));
++                }
++            }
++        }
++    }
++
++    return true;
++}
++
+ 
+ // cuda buffer
+ 
+@@ -4217,6 +4754,51 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    // V2 §8 (RSH-20260523-001): serialize the entire FA-touching window of one
++    // graph_compute() call. Lock order: fattn_compute_mu BEFORE ggml_cuda_lock.
++    // Held across retired-list drain, sizing, reservation, growth, §3 step 5
++    // traversal, cuda_graphs mutations, existing decision block, BeginCapture/
++    // EndCapture, Instantiate, ExecUpdate, and cudaGraphLaunch (the launch
++    // happens inside evaluate_and_capture, which we call below).
++    std::lock_guard<std::mutex> fattn_lock(cuda_ctx->fattn_compute_mu);
++
++    // V2 §3 step 0: normalize curr_stream_no. The field persists across calls;
++    // the live join-reset inside evaluate_and_capture returns it to 0 under
++    // normal flow. Defensive against future refactors that introduce a softer
++    // error path leaving it nonzero.
++    cuda_ctx->curr_stream_no = 0;
++
++    // V2 §3 step 1: opportunistic retired-list drain (poll-only by default;
++    // path (a) per-stream sync kicks in above GGML_V2_RETIRED_FATTN_THRESHOLD).
++    ggml_cuda_v2_drain_retired_fattn(cuda_ctx);
++
++    // V2 §3 steps 2-5: sweep cgraph, reserve/grow scratch, invalidate stale
++    // captured graph executables on growth.
++    if (!ggml_cuda_v2_preflight_fa_scratch(cuda_ctx, cgraph)) {
++        // V2 §3 step 6: recoverable failure. No node_props advance, no
++        // warmup-state change, no entry into the existing decision/capture
++        // /launch block, no partial K-only allocation left behind. The
++        // current graph entry's fa_borrowed_streams is intentionally NOT
++        // touched — its state still corresponds to the previous successful
++        // capture's instance which has not been invalidated.
++        return GGML_STATUS_ALLOC_FAILED;
++    }
++
++#ifdef USE_CUDA_GRAPH
++    // V2 §4: RAII guard at graph_compute scope that unconditionally clears
++    // active_capture_graph on exit (idempotent on a nullptr state). The
++    // pointer itself is set further below, immediately after BeginCapture.
++    struct active_capture_guard {
++        ggml_cuda_graph ** target;
++        ~active_capture_guard() {
++            if (target != nullptr) {
++                *target = nullptr;
++            }
++        }
++    };
++    active_capture_guard cap_guard{&cuda_ctx->active_capture_graph};
++#endif
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+@@ -4264,6 +4846,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+         }
+ 
+         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
++
++#ifdef USE_CUDA_GRAPH
++        // V2 §4: publish the current graph entry to the borrower. Capture is
++        // now active for `graph`; launch_fattn() in this window will record
++        // its borrowed stream slot into graph->fa_borrowed_streams. Cleared
++        // by cap_guard's dtor on function exit.
++        cuda_ctx->active_capture_graph = graph;
++#endif
+     }
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+@@ -4299,6 +4889,15 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
++    // V2 §8 (RSH-20260523-001): serialize the cuda_graphs map mutation that
++    // happens via ggml_cuda_graph_set_enabled → cuda_ctx->cuda_graph(key)
++    // against the MTP worker thread's concurrent graph_compute on the same
++    // cuda_ctx. Acquired regardless of the GGML_CUDA_GRAPH_OPT env gate
++    // because the insert into cuda_graphs runs before the env check below.
++    // The lock window in graph_optimize is brief (no compute) and does not
++    // measurably affect throughput.
++    std::lock_guard<std::mutex> fattn_lock(cuda_ctx->fattn_compute_mu);
++
+ #ifdef USE_CUDA_GRAPH
+     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);

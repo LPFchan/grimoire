@@ -1,0 +1,49 @@
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 861d844..a380837 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1297,32 +1297,26 @@ void launch_fattn(
+     const int cc  = ggml_cuda_info().devices[id].cc;
+     const int nsm = ggml_cuda_info().devices[id].nsm;
+ 
+-#ifdef GGML_USE_HIP
+-    // HIP/ROCm: bypass the memory pool for f16 temp buffers.
+-    // The legacy pool (ggml_cuda_pool_leg) retains peak-sized allocations permanently.
+-    // For quantized KV dequant, this means the f16 temp buffer stays allocated,
+-    // consuming more VRAM than the quantized KV compression saves — causing OOM.
+-    // Using raw alloc+free ensures the memory is released after the kernel completes.
+-    struct hip_f16_alloc {
++    // Bypass the ggml CUDA pool for f16 FA dequant temp buffers. With quantized
++    // KV cache, these buffers scale with context length and otherwise make the
++    // VMM pool retain peak flash-attention scratch memory for the process.
++    // The grimoire build disables CUDA graphs, so raw alloc/free is not captured.
++    struct fa_f16_alloc {
+         half * ptr = nullptr;
+         cudaStream_t stream;
+-        hip_f16_alloc(cudaStream_t s) : stream(s) {}
+-        ~hip_f16_alloc() {
++        fa_f16_alloc(cudaStream_t s) : stream(s) {}
++        ~fa_f16_alloc() {
+             if (ptr) {
+-                cudaStreamSynchronize(stream);
+-                cudaFree(ptr);
++                CUDA_CHECK(cudaStreamSynchronize(stream));
++                CUDA_CHECK(cudaFree(ptr));
+             }
+         }
+         void alloc(size_t nelements) {
+-            CUDA_CHECK(cudaMalloc(&ptr, nelements * sizeof(half)));
++            CUDA_CHECK(cudaMalloc((void **) &ptr, nelements * sizeof(half)));
+         }
+     };
+-    hip_f16_alloc K_f16(main_stream);
+-    hip_f16_alloc V_f16(main_stream);
+-#else
+-    ggml_cuda_pool_alloc<half>   K_f16(pool);
+-    ggml_cuda_pool_alloc<half>   V_f16(pool);
+-#endif
++    fa_f16_alloc K_f16(main_stream);
++    fa_f16_alloc V_f16(main_stream);
+     ggml_cuda_pool_alloc<int>    KV_max(pool);
+     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);

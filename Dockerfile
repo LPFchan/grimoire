@@ -9,6 +9,9 @@ ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=0a635dcd92ba66c75fccfef91c3e106f4668f367
+ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
+ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
 ARG CACHE_BUST=10
 
@@ -41,9 +44,14 @@ RUN apt-get update \
 
 WORKDIR /app
 
+COPY patches/atomic-llama-cpp/ /app/patches/atomic-llama-cpp/
+
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
+ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
+ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch
 ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
@@ -83,11 +91,34 @@ fi; \
         echo "ERROR: cloned SHA $current_sha != pinned $GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
         exit 1; \
     fi; \
+    git -C /app/.cache/llama-cpp-src/repo reset --hard "$GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
+    git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
+    patch_path="/app/patches/atomic-llama-cpp/$GRIMOIRE_LLAMA_CPP_PATCH_FILE"; \
+    if [ ! -f "$patch_path" ]; then echo "ERROR: patch not found: $patch_path"; exit 1; fi; \
+    patch_hash=$(sha256sum "$patch_path"); \
+    build_config="sha=$GRIMOIRE_LLAMA_CPP_PINNED_SHA apply_patches=$GRIMOIRE_LLAMA_CPP_APPLY_PATCHES cuda_graphs=$GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS arch=$GRIMOIRE_CMAKE_CUDA_ARCHITECTURES patch=$patch_hash"; \
+    build_config_file=/app/.cache/llama-cpp-build/.atomic_build_config; \
+    old_build_config=""; \
+    if [ -f "$build_config_file" ]; then old_build_config=$(cat "$build_config_file"); fi; \
+    if [ "$old_build_config" != "$build_config" ]; then \
+        echo "Atomic build config changed, forcing rebuild"; \
+        rm -f /app/.cache/llama-cpp-build/.built; \
+    fi; \
+    echo "$build_config" > "$build_config_file"; \
+    case "$GRIMOIRE_LLAMA_CPP_APPLY_PATCHES" in \
+        1|true|TRUE|yes|YES) git -C /app/.cache/llama-cpp-src/repo apply "$patch_path" ;; \
+        0|false|FALSE|no|NO) echo "Skipping Atomic patches" ;; \
+        *) echo "ERROR: GRIMOIRE_LLAMA_CPP_APPLY_PATCHES must be true or false"; exit 1 ;; \
+    esac; \
+    if [ ! -x /opt/grimoire-llama-cpp/bin/llama-server ]; then \
+        rm -f /app/.cache/llama-cpp-build/.built; \
+    fi; \
     if [ ! -f /app/.cache/llama-cpp-build/.built ]; then \
         rm -f /app/.cache/llama-cpp-build/CMakeCache.txt; \
         cmake -S /app/.cache/llama-cpp-src/repo -B /app/.cache/llama-cpp-build \
             -DGGML_CUDA=ON \
             -DGGML_CUDA_FA=ON \
+            -DGGML_CUDA_GRAPHS=${GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS} \
             -DGGML_NATIVE=OFF \
             -DGGML_BUILD_EXAMPLES=OFF \
             -DGGML_BUILD_TESTS=OFF \
