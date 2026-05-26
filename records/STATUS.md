@@ -1,8 +1,8 @@
 # Current Status
 
-**Snapshot:** 2026-05-25
-**Posture:** Bee migration complete — Atomic CUDA FA V2 implementation in flight
-**Focus:** Atomic CUDA FA V2 patch (RSH-20260523-001)
+**Snapshot:** 2026-05-26
+**Posture:** Bee migration complete — Atomic CUDA FA **V2+ON is the default for `grimoire:local`**
+**Focus:** rebuild + roll forward to V2+ON-served prod (Dockerfile defaults updated; next `docker compose up -d --build --force-recreate grimoire` flips it live)
 
 ## Migration Summary
 
@@ -10,22 +10,20 @@ Bee (`Anbeeld/beellama.cpp`) is the canonical engine. Single binary serves DFlas
 
 ## Atomic CUDA FA V2 Track
 
-Parallel A/B build target. The Dockerfile builds `AtomicBot-ai/atomic-llama-cpp-turboquant` pinned at `0a635dcd92ba66c75fccfef91c3e106f4668f367` for benchmark/canary runs alongside Bee.
+Patch chain in `patches/atomic-llama-cpp/`, applied in order by `Dockerfile`:
 
-| Layer | Current state |
-| --- | --- |
-| V1 patch (production) | `patches/atomic-llama-cpp/0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch` — raw `cudaMalloc`/`cudaFree` of K_f16/V_f16 inside `launch_fattn()`. Requires `GGML_CUDA_GRAPHS=OFF` (capture-time alloc/sync is unsafe). |
-| V2 plan | `records/research/RSH-20260523-001-cuda-vmm-pool-oom-agentic-crash.md` §Patch V2 Authoritative Plan — iteration 15 converged 2026-05-25. Eight binding requirements (scratch owner, sizing helper, pre-execution reservation, borrower, recoverable failure, retired-pointer reclaim, stream predictor, `fattn_compute_mu`). Graph-safe, allows graphs ON. |
-| V2 implementation | First-pass complete 2026-05-25 (Opus 4.7). Source edits at `/mnt/MX500/grimoire-ab/atomic-src` against pinned SHA. Generated patch: `patches/atomic-llama-cpp/0002-cuda-fa-v2-scratch-owner.patch` (~830 lines across 5 files). Built and smoke-validated. |
-| V2 build | `Dockerfile` now takes `GRIMOIRE_LLAMA_CPP_PATCH_FILE` build-arg (defaults to V1 filename). `grimoire:ab-v2-graphs-on` image built with `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON`; library reports `USE_GRAPHS = 1`; `strings libggml-cuda.so` shows V2 markers; V1's `ggml_cuda_pool_alloc<__half>` is gone. |
-| V2 smoke | Ran on GPU 1 alongside V1 prod (which kept serving on GPU 0). Three back-to-back agentic two-turn repros at the original crash scenario (qwen3.6-mtp-27B, ctx=180k, 22,081-char tool-result injection): all three `ok=true` with `[DONE]`, NextN draft acceptance 67–91 %, no `cudaError` / no `cuMem` / no `abort`. **Subsequent matrix on GPU 0 at 210k+999** (the May 24 crash env) showed V2 converts the abort into HTTP 500 — but V0+OFF *also* serves that workload, and V2 does not. V2 is a safety upgrade over V0, not a memory upgrade. See V3 proposal for the path forward. |
+| Default-served | File | Concern |
+| --- | --- | --- |
+| ✓ | `0002-cuda-fa-v2-scratch-owner.patch` | V2 graph-safe FA scratch owner with recoverable failure |
+| ✓ | `0004-pool-flush-on-oom.patch` | Legacy pool flush-and-retry on OOM (backport of upstream PR #22155) |
+|  | `0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch` | V1, rollback only |
+|  | `0003-cuda-fa-view_src-sizing.patch` | view_src sizing (closed upstream PR #23620), kept for slow-VRAM-creep regime if it appears |
+
+`GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON` is the Dockerfile default. The trail of investigation and the decision rationale are in `records/research/RSH-20260523-001`, `RSH-20260526-001` (validation matrix), `RSH-20260526-002` (V3 design, deferred), and `RSH-20260526-003` (V2+ON shipping decision with the bench data and upstream survey).
 
 ## Recent Changes
 
-- 2026-05-26: **V2 matrix complete + boundary case + honest revision.** Ran four matrix passes on this rig (180k+63 on GPU 1; 170k+999, 999/210k on GPU 1; **210k+999 on GPU 0 with V1 prod stopped — the May 24 crash environment**). Findings: **(1)** V1+ON deterministically crashes with `operation not permitted when stream is capturing` at every config. **(2)** V0+ON reproduces the exact RSH-20260523-001 crash at 210k+999+GPU-0 (`launch_fattn → ggml_cuda_pool_vmm::alloc → cuMemCreate → ggml_abort` → HTTP 502, server dies). **(3)** V2 converts that abort into `GGML_STATUS_ALLOC_FAILED` → HTTP 500 → server keeps serving. **(4)** **V2 does NOT make the workload fit** at the boundary — V0+OFF succeeds at the same 210k+999+GPU-0 case where V2 fails gracefully (V2's persistent FA scratch reservation steals VRAM from non-FA ops between FA calls; V0+OFF's transient pool allocation lets the pool rotate among non-FA ops). **(5)** The "V2 is 5-10× faster than V1+OFF" claim from earlier is wrong and retracted — it was a CPU-offload artifact at n-gpu-layers=63; at 999 V1+OFF and V2 are in the same throughput band when both succeed. **(6)** The GPU 0 vs GPU 1 reproducibility delta is a 34 MiB VBIOS-reserved difference between two "identical" 3090 SKUs (94.02.26.C0.34 vs 94.02.59.00.42). Full results + revised verdict: `records/research/RSH-20260526-001-v2-matrix-single-gpu.md`. V3 design proposal (adaptive scratch lifetime — transient on direct-execute, persistent only during capture): `records/research/RSH-20260526-002-v3-adaptive-fa-scratch.md`. (RSH-20260523-001, RSH-20260526-001, RSH-20260526-002)
-- 2026-05-25: **Atomic V2 smoke green** — `grimoire:ab-v2-graphs-on` image built (`USE_GRAPHS = 1`), brought up on GPU 1 alongside V1 prod, ran three agentic two-turn repros at qwen3.6-mtp-27B ctx=180k with 22,081-char tool-result injection. All three returned `ok=true` with `[DONE]`, NextN draft acceptance 67–91 %, no V2-injected errors. The exact scenario that crashes V1 under graphs-OFF (`launch_fattn` pool VMM OOM on second-turn FA scratch growth) now runs cleanly under graphs-ON. (RSH-20260523-001 — load-bearing case)
-- 2026-05-25: **Atomic V2 first-pass landed** — `patches/atomic-llama-cpp/0002-cuda-fa-v2-scratch-owner.patch` generated (~830 lines). Adds per-context FA scratch owner with stable K/V pointers (`fattn_scratch[d][s]`), `fattn_compute_mu` mutex with documented lock-order vs `ggml_cuda_lock`, retired-pointer reclaim with per-slot first-use events to close the lazy-stream race, growth-time `cuda_graphs` invalidation via `fa_borrowed_streams` per graph entry, side-effect-free stream-slot predictor, recoverable `GGML_STATUS_ALLOC_FAILED` propagation, dispatch-accurate sizing helper that calls `ggml_cuda_get_best_fattn_kernel`, shared `V_is_K_view` predicate, RAII guard for `active_capture_graph`, explicit destructor teardown sequence under `#ifdef USE_CUDA_GRAPH`, env-gated debug failure-injection hook, and a non-owning borrower in `launch_fattn()`. **Unwired** — V1 patch remains served until the validation matrix in the RSH is green. Predictor-drift assert inside `evaluate_and_capture` deferred to post-build iteration (the borrower's debug `capacity >= request` assert covers the practical case). (RSH-20260523-001)
-- 2026-05-25: **Atomic V2 implementation started** — RSH-20260523-001 V2 plan converged at iteration 15. Implementation broken into six phases (foundational data + lock, sizing helper, destructor + retired drain, compute path + borrower, stream predictor, debug instrumentation). V1 patch remains the served Atomic build until V2 patch is generated and validated. (RSH-20260523-001)
+- 2026-05-26: **Prod Dockerfile default flipped to V2+ON + 0004** (RSH-20260526-003). Pending: rebuild + recreate `grimoire:local` container.
 
 
 - 2026-05-18: **DFlash MAX_VERIFY_TOKENS cap fixed** — `LLAMA_DFLASH_MAX_VERIFY_TOKENS=25` was silently breaking DDTree tree-mode (3-5% acceptance). Patched with env-var `GGML_DFLASH_MAX_VERIFY_TOKENS` following existing `GGML_DFLASH_MAX_CTX` pattern. Default stays 25. Auto-derived in `model_manager.py` from n_max + branch_budget. (RSH-20260518-005, commit `2f6a345`)

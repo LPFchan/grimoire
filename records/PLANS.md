@@ -19,17 +19,9 @@ Phases (dependency order; each closes with a `LOG-*` commit):
 | V2-5 | Stream-slot predictor + `graph_optimize` lock | §7, §8 | `ggml-cuda.cu` |
 | V2-6 | Debug instrumentation: failure-injection hook, sizing-vs-actual drift assert, predictor drift assert | Validation Requirements | `common.cuh`, `fattn.cu`, `ggml-cuda.cu` |
 
-**Phases V2-1 through V2-6 complete 2026-05-25.** Patch lives at `patches/atomic-llama-cpp/0002-cuda-fa-v2-scratch-owner.patch`. Image `grimoire:ab-v2-graphs-on` built with `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON` and smoke-validated end-to-end at qwen3.6-mtp-27B ctx=180k with the original crash payload (three back-to-back agentic two-turn repros, 22,081-char tool result, all `ok=true`, NextN 67–91 % acceptance). Predictor-drift assert inside `evaluate_and_capture` deferred to follow-up.
+**Phases V2-1 through V2-6 complete 2026-05-25.** Shipped 2026-05-26 as the Dockerfile default for `grimoire:local` (stacked with `0004-pool-flush-on-oom.patch`). The shipping decision, bench data, upstream survey, and V2-era follow-ups all live in `records/research/RSH-20260526-003-v2-on-shipping-decision.md`. Live deployment pending a `docker compose up -d --build --force-recreate grimoire`.
 
-**Open follow-ups** (none are gating; load-bearing case is green):
-
-| Item | Notes |
-| --- | --- |
-| V2 graphs-OFF build + smoke | Confirms V2 also works when graphs are disabled. Single image build with `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF`. |
-| V0/V1 baseline rows in the matrix | The 8-row matrix in the RSH expects unpatched-on/off and V1-on baselines for throughput comparison. Today only V1-OFF (i.e. `grimoire:local`) is built. V0 (`APPLY_PATCHES=0`) and V1-ON would mainly reproduce the original crash. |
-| 210k-ctx row of the matrix | Won't fit single-GPU on the dual-3090 host; defer or run with `--n-cpu-moe` offload. |
-| Long-soak (≥ 1000 decode cycles), idle-after-growth, forced-failure-injection, F32 K/V VEC dispatch | Listed in the RSH §Validation Requirements as targeted cases. Not yet run. |
-| Flip prod (`grimoire:local`) to V2 | Requires building `grimoire:local` with `GRIMOIRE_LLAMA_CPP_PATCH_FILE=0002-...` and graphs ON, then `compose up -d --force-recreate`. Pending operator approval. |
+V3 (adaptive scratch lifetime + recoverable VMM pool + capture-failure self-heal) designed in `records/research/RSH-20260526-002-v3-adaptive-fa-scratch.md` and **deferred** per the RSH-20260526-003 verdict.
 
 ## Backlog (Future Interest)
 

@@ -1,0 +1,29 @@
+From: pikaxinge <upstream PR #23620>
+Origin: https://github.com/ggml-org/llama.cpp/pull/23620 (closed without merge — maintainer disagreement)
+Confirmed by: 5+ community testers on RTX 2080Ti / 3090 / 5090 / Vulkan against upstream issue #23446
+Local notes: shipped privately because upstream maintainer position is "VRAM growth with quantized KV is expected behavior" (am17an comment on #23446). We disagree and we maintain this. Two lines.
+
+The fix: size K_f16 / V_f16 dequant scratch by the view's *underlying* (view_src) buffer instead of the view itself. The view's ggml_nelements grows by 1 each decoded token (n_kv +1); the underlying buffer is fixed at the max-context-size budget. Allocating at the larger size means the pool reuses the same allocation on every call instead of allocating a fresh slightly-larger buffer each time. Eliminates the unbounded VMM pool growth that fires `cuMemCreate` inside `ggml_cuda_pool_vmm::alloc` on tight VRAM (the RSH-20260523-001 crash path).
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 861d844..f0e7c8b 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1341,7 +1341,7 @@ void launch_fattn(
+         const size_t bs = ggml_blck_size(K->type);
+         const size_t ts = ggml_type_size(K->type);
+
+-        K_f16.alloc(ggml_nelements(K));
++        K_f16.alloc(ggml_nelements(K->view_src ? K->view_src : K));
+         if (ggml_is_contiguously_allocated(K)) {
+             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+             to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+@@ -1374,7 +1374,7 @@ void launch_fattn(
+             const size_t bs = ggml_blck_size(V->type);
+             const size_t ts = ggml_type_size(V->type);
+
+-            V_f16.alloc(ggml_nelements(V));
++            V_f16.alloc(ggml_nelements(V->view_src ? V->view_src : V));
+             if (ggml_is_contiguously_allocated(V)) {
+                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                 to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);

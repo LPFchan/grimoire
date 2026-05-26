@@ -2,21 +2,39 @@
 
 Patches in this directory apply to `AtomicBot-ai/atomic-llama-cpp-turboquant` after the Docker build verifies `GRIMOIRE_LLAMA_CPP_PINNED_SHA` (`0a635dcd92ba66c75fccfef91c3e106f4668f367`).
 
-Keep each patch scoped to one runtime issue and update the patch if the pinned SHA changes.
+`GRIMOIRE_LLAMA_CPP_PATCH_FILE` is a **comma-separated list** of patch filenames in this directory, applied in order. Patch hashes are part of the build cache key.
 
-## Patches
+## Currently Served (`grimoire:local` default)
 
-| File | State | Scope | Notes |
-| --- | --- | --- | --- |
-| `0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch` | **served** | V1 fix: replaces the CUDA FA K/V f16 dequant pool allocation with raw `cudaMalloc`/`cudaFree`/`cudaStreamSynchronize` in `launch_fattn()`. Requires `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF` because alloc/free/sync inside a captured graph is unsafe. | Currently wired into `Dockerfile` and applied on every build. |
-| `0002-cuda-fa-v2-scratch-owner.patch` | **unwired** | V2 fix per `records/research/RSH-20260523-001-cuda-vmm-pool-oom-agentic-crash.md` §Patch V2 Authoritative Plan. Adds a per-context FA scratch owner with stable K/V pointers, `fattn_compute_mu` mutex, retired-pointer reclaim, `cuda_graphs` invalidation on growth, stream-slot predictor, recoverable allocation failure, and a debug failure-injection hook. Graph-safe — allows `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON`. | Conflicts with `0001` (both edit `launch_fattn`). Flip to V2 by editing `Dockerfile`: replace the `0001-...` filename with `0002-...`. Validation matrix lives in the RSH. |
+| File | Scope | Origin |
+| --- | --- | --- |
+| `0002-cuda-fa-v2-scratch-owner.patch` | V2 graph-safe FA scratch owner with recoverable failure | private, RSH-20260523-001 |
+| `0004-pool-flush-on-oom.patch` | Legacy pool flush-and-retry on `cudaErrorMemoryAllocation` (backport of upstream PR #22155) | `ggml-org/llama.cpp` PR #22155, merge commit `97895129e5f2bde94d13dc01ca41ee79e9b629f2` |
 
-## Flipping to V2
+Dockerfile default: `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON`.
 
-V2 supersedes V1. The two patches both edit `launch_fattn()` and cannot apply together — pick one.
+The decision to ship this chain with graphs ON is documented in `records/research/RSH-20260526-003-v2-on-shipping-decision.md`. Validation evidence is `RSH-20260526-001`. V3 design (deferred) is `RSH-20260526-002`.
 
-1. Edit `Dockerfile`: change `patches/atomic-llama-cpp/0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch` to `patches/atomic-llama-cpp/0002-cuda-fa-v2-scratch-owner.patch` in both the `sha256sum` and `git apply` commands.
-2. Set `GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON` in the same file once V2 is validated.
-3. Rebuild. The Dockerfile's `.atomic_build_config` cache key includes the patch hash, so swapping patches busts the build cache automatically.
+## Available But Not Shipped
 
-Do not flip until the validation matrix in the RSH (`§Validation Requirements`, eight rows + targeted cases) is green.
+| File | Status |
+| --- | --- |
+| `0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch` | V1, kept for rollback / repro. Superseded by V2. |
+| `0003-cuda-fa-view_src-sizing.patch` | Backport of closed upstream PR #23620. Tested and rejected for our boundary case — see RSH-20260526-003 §"The View_src False Positive". Kept for slow-VRAM-creep mitigation if that regime ever fires. |
+
+## Build Examples
+
+```bash
+# Default (V2+0004, graphs ON)
+docker build -t grimoire:local .
+
+# Rollback to V1+OFF
+docker build -t grimoire:ab-v1-graphs-off \
+    --build-arg GRIMOIRE_LLAMA_CPP_PATCH_FILE=0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch \
+    --build-arg GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF .
+
+# V0 (no patches) for crash repro
+docker build -t grimoire:ab-unpatched-graphs-on \
+    --build-arg GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=0 \
+    --build-arg GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON .
+```

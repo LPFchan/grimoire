@@ -10,8 +10,10 @@ ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/AtomicBot-ai/atomic-llama-cpp
 ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=0a635dcd92ba66c75fccfef91c3e106f4668f367
 ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
-ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF
-ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch
+ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
+# Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
+# Default ships V2 (graph-safe FA scratch owner) + #22155 backport (legacy pool flush-on-OOM).
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0002-cuda-fa-v2-scratch-owner.patch,0004-pool-flush-on-oom.patch
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
 ARG CACHE_BUST=10
 
@@ -50,8 +52,10 @@ ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
 ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
-ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=OFF
-ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch
+ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
+# Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
+# Default ships V2 (graph-safe FA scratch owner) + #22155 backport (legacy pool flush-on-OOM).
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0002-cuda-fa-v2-scratch-owner.patch,0004-pool-flush-on-oom.patch
 ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
@@ -93,10 +97,15 @@ fi; \
     fi; \
     git -C /app/.cache/llama-cpp-src/repo reset --hard "$GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
     git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
-    patch_path="/app/patches/atomic-llama-cpp/$GRIMOIRE_LLAMA_CPP_PATCH_FILE"; \
-    if [ ! -f "$patch_path" ]; then echo "ERROR: patch not found: $patch_path"; exit 1; fi; \
-    patch_hash=$(sha256sum "$patch_path"); \
-    build_config="sha=$GRIMOIRE_LLAMA_CPP_PINNED_SHA apply_patches=$GRIMOIRE_LLAMA_CPP_APPLY_PATCHES cuda_graphs=$GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS arch=$GRIMOIRE_CMAKE_CUDA_ARCHITECTURES patch=$patch_hash"; \
+    # Resolve patch files (comma-separated list, applied in order).
+    patch_files=$(echo "$GRIMOIRE_LLAMA_CPP_PATCH_FILE" | tr ',' ' '); \
+    patch_hash=""; \
+    for pf in $patch_files; do \
+        pp="/app/patches/atomic-llama-cpp/$pf"; \
+        if [ ! -f "$pp" ]; then echo "ERROR: patch not found: $pp"; exit 1; fi; \
+        patch_hash="${patch_hash}$(sha256sum "$pp"); "; \
+    done; \
+    build_config="sha=$GRIMOIRE_LLAMA_CPP_PINNED_SHA apply_patches=$GRIMOIRE_LLAMA_CPP_APPLY_PATCHES cuda_graphs=$GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS arch=$GRIMOIRE_CMAKE_CUDA_ARCHITECTURES patches=$patch_hash"; \
     build_config_file=/app/.cache/llama-cpp-build/.atomic_build_config; \
     old_build_config=""; \
     if [ -f "$build_config_file" ]; then old_build_config=$(cat "$build_config_file"); fi; \
@@ -106,7 +115,11 @@ fi; \
     fi; \
     echo "$build_config" > "$build_config_file"; \
     case "$GRIMOIRE_LLAMA_CPP_APPLY_PATCHES" in \
-        1|true|TRUE|yes|YES) git -C /app/.cache/llama-cpp-src/repo apply "$patch_path" ;; \
+        1|true|TRUE|yes|YES) \
+            for pf in $patch_files; do \
+                echo "Applying patch: $pf"; \
+                git -C /app/.cache/llama-cpp-src/repo apply "/app/patches/atomic-llama-cpp/$pf"; \
+            done ;; \
         0|false|FALSE|no|NO) echo "Skipping Atomic patches" ;; \
         *) echo "ERROR: GRIMOIRE_LLAMA_CPP_APPLY_PATCHES must be true or false"; exit 1 ;; \
     esac; \
