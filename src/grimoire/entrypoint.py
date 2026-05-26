@@ -404,7 +404,7 @@ async def cors_proxy(request: Request):
     headers = {}
     for key, value in request.headers.items():
         low = key.lower()
-        if low in ("host", "content-length", "x-forwarded-for"):
+        if low in ("host", "content-length", "x-forwarded-for", "accept-encoding"):
             continue
         if low.startswith("x-proxy-header-"):
             original_key = key[len("x-proxy-header-"):]
