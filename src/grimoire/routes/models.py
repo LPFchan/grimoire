@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from grimoire.auth import require_api, require_admin
 from grimoire.config import DEFAULT_CTX_SIZE, DEFAULT_GENERATION_PARAMS
-from grimoire.ingest import download_model_file, model_filename_from_url
+from grimoire.ingest import download_model_file, model_filename_from_url, parse_hf_url, download_model_file_with_progress, _DownloadCancelled, MAX_BYTES as INGEST_MAX_BYTES
 from grimoire.registry import MODELS_DIR, registry
 
 _REFERENCE_FIELDS = ("file", "mmproj", "mtp-head", "spec-draft-model", "draft", "drafter")
@@ -19,6 +19,11 @@ _MAX_GGUF_UPLOAD_BYTES = int(os.environ.get("GRIMOIRE_MAX_GGUF_UPLOAD_BYTES", 40
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.on_event("startup")
+async def _on_startup():
+    asyncio.create_task(prune_old_ingest_tasks())
 
 
 def _get_manager():
@@ -556,3 +561,362 @@ async def upload_registry_gguf(request: Request, file: UploadFile):
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
     return {"filename": f"gguf/{safe_name}", "size_bytes": total}
+
+
+# ---------------------------------------------------------------------------
+# Ingest infrastructure (background downloads with progress)
+# ---------------------------------------------------------------------------
+
+import time as _time
+
+_ingest_tasks: dict[str, dict] = {}
+_ingest_lock = asyncio.Lock()
+
+
+async def prune_old_ingest_tasks():
+    """Periodically remove old ingest task entries and orphaned files."""
+    while True:
+        await asyncio.sleep(600)  # every 10 minutes
+        cutoff = _time.time() - 3600  # 1 hour ago
+        async with _ingest_lock:
+            stale_ids = [
+                tid for tid, t in _ingest_tasks.items()
+                if t.get("_completed_at", _time.time()) < cutoff
+            ]
+            for tid in stale_ids:
+                task = _ingest_tasks.pop(tid, None)
+                if task:
+                    for path_key in ("tmp_path", "target_path"):
+                        p = task.get(path_key)
+                        if p and os.path.isfile(p):
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+            # Clean orphaned .part files older than 1 hour
+            gguf_dir = os.path.join(MODELS_DIR, "gguf")
+            if os.path.isdir(gguf_dir):
+                for entry in os.listdir(gguf_dir):
+                    if not entry.endswith(".part"):
+                        continue
+                    part_path = os.path.join(gguf_dir, entry)
+                    try:
+                        if _time.time() - os.path.getmtime(part_path) > 3600:
+                            os.remove(part_path)
+                    except OSError:
+                        pass
+
+
+# ---------------------------------------------------------------------------
+# Ingest endpoints (HuggingFace URL → download → register)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/registry/ingest-start")
+async def ingest_start(request: Request):
+    """Parse a HuggingFace URL and start a background download."""
+    require_api(request)
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    url = data.get("url")
+    if not url or not isinstance(url, str):
+        raise HTTPException(status_code=400, detail="'url' is required")
+
+    try:
+        download_url, filename = parse_hf_url(url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    suggested_alias = os.path.splitext(os.path.basename(filename))[0].lower()
+
+    task_id = os.urandom(8).hex()
+    gguf_dir = os.path.join(MODELS_DIR, "gguf")
+    os.makedirs(gguf_dir, exist_ok=True)
+    target_path = os.path.join(gguf_dir, os.path.basename(filename))
+
+    task = {
+        "task_id": task_id,
+        "status": "downloading",
+        "filename": os.path.basename(filename),
+        "suggested_alias": suggested_alias,
+        "downloaded_bytes": 0,
+        "total_bytes": None,
+        "target_path": target_path,
+        "cancelled": False,
+        "configured": False,
+        "alias": None,
+        "load_settings_from": None,
+        "error": None,
+        "last_poll_at": None,
+        "last_poll_bytes": None,
+    }
+
+    async with _ingest_lock:
+        _ingest_tasks[task_id] = task
+
+    async def _run_download():
+        try:
+            await asyncio.to_thread(
+                download_model_file_with_progress,
+                download_url, target_path, task, max_bytes=INGEST_MAX_BYTES
+            )
+            async with _ingest_lock:
+                if task["configured"]:
+                    _register_model(task_id)
+                    task["status"] = "done"
+                else:
+                    task["status"] = "awaiting_configure"
+                task["_completed_at"] = _time.time()
+        except _DownloadCancelled:
+            async with _ingest_lock:
+                task["status"] = "cancelled"
+                task["_completed_at"] = _time.time()
+                if os.path.isfile(target_path):
+                    try:
+                        os.remove(target_path)
+                    except OSError:
+                        pass
+        except Exception as e:
+            async with _ingest_lock:
+                task["status"] = "failed"
+                task["error"] = str(e)
+                task["_completed_at"] = _time.time()
+
+    asyncio.create_task(_run_download())
+
+    return {
+        "status": "started",
+        "task_id": task_id,
+        "filename": os.path.basename(filename),
+        "suggested_alias": suggested_alias,
+    }
+
+
+@router.post("/registry/ingest-configure")
+async def ingest_configure(request: Request):
+    """Save config for a download task. Model is registered when download completes."""
+    require_api(request)
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    task_id = data.get("task_id")
+    if not task_id:
+        raise HTTPException(status_code=400, detail="'task_id' is required")
+
+    alias = data.get("alias")
+    if not alias or not isinstance(alias, str):
+        raise HTTPException(status_code=400, detail="'alias' is required")
+
+    load_settings_from = data.get("load_settings_from")
+    if load_settings_from and not isinstance(load_settings_from, str):
+        raise HTTPException(status_code=400, detail="'load_settings_from' must be a string or null")
+
+    async with _ingest_lock:
+        task = _ingest_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task["status"] in ("cancelled", "failed", "done"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Task is in terminal state: {task['status']}",
+            )
+
+        task["configured"] = True
+        task["alias"] = alias
+        task["load_settings_from"] = load_settings_from
+
+        # Validate merged config if settings source specified
+        if load_settings_from:
+            src = registry.get(load_settings_from)
+            if not src:
+                raise HTTPException(status_code=404, detail=f"Source model '{load_settings_from}' not found")
+
+        if task["status"] in ("awaiting_configure", "downloading"):
+            # If download is already done, register immediately
+            if task["status"] == "awaiting_configure":
+                _register_model(task_id)
+                task["status"] = "done"
+
+    return {"status": "configured"}
+
+
+@router.get("/registry/ingest-status/{task_id}")
+async def ingest_status(task_id: str, request: Request):
+    """Poll the status of a background download."""
+    require_api(request)
+    async with _ingest_lock:
+        task = _ingest_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        now = _time.time()
+
+        # Compute speed from last poll
+        speed_bytes_per_sec = None
+        if task.get("last_poll_at") and task.get("last_poll_bytes") is not None:
+            delta_t = now - task["last_poll_at"]
+            delta_b = task["downloaded_bytes"] - task["last_poll_bytes"]
+            if delta_t > 0:
+                speed_bytes_per_sec = int(delta_b / delta_t)
+
+        task["last_poll_at"] = now
+        task["last_poll_bytes"] = task["downloaded_bytes"]
+
+        response = {
+            "status": task["status"],
+            "filename": task["filename"],
+            "suggested_alias": task["suggested_alias"],
+            "downloaded_bytes": task["downloaded_bytes"],
+            "total_bytes": task["total_bytes"],
+            "speed_bytes_per_sec": speed_bytes_per_sec,
+        }
+
+        if task["status"] == "done":
+            response["alias"] = task["alias"]
+        if task["status"] == "failed":
+            response["error"] = task["error"]
+
+        return response
+
+
+@router.delete("/registry/ingest-status/{task_id}")
+async def ingest_cancel(task_id: str, request: Request):
+    """Cancel a background download."""
+    require_api(request)
+    async with _ingest_lock:
+        task = _ingest_tasks.get(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found")
+        if task["status"] not in ("downloading", "awaiting_configure"):
+            return {"status": "already_finished"}
+
+        task["cancelled"] = True
+
+    # Wait briefly for the chunk loop to notice the flag
+    await asyncio.sleep(1)
+
+    async with _ingest_lock:
+        if os.path.isfile(task.get("target_path", "")):
+            try:
+                os.remove(task["target_path"])
+            except OSError:
+                pass
+        tmp = task.get("tmp_path")
+        if tmp and os.path.isfile(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        task["status"] = "cancelled"
+        task["_completed_at"] = _time.time()
+
+    return {"status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# GGUF file management
+# ---------------------------------------------------------------------------
+
+
+@router.patch("/registry/gguf")
+async def rename_gguf(request: Request, filename: str = "", new_filename: str = ""):
+    """Rename a GGUF file and update all model configs referencing it."""
+    require_api(request)
+    if not filename or not new_filename:
+        raise HTTPException(status_code=400, detail="'filename' and 'new_filename' are required")
+
+    # Containment check on old file
+    real_old = _containment_check(filename)
+    if not os.path.isfile(real_old):
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+
+    # New filename must end with .gguf
+    if not new_filename.lower().endswith(".gguf"):
+        raise HTTPException(status_code=400, detail="'new_filename' must end with .gguf")
+
+    # Containment check on parent of new filename (file doesn't exist yet)
+    new_parent = os.path.realpath(os.path.join(MODELS_DIR, os.path.dirname(new_filename) or "."))
+    real_models = os.path.realpath(MODELS_DIR)
+    if os.path.commonpath([real_models, new_parent]) != real_models:
+        raise HTTPException(status_code=400, detail="Path escapes models directory")
+
+    real_new = os.path.join(new_parent, os.path.basename(new_filename))
+
+    # Collision check
+    if os.path.exists(real_new):
+        raise HTTPException(status_code=409, detail=f"'{new_filename}' already exists")
+
+    try:
+        os.rename(real_old, real_new)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Rename failed: {e}")
+
+    # Update all model configs referencing the old filename
+    from grimoire.registry import registry as reg
+    updated = []
+    for model_name in reg.list_all():
+        cfg = reg.get(model_name)
+        changed = False
+        for field in _REFERENCE_FIELDS:
+            if cfg and cfg.get(field) == filename:
+                cfg[field] = new_filename
+                changed = True
+        if changed:
+            reg.update(model_name, cfg)
+            updated.append(model_name)
+
+    return {"status": "renamed", "updated_models": updated}
+
+
+def _register_model(task_id: str):
+    """Register a completed download into the registry. Caller must hold _ingest_lock."""
+    task = _ingest_tasks.get(task_id)
+    if not task:
+        return
+
+    alias = task.get("alias")
+    filename = task.get("filename")
+    if not alias or not filename:
+        return
+
+    config = {
+        "file": f"gguf/{filename}",
+        "capabilities": ["completion"],
+        "ctx-size": 262144,
+        "predict": 16384,
+        "parallel": 1,
+        "n-gpu-layers": 999,
+        "cache-type-k": "q8_0",
+        "cache-type-v": "q8_0",
+        "cost": {"input": 0, "output": 0, "cache_read": 0},
+    }
+
+    # Merge settings from source model if specified
+    load_from = task.get("load_settings_from")
+    if load_from:
+        src = registry.get(load_from)
+        if src:
+            for k, v in src.items():
+                if k not in ("file", "mmproj", "alias", "added", "backend",
+                             "mtp-head", "spec-draft-model", "draft", "drafter"):
+                    config[k] = v
+
+    # Strip incompatible combos
+    if config.get("speculative-type") == "mtp" and not config.get("mtp-head"):
+        config.pop("speculative-type", None)
+    if config.get("speculative-type") == "dflash" and not config.get("spec-draft-model"):
+        config.pop("speculative-type", None)
+    if config.get("pflash") and not config.get("drafter"):
+        config.pop("pflash", None)
+        config.pop("park-unpark", None)
+    caps = config.get("capabilities") or []
+    if ("multimodal" in caps or "vision" in caps) and not config.get("mmproj"):
+        config["capabilities"] = [c for c in caps if c not in ("multimodal", "vision")]
+
+    registry.add(alias, config)
+    task["alias"] = alias

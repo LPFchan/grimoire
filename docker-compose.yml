@@ -6,6 +6,7 @@ services:
     mem_limit: 28g
     memswap_limit: 28g
     oom_score_adj: 500
+    restart: unless-stopped
     ports:
       - "9001:9001"
     volumes:
@@ -13,7 +14,7 @@ services:
       - ${TEMPLATES_DIR}:/templates:ro
       - ${GRAMMARS_DIR}:/etc/grimoire/grammars:ro
       - ${TOKEN_STATS_PATH}:/var/lib/grimoire/token-stats.json:ro
-      - grimoire_state:/var/lib/grimoire
+      - ./state:/var/lib/grimoire
       - ${MODELS_JSON_PATH}:/etc/grimoire/models.json:ro
       # Dev override: bind-mount Python source so code changes apply immediately.
       - ${DEV_SRC_BIND}:/opt/grimoire-venv/lib/python3.11/site-packages/grimoire:ro
@@ -50,5 +51,3 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-volumes:
-  grimoire_state:

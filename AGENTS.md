@@ -51,3 +51,4 @@ Load the skill before the trigger condition fires. Each skill defines the proced
 - Do not turn an inbox review into a digest of every low-confidence idea. Report counts or clusters.
 - Do not write chatty transcripts where the repo expects normalized records.
 - Do not bypass commit provenance checks unless the commit is an explicit bootstrap or migration exception.
+- **Never use `docker commit` on the grimoire image.** Image changes go through `Dockerfile` → `docker compose build`. For live dev code changes, use the existing `DEV_SRC_BIND` mount. For dependency changes, edit `pyproject.toml` and rebuild.
