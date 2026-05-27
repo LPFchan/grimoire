@@ -2,6 +2,7 @@
   "models": {
     "qwen3.6-mtp-27B": {
       "file": "gguf/Qwen3.6-27B-MTP-Q4_K_M.gguf",
+      "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
@@ -28,6 +29,7 @@
     "qwen3.6-mtp-mmproj-27B": {
       "file": "gguf/Qwen3.6-27B-MTP-Q4_K_M.gguf",
       "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
+      "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
@@ -51,6 +53,7 @@
 
     "qwen3.6-hereticv2-mtp-27B": {
       "file": "gguf/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf",
+      "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
@@ -77,6 +80,7 @@
     "qwen3.6-hereticv2-mtp-mmproj-27B": {
       "file": "gguf/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf",
       "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
+      "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
@@ -100,6 +104,7 @@
 
     "qwopus3.6v2-mtp-27B": {
       "file": "gguf/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf",
+      "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [
@@ -126,6 +131,7 @@
     "qwopus3.6v2-mtp-mmproj-27B": {
       "file": "gguf/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf",
       "mmproj": "gguf/qwen-mtp-mmproj-BF16.gguf",
+      "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
       "speculative-type": "nextn",
       "family": "qwen",
       "capabilities": [

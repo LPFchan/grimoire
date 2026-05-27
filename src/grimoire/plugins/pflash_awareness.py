@@ -1,11 +1,11 @@
-"""DFlash/PFlash awareness plugin — injects runtime note into system prompts."""
+"""PFlash awareness plugin — injects runtime note into system prompts."""
 
 import copy
 
 from grimoire.plugins.base import Plugin
 
-DFLASH_AWARENESS_MARKER = "Grimoire DFlash runtime note:"
-DFLASH_RECALL_TOOL = "conversation_recall"
+PFLASH_AWARENESS_MARKER = "Grimoire PFlash runtime note:"
+PFLASH_RECALL_TOOL = "conversation_recall"
 
 
 def payload_tool_names(payload):
@@ -45,25 +45,25 @@ def append_text_to_content(content, text):
     return f"{content}\n\n{text}" if content else text
 
 
-class DflashPflashAwarenessPlugin(Plugin):
-    """Inject a runtime note when retrieval-aware sessions run on DFlash/PFlash."""
+class PflashAwarenessPlugin(Plugin):
+    """Inject a runtime note when retrieval-aware sessions run on PFlash."""
 
     def _default_enabled(self) -> bool:
         return True
 
     def _info(self) -> dict:
-        return {"name": "DFlash/PFlash Awareness", "key": "DFLASH_AWARENESS", "description": "Injects a runtime note about speculative compression into system prompts when retrieval tools are used"}
+        return {"name": "PFlash Awareness", "key": "PFLASH_AWARENESS", "description": "Injects a runtime note about PFlash long-context compression into system prompts when retrieval tools are used"}
 
     def before_request(self, payload, model_name, model_cfg):
         if not self._is_enabled():
             return payload
-        if model_cfg.get("speculative-type") != "dflash":
+        if model_cfg.get("speculative-type") != "pflash":
             return payload
         if model_cfg.get("prefill-compression", model_cfg.get("prefill_compression")) == "never":
             return payload
         if not model_cfg.get("drafter"):
             return payload
-        if DFLASH_RECALL_TOOL not in payload_tool_names(payload):
+        if PFLASH_RECALL_TOOL not in payload_tool_names(payload):
             return payload
 
         messages = payload.get("messages")
@@ -73,7 +73,7 @@ class DflashPflashAwarenessPlugin(Plugin):
         for message in messages:
             if not isinstance(message, dict) or message.get("role") != "system":
                 continue
-            if content_contains_text(message.get("content"), DFLASH_AWARENESS_MARKER):
+            if content_contains_text(message.get("content"), PFLASH_AWARENESS_MARKER):
                 return payload
 
         threshold = model_cfg.get("prefill-threshold", model_cfg.get("prefill_threshold"))
@@ -88,7 +88,7 @@ class DflashPflashAwarenessPlugin(Plugin):
             else "On long prompts, "
         )
         context = (
-            f"{DFLASH_AWARENESS_MARKER} This session runs on Grimoire DFlash with PFlash long-context compression available. "
+            f"{PFLASH_AWARENESS_MARKER} This session runs on Grimoire with PFlash long-context compression available. "
             f"{threshold_hint}older middle context may be compressed before target prefill, while the head, recent tail, "
             "and protected tool blocks are preferentially kept exact. If you need exact older wording or the original "
             "contents of an older message block, use the `conversation_recall` tool instead of assuming the compressed "
