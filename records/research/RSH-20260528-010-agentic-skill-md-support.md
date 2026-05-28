@@ -52,6 +52,16 @@ Likely next work:
 - add UI for registered skills
 - decide whether skill content should be injected automatically, selected by the user, or requested by a future `skill` tool
 
+## Opencode Source Provenance
+
+This was an adapted data/prompt port; no opencode filesystem discovery or Effect service code was copied.
+
+- Skill data shape referenced `/home/yeowool/opencode/packages/opencode/src/skill/index.ts:36-41`.
+- Frontmatter parsing and `SKILL.md` load behavior referenced `/home/yeowool/opencode/packages/opencode/src/skill/index.ts:52-58` and `/home/yeowool/opencode/packages/opencode/src/skill/index.ts:104-140`.
+- Filesystem and URL discovery were reviewed at `/home/yeowool/opencode/packages/opencode/src/skill/index.ts:21-25`, `/home/yeowool/opencode/packages/opencode/src/skill/index.ts:173-227`, and `/home/yeowool/opencode/packages/opencode/src/skill/discovery.ts:12-19`, `/home/yeowool/opencode/packages/opencode/src/skill/discovery.ts:54-104`, but were deferred.
+- Available-skill prompt injection referenced `/home/yeowool/opencode/packages/opencode/src/session/system.ts:65-76`; compact/verbose formatting referenced `/home/yeowool/opencode/packages/opencode/src/skill/index.ts:326-350`.
+- Later model-callable skill loading was designed against `/home/yeowool/opencode/packages/opencode/src/tool/skill.ts:10-23`, `/home/yeowool/opencode/packages/opencode/src/tool/skill.ts:29-34`, and `/home/yeowool/opencode/packages/opencode/src/tool/skill.ts:47-68`.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-skills.test.ts tests/unit/agentic-tool-registry.test.ts tests/unit/agentic-todo.test.ts tests/unit/agentic-question.test.ts tests/unit/tool-permissions.test.ts tests/unit/agentic-sections.test.ts`

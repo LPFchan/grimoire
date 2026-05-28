@@ -50,6 +50,16 @@ Next subsystem: todo/status tool.
 
 The todo/status prototype should be implemented as a provider tool instead of another bespoke branch in `AgenticStore`.
 
+## Opencode Source Provenance
+
+This was an adapted architecture port; no opencode registry/runtime code was copied.
+
+- Tool definition contract referenced `/home/yeowool/opencode/packages/opencode/src/tool/tool.ts:34-63`, including context, execute result, and attachments.
+- Tool wrapper semantics referenced `/home/yeowool/opencode/packages/opencode/src/tool/tool.ts:97-147`, especially argument decoding and output truncation boundaries.
+- Registry service shape referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:73-80`.
+- Builtin/custom tool initialization and plugin tool conversion referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:137-220` and `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:225-269`.
+- Final tool description/execute projection referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:316-360`, but was reduced to a browser-local provider hook instead of porting Effect services or plugin imports.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-question.test.ts tests/unit/tool-permissions.test.ts tests/unit/agentic-sections.test.ts`

@@ -21,6 +21,15 @@ Context budget was only visible while generation stats were shown. The desired a
 - Tooltip shows `Context: <used> / <total> (<percent>%)`.
 - Ring color changes at 70% and 90% thresholds.
 
+## Opencode Source Provenance
+
+This was an adapted visual/behavior reference; no opencode TUI code was copied.
+
+- Persistent context usage display referenced opencode's sidebar context plugin at `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/context.tsx:16-35` and rendering at `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/feature-plugins/sidebar/context.tsx:38-44`.
+- Subagent footer context/cost usage referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/subagent-footer.tsx:35-53` and display at `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/subagent-footer.tsx:83-93`.
+- Manual compaction affordance was informed by opencode's compaction command binding at `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/config/keybind.ts:95` and command id at `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/config/keybind.ts:292`; the webui later moved compaction into the popup button per operator direction.
+- Overflow math for future thresholding referenced `/home/yeowool/opencode/packages/opencode/src/session/overflow.ts:6-31`, but current webui display uses llama-server timings/model context telemetry.
+
 ## Verification
 
 - `npm run build`

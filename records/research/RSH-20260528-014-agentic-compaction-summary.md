@@ -20,6 +20,16 @@ The product needs an opencode-shaped compaction/summarization path without start
 - Added visible `Compacted context` cards for stored summary messages.
 - Updated chat request construction so future requests preserve prior system prompts, inject the latest summary as system context, and keep only the tail after that summary.
 
+## Opencode Source Provenance
+
+This was an adapted compaction design port; no opencode compaction service code was copied.
+
+- Structured summary template and compaction prompt behavior referenced `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:35-77` and `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:123-134`.
+- Prior summary anchoring and tail-selection behavior referenced `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:95-121`, `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:136-183`, and `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:245-294`.
+- Manual/auto compaction event shape referenced `/home/yeowool/opencode/packages/core/src/session-event.ts:332-363`; opencode's create/process flow referenced `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:344-614`.
+- Tool-output truncation during compaction referenced `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:37-38`, `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:406-409`, and `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:284`, `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:790-809`.
+- Overflow threshold math referenced `/home/yeowool/opencode/packages/opencode/src/session/overflow.ts:6-31`; this first webui slice stayed manual and browser-local.
+
 ## Upstream Shape
 
 - Upstreamable: summary marker detection, visible summary cards, and request-context normalization behind a latest-summary boundary.

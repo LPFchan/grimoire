@@ -21,6 +21,16 @@ Agentic tool outputs could attach images, but artifact visibility was still tied
 - Extended agentic data URI extraction to text, JSON, PDF, audio, and video attachments.
 - Marked saved-attachment result lines so raw result rendering can hide those marker lines.
 
+## Opencode Source Provenance
+
+This was an adapted attachment/artifact behavior port; no opencode artifact UI or storage code was copied.
+
+- Tool execute result attachment shape referenced `/home/yeowool/opencode/packages/opencode/src/tool/tool.ts:46-51`.
+- Tool-result attachment normalization referenced `/home/yeowool/opencode/packages/opencode/src/session/tools.ts:94-102` for provider tool attachments and `/home/yeowool/opencode/packages/opencode/src/session/tools.ts:153-194` for MCP result-to-attachment conversion.
+- Processor persistence of tool attachments referenced `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:168-190`, `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:280-293`, and `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:455-500`.
+- MessageV2 file/tool attachment schema and model conversion referenced `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:160-168`, `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:277-318`, and `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:646-682`, `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:790-809`.
+- The webui artifact panel/header behavior is product-native; opencode supplied attachment semantics, not the right-side presentation panel.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-sections.test.ts`

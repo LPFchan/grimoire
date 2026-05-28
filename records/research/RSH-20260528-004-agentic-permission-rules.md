@@ -42,6 +42,16 @@ Adapted port.
 
 The ported idea is opencode's distinction between tools that require permission and tools that should be available as internal agent protocol. The runtime remains llama-ui-native: client-side pending state, local persisted approvals, existing action-card prompts, and no backend permission service.
 
+## Opencode Source Provenance
+
+This was an adapted port of semantics only; no opencode permission service code was copied.
+
+- Permission request/reply vocabulary referenced `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:36-53`, where replies are `once`, `always`, and `reject`.
+- Ask/evaluate behavior referenced `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:171-211`; reply behavior, including always approval and pending auto-resolution, referenced `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:213-269`.
+- Config action names and known permission keys referenced `/home/yeowool/opencode/packages/opencode/src/config/permission.ts:4-35`.
+- Tool-context permission hook referenced `/home/yeowool/opencode/packages/opencode/src/tool/tool.ts:34-44` and its use in `/home/yeowool/opencode/packages/opencode/src/session/tools.ts:42-72`.
+- Internal-tool bypass reasoning referenced opencode's registry inclusion of `question`, `todowrite`, and `skill` in `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:117-134`, `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:225-244`, and `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:248-266`.
+
 ## Rejected For Now
 
 - Pattern-based allow/deny config for bash, file paths, or URL scopes.

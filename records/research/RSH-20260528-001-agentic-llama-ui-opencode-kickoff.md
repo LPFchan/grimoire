@@ -106,6 +106,18 @@ Because of this mismatch, literal ports are appropriate only for small pure sche
 
 The llama-server builtin `/tools` endpoint is not a product boundary. Its own README states the endpoint is internal to the web UI and should not be used by downstream applications. It is useful as upstream reference material, not as the product's external tool execution API.
 
+## Opencode Source Provenance
+
+This research record referenced opencode source for subsystem classification; it did not copy implementation code into the repo.
+
+- Event/lifecycle classification referenced `/home/yeowool/opencode/packages/core/src/session-event.ts:103-145`, `/home/yeowool/opencode/packages/core/src/session-event.ts:148-177`, `/home/yeowool/opencode/packages/core/src/session-event.ts:213-307`, and `/home/yeowool/opencode/packages/core/src/session-event.ts:332-363` for step, text, tool, and compaction event shapes.
+- Tool lifecycle and attachment classification referenced `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:168-190`, `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:231-278`, `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:377-422`, and `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:452-500`.
+- Permission classification referenced `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:36-53`, `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:171-211`, `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:213-269`, and `/home/yeowool/opencode/packages/opencode/src/config/permission.ts:4-35`.
+- Question-tool classification referenced `/home/yeowool/opencode/packages/opencode/src/tool/question.ts:6-41`, `/home/yeowool/opencode/packages/opencode/src/question/index.ts:16-93`, and `/home/yeowool/opencode/packages/opencode/src/question/index.ts:155-220`.
+- Todo/status classification referenced `/home/yeowool/opencode/packages/opencode/src/tool/todo.ts:9-55`, `/home/yeowool/opencode/packages/opencode/src/session/todo.ts:10-31`, and `/home/yeowool/opencode/packages/opencode/src/session/todo.ts:41-75`.
+- Tool registry, skill, and task/subagent classification referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:73-80`, `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:117-134`, `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:225-269`, `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:282-360`, `/home/yeowool/opencode/packages/opencode/src/tool/skill.ts:10-68`, and `/home/yeowool/opencode/packages/opencode/src/tool/task.ts:34-68`, `/home/yeowool/opencode/packages/opencode/src/tool/task.ts:96-180`.
+- Compaction classification referenced `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:35-77`, `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:123-140`, `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:245-294`, `/home/yeowool/opencode/packages/opencode/src/session/compaction.ts:344-614`, and `/home/yeowool/opencode/packages/opencode/src/session/overflow.ts:6-31`.
+
 ## Upstreamable PR Candidates
 
 - Agent event/section normalization for llama-ui.

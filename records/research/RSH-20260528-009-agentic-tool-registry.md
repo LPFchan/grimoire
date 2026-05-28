@@ -45,6 +45,16 @@ Next subsystem: `SKILL.md` support.
 
 Skill support should plug into this registry as a provider only if it needs tool definitions. The first implementation should focus on discovery/loading and prompt-context injection rather than executable skill tooling.
 
+## Opencode Source Provenance
+
+This was an adapted registry-boundary port; no opencode registry implementation was copied.
+
+- Registry interface shape referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:73-80`.
+- Builtin and custom tool collection referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:117-134`, `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:137-220`, and `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:225-269`.
+- Tool definition projection and dynamic description hooks referenced `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:282-360`.
+- Execution context and result fields referenced `/home/yeowool/opencode/packages/opencode/src/tool/tool.ts:34-63`.
+- Direct plugin/filesystem loading from `/home/yeowool/opencode/packages/opencode/src/tool/registry.ts:199-220` was explicitly not ported because the webui registry slice is browser-local.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-tool-registry.test.ts tests/unit/agentic-todo.test.ts tests/unit/agentic-question.test.ts tests/unit/tool-permissions.test.ts tests/unit/agentic-sections.test.ts`

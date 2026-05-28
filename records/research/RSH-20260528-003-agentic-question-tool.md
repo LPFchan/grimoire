@@ -58,6 +58,16 @@ Next subsystem: permission rules refinement.
 
 The current implementation should compose with llama-ui's existing allow once / always / always server / deny surface; the next checkpoint should tighten rule storage, internal-tool bypasses, and presentation language rather than replacing llama-ui's MCP permission model.
 
+## Opencode Source Provenance
+
+This was a literal protocol/reference-text port with adapted Svelte/client runtime; no server-side opencode service code was copied.
+
+- Tool name, parameter envelope, and metadata shape referenced `/home/yeowool/opencode/packages/opencode/src/tool/question.ts:6-14`.
+- The model-facing answer text and title were adapted from `/home/yeowool/opencode/packages/opencode/src/tool/question.ts:30-40`.
+- Question option/prompt data shapes referenced `/home/yeowool/opencode/packages/opencode/src/question/index.ts:16-50`; request/reply/event shapes referenced `/home/yeowool/opencode/packages/opencode/src/question/index.ts:52-93`.
+- Pending ask/reply/reject lifecycle referenced `/home/yeowool/opencode/packages/opencode/src/question/index.ts:155-220`, but was rewritten into llama-ui stores and action cards instead of porting Effect, Deferred, and Bus.
+- Frontend behavior for single-question no-confirm flow and answered question summaries referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/question.tsx:21-37`, `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/question.tsx:49-76`, and `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:2320-2348`.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-question.test.ts tests/unit/agentic-sections.test.ts`

@@ -40,6 +40,15 @@ Next subsystem: external tool-provider hook.
 
 The renderer now expects normalized lifecycle/result metadata. The next useful boundary is letting internal/downstream providers add tools without special-casing every tool in `AgenticStore`.
 
+## Opencode Source Provenance
+
+This was an adapted frontend behavior port; no Solid/opencode component code was copied.
+
+- Generic tool selection and specialized renderer dispatch referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:1642-1719`.
+- Generic expanded/collapsed tool rendering referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:1734-1768`.
+- Inline/block tool treatment referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:1772-1876`.
+- Status/error color decisions referenced tool-state access in `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:1790-1810` and `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:1870-1876`.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-sections.test.ts tests/unit/tool-permissions.test.ts tests/unit/agentic-question.test.ts`

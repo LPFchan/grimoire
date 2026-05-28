@@ -50,6 +50,15 @@ Next subsystem: frontend tool rendering.
 
 Use `toolResultKind` to improve card subtitles, icon/color treatment, and result copy for denied/interrupted/dismissed tool calls while keeping the existing collapsible card structure.
 
+## Opencode Source Provenance
+
+This was an adapted behavior port; no opencode implementation code was copied.
+
+- Tool terminal states referenced `/home/yeowool/opencode/packages/core/src/session-event.ts:249-307`, especially called/progress/success/failed event shapes.
+- Completed/error/interrupted behavior referenced `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:168-210` for complete/fail transitions and `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:723-746` for aborted tool cleanup.
+- Permission and question rejection classification referenced `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:194-210`, `/home/yeowool/opencode/packages/opencode/src/permission/index.ts:81-100`, and `/home/yeowool/opencode/packages/opencode/src/question/index.ts:95-99`.
+- UI hide/show behavior for completed tool details referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:1642-1719`.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-sections.test.ts tests/unit/tool-permissions.test.ts tests/unit/agentic-question.test.ts`

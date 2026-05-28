@@ -45,6 +45,14 @@ Next subsystem: `question` tool.
 
 The lifecycle state/event layer should give the `question` tool a clean way to render as a tool call that blocks for structured user input, then returns a model-visible tool result.
 
+## Opencode Source Provenance
+
+This was an adapted behavior port; no opencode implementation code was copied.
+
+- State vocabulary came from opencode's event taxonomy in `/home/yeowool/opencode/packages/core/src/session-event.ts:103-145` for step lifecycle, `/home/yeowool/opencode/packages/core/src/session-event.ts:148-177` for text lifecycle, `/home/yeowool/opencode/packages/core/src/session-event.ts:179-210` for reasoning lifecycle, and `/home/yeowool/opencode/packages/core/src/session-event.ts:213-307` for tool lifecycle.
+- The pending/running/completed/error mapping referenced opencode's processor creation and updates in `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:231-278`, tool-call transition in `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:377-422`, result completion in `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:452-500`, and error handling in `/home/yeowool/opencode/packages/opencode/src/session/processor.ts:504-522`.
+- The choice to expose a view-model rather than import opencode MessageV2 referenced `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:310-318` for `ToolPart` and `/home/yeowool/opencode/packages/opencode/src/session/message-v2.ts:790-849` for model-message conversion by tool state.
+
 ## Verification
 
 Baseline before edits:

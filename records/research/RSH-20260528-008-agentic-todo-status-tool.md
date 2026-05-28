@@ -45,6 +45,15 @@ Next subsystem: tool definitions/registry.
 
 The new provider hook plus `question` and `todowrite` tools are enough pressure to consolidate internal tool definitions and registry behavior before adding `SKILL.md` support.
 
+## Opencode Source Provenance
+
+This was an adapted port of the tool schema/output; no opencode service or database code was copied.
+
+- Todo item schema and tool parameters referenced `/home/yeowool/opencode/packages/opencode/src/tool/todo.ts:9-19`.
+- Permission request, session update call, title, JSON output, and metadata shape referenced `/home/yeowool/opencode/packages/opencode/src/tool/todo.ts:25-55`.
+- Todo persistence/event service was reviewed at `/home/yeowool/opencode/packages/opencode/src/session/todo.ts:10-31` and `/home/yeowool/opencode/packages/opencode/src/session/todo.ts:41-75`, but intentionally replaced with client-local reactive state.
+- The visible todo renderer later referenced `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx:2299-2315` and `/home/yeowool/opencode/packages/opencode/src/cli/cmd/tui/component/todo-item.tsx:8-31`.
+
 ## Verification
 
 - `npm run test:unit -- --run tests/unit/agentic-todo.test.ts tests/unit/agentic-question.test.ts tests/unit/tool-permissions.test.ts tests/unit/agentic-sections.test.ts`
