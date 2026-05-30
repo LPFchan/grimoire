@@ -298,6 +298,61 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=502, detail="Model server unavailable")
 
 
+
+@app.post("/v1/responses")
+async def chat_responses(request: Request):
+    """Route Responses API calls directly to llama-server (no gateway auth)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON"})
+
+    requested_model = payload.get("model") if isinstance(payload, dict) else None
+    model_name = registry.resolve(requested_model) if requested_model else None
+    if not model_name:
+        active_names = manager.list_active()
+        if len(active_names) == 1:
+            model_name = active_names[0]
+    if not model_name:
+        raise HTTPException(status_code=404, detail="No target model resolved for responses request")
+
+    client = None
+    try:
+        active = await manager.start_model(model_name)
+        client = httpx.AsyncClient(timeout=None)
+        headers = _backend_request_headers(request.headers)
+
+        payload = copy.deepcopy(payload)
+        payload["model"] = await active.get_backend_model_id()
+        req = client.build_request(
+            "POST",
+            f"http://127.0.0.1:{active.port}/v1/responses",
+            headers=headers,
+            params=request.query_params,
+            json=payload,
+        )
+        upstream = await client.send(req, stream=True)
+    except HTTPException:
+        if client:
+            await client.aclose()
+        raise
+    except Exception as e:
+        if client:
+            await client.aclose()
+        logger.error(f"Failed to proxy /v1/responses: {e}")
+        raise HTTPException(status_code=502, detail="Model server unavailable")
+
+    async def body_iter():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response_headers = _backend_response_headers(upstream.headers)
+    return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=response_headers)
+
 @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy_v1(request: Request, path: str):
     """Proxy other OpenAI-compatible routes to the requested or active backend."""
