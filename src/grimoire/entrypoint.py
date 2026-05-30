@@ -316,6 +316,14 @@ async def chat_responses(request: Request):
     if not model_name:
         raise HTTPException(status_code=404, detail="No target model resolved for responses request")
 
+    # Strip non-function tools before forwarding to llama-server
+    # (llama.cpp Responses API converter only handles "function" type tools)
+    if isinstance(payload, dict) and isinstance(payload.get("tools"), list):
+        payload["tools"] = [t for t in payload["tools"] if isinstance(t, dict) and t.get("type") == "function"]
+        if not payload["tools"]:
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+
     client = None
     try:
         active = await manager.start_model(model_name)
