@@ -324,6 +324,12 @@ async def chat_responses(request: Request):
             payload.pop("tools", None)
             payload.pop("tool_choice", None)
 
+    # Remove max_output_tokens cap so model has enough tokens for thinking + response
+    # (the model's own --predict limit handles the safety cap)
+    if isinstance(payload, dict):
+        payload.pop("max_output_tokens", None)
+        payload.pop("max_tokens", None)
+
     client = None
     try:
         active = await manager.start_model(model_name)
