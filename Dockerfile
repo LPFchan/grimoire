@@ -6,16 +6,16 @@
 
 ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
-ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git
+ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
-ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=0a635dcd92ba66c75fccfef91c3e106f4668f367
-ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=4595fff0bbd15ee01663699b788eea70e7e1cd69
+ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=0
 ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
 # Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
 # Default ships V2 (graph-safe FA scratch owner) + #22155 backport (legacy pool flush-on-OOM).
 ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0002-cuda-fa-v2-scratch-owner.patch,0004-pool-flush-on-oom.patch
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
-ARG CACHE_BUST=10
+ARG CACHE_BUST=11
 
 # =============================================================================
 # Build stage: Compile llama.cpp with CUDA + turbo4 cache + patches
@@ -51,7 +51,7 @@ COPY patches/atomic-llama-cpp/ /app/patches/atomic-llama-cpp/
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
-ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
+ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=0
 ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
 # Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
 # Default ships V2 (graph-safe FA scratch owner) + #22155 backport (legacy pool flush-on-OOM).

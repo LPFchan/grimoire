@@ -15,7 +15,7 @@ Before writing into an artifact directory, read its `README.md` and follow its p
 
 Migration contracts, plans, and baselines are dissolved into `records/SPEC.md`, `records/STATUS.md`, `records/PLANS.md`, `records/decisions/`, and `records/research/`. Read those instead. The legacy `MIGRATION_EXECUTION_CHECKLIST.md` is retired.
 
-The build repo is `https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant.git`, pinned to SHA `0a635dcd92ba66c75fccfef91c3e106f4668f367`.
+The build repo is `https://github.com/TheTom/llama-cpp-turboquant.git`, pinned to SHA `4595fff0bbd15ee01663699b788eea70e7e1cd69` (branch `feature/turboquant-kv-cache`). Patches in `patches/atomic-llama-cpp/` are currently disabled (`GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=0`) — they targeted the old AtomicBot fork and may need rework before applying to TheTom's fork.
 
 The webui is a git submodule at `webui/` — a forked copy of `ggerganov/llama.cpp`'s `tools/ui/`. Before building, run `git submodule update --init` to check it out.
 

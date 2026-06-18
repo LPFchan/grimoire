@@ -50,7 +50,6 @@
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0"
     },
-
     "qwen3.6-hereticv2-mtp-27B": {
       "file": "gguf/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-Q4_K_M.gguf",
       "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
@@ -101,7 +100,6 @@
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0"
     },
-
     "qwopus3.6v2-mtp-27B": {
       "file": "gguf/Qwopus3.6-27B-v2-MTP-Q4_K_M.gguf",
       "chat-template-file": "/templates/buun-Qwen3.6-chat_template.jinja",
@@ -152,30 +150,6 @@
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0"
     },
-    "gemma-4-mtp-31B": {
-      "file": "gguf/gemma-4-31B-it-Q4_K_M.gguf",
-      "speculative-type": "mtp",
-      "family": "gemma4",
-      "capabilities": [
-        "completion"
-      ],
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "ctx-size": 120550,
-      "predict": 16384,
-      "parallel": 1,
-      "n-gpu-layers": 999,
-      "cache-type-k": "q8_0",
-      "cache-type-v": "q8_0",
-      "mtp-head": "gguf/gemma-4-31B-it-assistant.Q4_K_M.gguf",
-      "extra-args": [
-        "--draft-block-size",
-        "2"
-      ]
-    },
     "gemma-4-heretic-31B": {
       "file": "gguf/gemma-4-31B-it-uncensored-heretic-Q4_K_M.gguf",
       "family": "gemma4",
@@ -214,9 +188,9 @@
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0"
     },
-    "gemma-4-mtp-mmproj-31B": {
-      "file": "gguf/gemma-4-31B-it-Q4_K_M.gguf",
-      "mmproj": "gguf/gemma4-mmproj-BF16.gguf",
+    "gemma-4-qat-mtp-mmproj-31B": {
+      "file": "gguf/gemma-4-31B_q4_0-it.gguf",
+      "mmproj": "gguf/gemma-4-31B-it-mmproj.gguf",
       "speculative-type": "mtp",
       "family": "gemma4",
       "capabilities": [
@@ -232,9 +206,11 @@
       "predict": 16384,
       "parallel": 1,
       "n-gpu-layers": 999,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4",
-      "mtp-head": "gguf/gemma-4-31B-it-assistant.Q4_K_M.gguf",
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "q8_0",
+      "cache-type-v": "q8_0",
+      "mtp-head": "gguf/gemma-4-31B-it-qat-assistant.gguf",
       "extra-args": [
         "--draft-block-size",
         "2"
