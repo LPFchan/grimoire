@@ -159,13 +159,13 @@ def build_cmd(cfg, port, alias=None):
 
     spec_type = cfg.get("speculative-type")
     if spec_type in ("nextn", "mtp"):
-        # TheTom's fork (and upstream) use draft-mtp for --spec-type
+        # TheTom's fork (and upstream #22673) use draft-mtp for --spec-type.
+        # For nextn (Qwen), MTP layers are in the same GGUF — the server
+        # auto-detects them, so we do NOT pass -md (which would load a full
+        # second model copy and double VRAM).
+        # For mtp (Gemma4), the assistant is a separate GGUF file passed via -md.
         cmd.extend(["--spec-type", "draft-mtp"])
-        if spec_type == "nextn":
-            draft_path = _resolve_config_path(cfg.get("spec-draft-model") or cfg.get("draft") or cfg["file"])
-            if draft_path and os.path.exists(draft_path):
-                cmd.extend(["-md", draft_path])
-        elif spec_type == "mtp":
+        if spec_type == "mtp":
             mtp_head = _resolve_config_path(cfg.get("mtp-head"))
             if mtp_head and os.path.exists(mtp_head):
                 cmd.extend(["-md", mtp_head])
