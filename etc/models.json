@@ -226,8 +226,8 @@
         "output": 0.0,
         "cache_read": 0.0
       },
-      "ctx-size": 2048,
-      "parallel": 1,
+      "ctx-size": 8192,
+      "parallel": 4,
       "n-gpu-layers": 999,
       "extra-args": [
         "--embeddings",
