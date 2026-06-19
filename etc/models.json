@@ -215,6 +215,29 @@
         "--draft-block-size",
         "2"
       ]
+    },
+    "embeddinggemma-300m": {
+      "file": "gguf/embeddinggemma-300M-F32.gguf",
+      "capabilities": [
+        "embedding"
+      ],
+      "cost": {
+        "input": 0.0,
+        "output": 0.0,
+        "cache_read": 0.0
+      },
+      "ctx-size": 2048,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "extra-args": [
+        "--embeddings",
+        "--pooling",
+        "mean",
+        "--flash-attn",
+        "off",
+        "--ubatch-size",
+        "2048"
+      ]
     }
   },
   "fixed": {},
