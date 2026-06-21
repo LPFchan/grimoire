@@ -1,8 +1,8 @@
 # Current Status
 
-**Snapshot:** 2026-05-30
-**Posture:** vLLM migration prototyping active — llmcompressor quantization pipeline validated, vLLM serving confirmed with commercial AWQ models
-**Focus:** Complete AWQ quantization for all 5 target models; resolve vLLM loading config for custom-quantized models
+**Snapshot:** 2026-06-22
+**Posture:** Production stack is llama.cpp (TheTom turboquant fork, turbo4 KV). Recent work is operational tuning of that stack — always-on embedder/reranker GPU co-location and gateway proxy throughput. vLLM/AWQ migration remains an open parallel research track (DEC-20260528-001), not the current focus.
+**Focus:** Operate and tune the llama.cpp gateway (co-location, proxy throughput, per-model ctx/KV tuning).
 
 ## Migration Summary
 
@@ -23,6 +23,9 @@ Patch chain in `patches/atomic-llama-cpp/`, applied in order by `Dockerfile`:
 
 ## Recent Changes
 
+- 2026-06-22: **Gateway proxy throughput fix** — every proxy path created a fresh per-request `httpx.AsyncClient` (no keepalive), capping high-RPS endpoints at ~30 req/s. Switched to a shared connection-pooled client (`proxy/client.py`); gateway rerank 29.2 → 64.4 req/s. Also confirmed reranker `--parallel` does not help (prefill-only encoder; parallel=1 optimal). Corrects the chat-only conclusion of RSH-20260518-006. (RSH-20260622-001, commit `4c37298`)
+- 2026-06-22: **GPU co-location for always-on small models** — replaced strict one-model-per-GPU with a per-model `vram-budget-mib` + live `nvidia-smi` free-VRAM check. Both 0.6B models (embedder + reranker) now co-locate on GPU 1 (~2.9 GiB), freeing GPU 0 for chat. (DEC-20260622-001, commit `b616a99`)
+- 2026-06-20/21: **llama.cpp engine + model tuning** — switched to TheTom `llama-cpp-turboquant` fork; turbo4 KV cache with ctx-size tuned to verified maximums across chat models; auto-MTP for nextn models; embeddinggemma-300m registered/tuned. (commits `3ca14cd`, `c59a4ba`, `f2edaac`, `3b16be0`, `e7e8720`)
 - 2026-05-30: **vLLM migration prototype — llmcompressor quantization pipeline validated** (RSH-20260529-006, DEC-20260528-001). Driver upgraded to 580.159.04 for CUDA 13. vLLM 0.21.0 serving commercial AWQ model `Qwen3.6-27B-AWQ-INT4` on GPU 1. llmcompressor quantizes BF16 → AWQ (19.17 GB from 52 GB). vLLM loading blocked on post-quantization config patching (Marlin kernel shape requirements, missing multimodal weights).
 - 2026-05-26: **Prod Dockerfile default flipped to V2+ON + 0004** (RSH-20260526-003). Pending: rebuild + recreate `grimoire:local` container.
 
