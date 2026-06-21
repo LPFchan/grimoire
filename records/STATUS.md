@@ -1,8 +1,8 @@
 # Current Status
 
-**Snapshot:** 2026-05-26
-**Posture:** Bee migration complete — Atomic CUDA FA **V2+ON is the default for `grimoire:local`**
-**Focus:** rebuild + roll forward to V2+ON-served prod (Dockerfile defaults updated; next `docker compose up -d --build --force-recreate grimoire` flips it live)
+**Snapshot:** 2026-05-30
+**Posture:** vLLM migration prototyping active — llmcompressor quantization pipeline validated, vLLM serving confirmed with commercial AWQ models
+**Focus:** Complete AWQ quantization for all 5 target models; resolve vLLM loading config for custom-quantized models
 
 ## Migration Summary
 
@@ -23,6 +23,7 @@ Patch chain in `patches/atomic-llama-cpp/`, applied in order by `Dockerfile`:
 
 ## Recent Changes
 
+- 2026-05-30: **vLLM migration prototype — llmcompressor quantization pipeline validated** (RSH-20260529-006, DEC-20260528-001). Driver upgraded to 580.159.04 for CUDA 13. vLLM 0.21.0 serving commercial AWQ model `Qwen3.6-27B-AWQ-INT4` on GPU 1. llmcompressor quantizes BF16 → AWQ (19.17 GB from 52 GB). vLLM loading blocked on post-quantization config patching (Marlin kernel shape requirements, missing multimodal weights).
 - 2026-05-26: **Prod Dockerfile default flipped to V2+ON + 0004** (RSH-20260526-003). Pending: rebuild + recreate `grimoire:local` container.
 
 
