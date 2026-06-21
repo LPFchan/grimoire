@@ -3,12 +3,16 @@
 import json
 
 from grimoire.plugins.base import Plugin, PluginManager
+from grimoire.plugins.tool_arg_sanitize import ToolArgSanitizePlugin
 from grimoire.plugins.buun_template import BuunTemplatePlugin
 from grimoire.plugins.structured_cot import QwenStructuredCotPlugin
 from grimoire.plugins.pflash_awareness import PflashAwarenessPlugin
 from grimoire.plugins.tool_plan import StructuredToolPlanPlugin
 
 plugin_manager = PluginManager([
+    # Runs first: clean malformed tool-call args before any downstream transform
+    # or the backend's func_args_not_string sees them.
+    ToolArgSanitizePlugin(),
     BuunTemplatePlugin(),
     QwenStructuredCotPlugin(),
     PflashAwarenessPlugin(),
