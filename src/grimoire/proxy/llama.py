@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
+from grimoire.proxy.client import get_proxy_client
 from grimoire.dflash.kv_cache_store import KVCacheStore
 from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
@@ -255,44 +256,40 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 detail=f"pflash compression setup failed for {active.name}: {e}",
             )
 
-    client = httpx.AsyncClient(timeout=None)
+    client = get_proxy_client()
+    slot_guard = _slot_lock(active)
+    await slot_guard.acquire()
     try:
-        slot_guard = _slot_lock(active)
-        await slot_guard.acquire()
-        try:
-            payload = await plugin_manager.before_backend_request(
-                payload, active.name, model_cfg, backend_model_id, client, url, headers
-            )
+        payload = await plugin_manager.before_backend_request(
+            payload, active.name, model_cfg, backend_model_id, client, url, headers
+        )
 
-            # Three-tier KV cache: VRAM → RAM (tmpfs) → SSD
-            # Within same conversation: slot stays alive, cache_prompt handles delta.
-            # On conversation switch: save old to tmpfs, restore target if cached.
-            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
-            prev_conv = getattr(active, "_current_conv_id", None)
-            if _save_hash is not None:
-                # pflash path: restore by compressed content hash
-                await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
-            elif validated_conversation_id and validated_conversation_id != prev_conv:
-                # Same-model conversation switch: save old slot, restore target
-                if prev_conv:
-                    await store.save_conv(client, slot_url, prev_conv)
-                await store.restore_conv(client, slot_url, validated_conversation_id)
-                active._current_conv_id = validated_conversation_id
+        # Three-tier KV cache: VRAM → RAM (tmpfs) → SSD
+        # Within same conversation: slot stays alive, cache_prompt handles delta.
+        # On conversation switch: save old to tmpfs, restore target if cached.
+        slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+        prev_conv = getattr(active, "_current_conv_id", None)
+        if _save_hash is not None:
+            # pflash path: restore by compressed content hash
+            await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
+        elif validated_conversation_id and validated_conversation_id != prev_conv:
+            # Same-model conversation switch: save old slot, restore target
+            if prev_conv:
+                await store.save_conv(client, slot_url, prev_conv)
+            await store.restore_conv(client, slot_url, validated_conversation_id)
+            active._current_conv_id = validated_conversation_id
 
-            upstream = await client.send(
-                client.build_request(
-                    "POST",
-                    url,
-                    headers=headers,
-                    json=payload,
-                ),
-                stream=True,
-            )
-        except Exception:
-            slot_guard.release()
-            raise
+        upstream = await client.send(
+            client.build_request(
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+            ),
+            stream=True,
+        )
     except Exception:
-        await client.aclose()
+        slot_guard.release()
         raise
 
     non_streaming = not payload.get("stream", True)
@@ -330,7 +327,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     yield chunk
         finally:
             await upstream.aclose()
-            await client.aclose()
             # KV prefix cache: save slot by content hash (pflash path only)
             if _save_hash:
                 async with httpx.AsyncClient(timeout=5) as sc:

@@ -94,6 +94,11 @@ from grimoire.proxy.llama import (
     _backend_request_headers,
     _backend_response_headers,
 )
+from grimoire.proxy.client import (
+    init_proxy_client,
+    close_proxy_client,
+    get_proxy_client,
+)
 from grimoire.routes.history import router as history_router
 from grimoire.routes.dashboard import router as dashboard_router
 from grimoire.routes.models import router as models_router
@@ -144,6 +149,7 @@ logger.info(f"Grimoire starting with {manager.gpu_count} GPU(s)")
 
 @asynccontextmanager
 async def lifespan(_app):
+    init_proxy_client()
     imported = usage_store.import_legacy_token_stats(
         LEGACY_STATS_PATH,
         identity_hash(config.API_KEY or "anonymous"),
@@ -155,6 +161,15 @@ async def lifespan(_app):
     initial_model = getattr(_app.state, "initial_model", None)
     if initial_model:
         await manager.start_model(initial_model)
+
+    for name, cfg in registry.snapshot().get("models", {}).items():
+        if isinstance(cfg, dict) and cfg.get("always-on") and isinstance(cfg.get("cpu-only"), bool):
+            if name != initial_model:
+                try:
+                    await manager.start_model(name)
+                except Exception as exc:
+                    logger.error("Failed to start always-on model %s: %s", name, exc)
+
     sampler_task = asyncio.create_task(telemetry_sampler())
     try:
         yield
@@ -165,6 +180,7 @@ async def lifespan(_app):
         except (asyncio.CancelledError, Exception):
             pass
         await manager.shutdown()
+        await close_proxy_client()
 
 
 app = FastAPI(title="Grimoire Gateway", version="0.1.0", lifespan=lifespan)
@@ -330,10 +346,9 @@ async def chat_responses(request: Request):
         payload.pop("max_output_tokens", None)
         payload.pop("max_tokens", None)
 
-    client = None
     try:
         active = await manager.start_model(model_name)
-        client = httpx.AsyncClient(timeout=None)
+        client = get_proxy_client()
         headers = _backend_request_headers(request.headers)
 
         payload = copy.deepcopy(payload)
@@ -347,12 +362,8 @@ async def chat_responses(request: Request):
         )
         upstream = await client.send(req, stream=True)
     except HTTPException:
-        if client:
-            await client.aclose()
         raise
     except Exception as e:
-        if client:
-            await client.aclose()
         logger.error(f"Failed to proxy /v1/responses: {e}")
         raise HTTPException(status_code=502, detail="Model server unavailable")
 
@@ -362,7 +373,6 @@ async def chat_responses(request: Request):
                 yield chunk
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = _backend_response_headers(upstream.headers)
     return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=response_headers)
@@ -388,10 +398,9 @@ async def proxy_v1(request: Request, path: str):
     if not model_name:
         raise HTTPException(status_code=404, detail="No target model resolved for proxy request")
 
-    client = None
     try:
         active = await manager.start_model(model_name)
-        client = httpx.AsyncClient(timeout=None)
+        client = get_proxy_client()
         headers = _backend_request_headers(request.headers)
 
         if isinstance(payload, dict):
@@ -415,12 +424,8 @@ async def proxy_v1(request: Request, path: str):
 
         upstream = await client.send(req, stream=True)
     except HTTPException:
-        if client:
-            await client.aclose()
         raise
     except Exception as e:
-        if client:
-            await client.aclose()
         logger.error(f"Failed to proxy /v1/{path}: {e}")
         raise HTTPException(status_code=502, detail="Model server unavailable")
 
@@ -430,7 +435,6 @@ async def proxy_v1(request: Request, path: str):
                 yield chunk
         finally:
             await upstream.aclose()
-            await client.aclose()
 
     response_headers = _backend_response_headers(upstream.headers)
     return StreamingResponse(body_iter(), status_code=upstream.status_code, headers=response_headers)

@@ -124,7 +124,7 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
              patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda payload, *_: payload), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=fake_before_backend_request), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda stream, *_: stream), \
-             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient):
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient):
             with self.assertRaises(HTTPException) as cm:
                 await llama_proxy._proxy_chat(active.name, payload, active, user_hash=None, conversation_id="conv-1")
 
@@ -153,7 +153,7 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
              patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
-             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient), \
              patch.object(llama_proxy, "_save_kv", side_effect=capture_save):
             response = await llama_proxy._proxy_chat(active.name, payload, active)
             async for _ in response.body_iterator:
@@ -182,7 +182,7 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
              patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
-             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient), \
              patch.object(llama_proxy, "_save_kv", side_effect=capture_save):
             response = await llama_proxy._proxy_chat(active.name, payload, active)
             async for _ in response.body_iterator:
@@ -211,7 +211,7 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
              patch.object(llama_proxy, "_prompt_layout_from_messages", return_value=([1], [])), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
-             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient), \
              patch.object(llama_proxy, "_save_kv", side_effect=capture_save):
             response = await llama_proxy._proxy_chat(active.name, payload, active)
             async for _ in response.body_iterator:
@@ -235,7 +235,7 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
              patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
-             patch.object(llama_proxy.httpx, "AsyncClient", _FakeClient), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient), \
              patch.object(llama_proxy, "_save_kv", side_effect=capture_save):
             response = await llama_proxy._proxy_chat(active.name, payload, active)
             async for _ in response.body_iterator:
