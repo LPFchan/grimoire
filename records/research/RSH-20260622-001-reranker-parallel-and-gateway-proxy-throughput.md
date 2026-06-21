@@ -35,6 +35,26 @@ Through the gateway after the proxy fix (below), docs=1, concurrency 32:
 it has no throughput effect. Scaling ctx with parallel fills VRAM but buys
 nothing.
 
+### The embedder confirms the same pattern
+
+`eastself-embedder-0.6B` (also a prefill-only encoder) behaves identically.
+Gateway embeddings, batch=1, concurrency 32:
+
+| parallel | req/s |
+| --- | --- |
+| 1 | 112.1 |
+| 4 | 83.9 |
+| 8 | 81.9 |
+
+Throughput is GPU-compute-bound at ~115 texts/s and does not improve with input
+**batching** either (batch=1 → 112, batch=8 → 117, batch=16 → 117 texts/s);
+batching only trades request rate for per-request latency. The gateway fix also
+closed the embeddings gap: gateway 112.5 vs direct 115.7 req/s (~3% overhead).
+
+General rule: both always-on encoders are compute-bound at their ceiling
+(~115 texts/s embed, ~69 pairs/s rerank); neither benefits from `--parallel`,
+input batching, or larger `ctx-size`. Keep both at `parallel=1`.
+
 ### The real limiter was the gateway proxy's per-request httpx client
 
 Every proxy path (`proxy_v1`, `/v1/responses`, `_proxy_chat`) created a fresh
