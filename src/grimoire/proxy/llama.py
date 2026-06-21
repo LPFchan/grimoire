@@ -111,6 +111,12 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     log = logging.getLogger(__name__)
 
     payload = copy.deepcopy(payload)
+    if payload.get("stream"):
+        so = payload.get("stream_options")
+        if isinstance(so, dict):
+            so["include_usage"] = True
+        else:
+            payload["stream_options"] = {"include_usage": True}
     payload = plugin_manager.before_request(payload, active.name, model_cfg)
     backend_model_id = await active.get_backend_model_id()
     payload["model"] = backend_model_id

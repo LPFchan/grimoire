@@ -3,6 +3,15 @@
 import json
 
 
+def _nested(obj, *keys):
+    cur = obj
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
 def _extract_assistant_text(raw_bytes):
     text = raw_bytes.decode("utf-8", errors="ignore")
     pieces = []
@@ -54,7 +63,11 @@ def _usage_from_object(data):
         return None
     input_tokens = usage.get("prompt_tokens", usage.get("input_tokens", 0))
     output_tokens = usage.get("completion_tokens", usage.get("output_tokens", 0))
-    cached_tokens = usage.get("cached_tokens")
+    cached_tokens = (
+        usage.get("cached_tokens")
+        or _nested(usage, "prompt_tokens_details", "cached_tokens")
+        or _nested(usage, "input_tokens_details", "cached_tokens")
+    )
     try:
         input_tokens = int(input_tokens or 0)
         output_tokens = int(output_tokens or 0)
