@@ -707,6 +707,13 @@ class ModelRegistry:
             if gpu_count is not None and fixed_gpu >= gpu_count:
                 return False, f"Pinned GPU {fixed_gpu} is outside available range 0-{gpu_count - 1}"
 
+        # A malformed vram-budget-mib (string/float/<=0) would otherwise be
+        # silently coerced to None by the allocator and revert the model to
+        # exclusive one-per-GPU — surface it as a config error instead.
+        budget = cfg.get("vram-budget-mib")
+        if budget is not None and (isinstance(budget, bool) or not isinstance(budget, int) or budget <= 0):
+            return False, f"'vram-budget-mib' for '{model_name}' must be a positive integer, got {budget!r}"
+
         return True, "OK"
 
 

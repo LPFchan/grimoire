@@ -125,12 +125,18 @@ def build_cmd(cfg, port, alias=None):
         "--ctx-size", str(cfg.get("ctx-size", config.DEFAULT_CTX_SIZE)),
         "--n-gpu-layers", str(cfg.get("n-gpu-layers", config.DEFAULT_N_GPU_LAYERS)),
         "--parallel", str(cfg.get("parallel", 1)),
-        "--jinja",
-        "--flash-attn", "on",
+    ]
+
+    capabilities = cfg.get("capabilities", [])
+    if "completion" in capabilities:
+        cmd.append("--jinja")
+
+    cmd.extend([
+        "--flash-attn", "on" if not cfg.get("cpu-only") else "off",
         "--metrics",
         "--slot-save-path", "/dev/shm/grimoire-slots",
         "--predict", str(cfg.get("predict", config.DEFAULT_PREDICT)),
-    ]
+    ])
 
     effective_alias = alias or cfg.get("alias")
     if effective_alias:
@@ -216,15 +222,20 @@ class ActiveModel:
         """Start the llama-server process."""
         cmd = build_cmd(self.cfg, self.port, alias=self.name)
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
-        # Put turboquant ggml libraries first so llama-server doesn't
-        # accidentally load dflash's (older) ggml-cuda which lacks the
-        # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
-        _prepend_library_paths(
-            env,
-            [config.TURBOQUANT_LIB_DIR, config.TURBOQUANT_LIB64_DIR],
-            exclude_prefixes=(config.PFLASH_HOME,),
-        )
+        if self.gpu is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+            # Put turboquant ggml libraries first so llama-server doesn't
+            # accidentally load dflash's (older) ggml-cuda which lacks the
+            # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
+            _prepend_library_paths(
+                env,
+                [config.TURBOQUANT_LIB_DIR, config.TURBOQUANT_LIB64_DIR],
+                exclude_prefixes=(config.PFLASH_HOME,),
+            )
+        else:
+            # CPU-only: hide GPUs entirely so llama-server's CUDA backend
+            # doesn't try to init (and OOM) when VRAM is full.
+            env["CUDA_VISIBLE_DEVICES"] = ""
 
         # LD_PRELOAD the park/unpark shim for park models
         if self.cfg.get("park-unpark"):
@@ -250,7 +261,7 @@ class ActiveModel:
                     verify_tokens, n_max, branch_budget, draft_topk, tree_budget
                 )
 
-        logger.info(f"Starting {self.name} (llama) on GPU {self.gpu}, port {self.port}")
+        logger.info(f"Starting {self.name} (llama) on {'CPU' if self.gpu is None else f'GPU {self.gpu}'}, port {self.port}")
         logger.info(f"Command: {' '.join(cmd)}")
 
         self.process = subprocess.Popen(cmd, env=env, preexec_fn=_spawn_child_preexec)
@@ -436,23 +447,140 @@ class ModelManager:
         self.gpu_count = gpu_count
         self._lock = asyncio.Lock()
 
-    def _find_free_gpu(self):
-        """Find a GPU that has no active model."""
-        used_gpus = {m.gpu for m in self.active.values()}
-        for gpu in range(self.gpu_count):
-            if gpu not in used_gpus:
-                return gpu
+    def _incumbents_on(self, gpu):
+        """All active models currently placed on a GPU."""
+        return [(name, active) for name, active in self.active.items() if active.gpu == gpu]
+
+    def _is_budgeted_incumbent(self, active):
+        """A budgeted incumbent declared a footprint and shares spare VRAM; an
+        unbudgeted incumbent owns its GPU exclusively."""
+        return self._model_budget_mib(active.cfg) is not None
+
+    @staticmethod
+    def _model_budget_mib(cfg):
+        """Return declared `vram-budget-mib`, or None for unbudgeted (exclusive) models.
+
+        Budgeted models may co-locate on a GPU as long as free VRAM covers the
+        budget; unbudgeted models keep the strict one-model-per-GPU behavior.
+        """
+        budget = cfg.get("vram-budget-mib")
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget > 0:
+            return budget
         return None
 
-    def _find_oldest_evictable(self):
-        """Find the oldest-loaded non-pinned active model."""
-        oldest = None
+    def _get_gpu_free_vram_mib(self, gpu_id):
+        """Query nvidia-smi for free VRAM (MiB) on a GPU. Returns None on failure."""
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", f"--id={gpu_id}",
+                 "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return int(result.stdout.strip())
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+            pass
+        return None
+
+    def _allocate_exclusive(self, pinned_gpu):
+        """Allocation for an unbudgeted (exclusive) model.
+
+        An exclusive model owns its GPU only with respect to other exclusive
+        models; budgeted incumbents (e.g. the always-on small models) declared a
+        footprint and are treated as non-blocking co-tenants. An exclusive model
+        therefore co-locates on top of budgeted incumbents without evicting them,
+        and never queries nvidia-smi (it declares no budget of its own).
+
+        Returns (gpu_id, [(name, ActiveModel), ...] incumbents_to_evict).
+        """
+        if pinned_gpu is not None:
+            evict = []
+            for name, active in self._incumbents_on(pinned_gpu):
+                if self._is_budgeted_incumbent(active):
+                    continue  # budgeted co-tenant shares the GPU; never evicted here
+                if registry.is_fixed(name):
+                    raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {pinned_gpu}")
+                evict.append((name, active))
+            return pinned_gpu, evict
+
+        # Unpinned tiering, safest-for-an-undeclared-footprint first:
+        #   1. a truly-empty GPU;
+        #   2. evict the oldest non-pinned exclusive incumbent and take its GPU
+        #      wholesale — preserves exclusive-swap semantics so loading a second
+        #      large chat model swaps it in rather than cramming it onto a small
+        #      model's GPU and OOMing;
+        #   3. co-locate on a GPU hosting only budgeted co-tenants — a genuine
+        #      last resort, used only when there is no exclusive to evict.
+        # Budgeted incumbents are never evicted by an exclusive model.
+        empty, budgeted_only = [], []
+        for gpu in range(self.gpu_count):
+            incumbents = self._incumbents_on(gpu)
+            if not incumbents:
+                empty.append(gpu)
+            elif all(self._is_budgeted_incumbent(a) for _, a in incumbents):
+                budgeted_only.append(gpu)
+        if empty:
+            return empty[0], []
+
+        victim = None
         for name, active in self.active.items():
-            if registry.is_fixed(name):
+            if self._is_budgeted_incumbent(active) or registry.is_fixed(name):
                 continue
-            if oldest is None or active.started < oldest.started:
-                oldest = active
-        return oldest
+            if victim is None or active.started < victim[1].started:
+                victim = (name, active)
+        if victim is not None:
+            return victim[1].gpu, [victim]
+
+        if budgeted_only:
+            return budgeted_only[0], []
+        raise RuntimeError("All GPUs occupied by pinned or budgeted models")
+
+    async def _allocate_budgeted(self, pinned_gpu, budget):
+        """VRAM-budget allocation (budgeted/colocatable models).
+
+        Returns (gpu_id, incumbents_to_evict). Prefers a GPU where the model fits
+        without disturbing anyone; only if none exists does it evict non-pinned
+        incumbents (pinned incumbents are never evicted). A post-eviction VRAM
+        re-check in start_model guards against eviction not freeing enough.
+        """
+        candidates = [pinned_gpu] if pinned_gpu is not None else list(range(self.gpu_count))
+
+        last_error = None
+        # Pass 1: co-locate without eviction if free VRAM already covers the budget.
+        for gpu in candidates:
+            free = await asyncio.to_thread(self._get_gpu_free_vram_mib, gpu)
+            if free is None:
+                last_error = f"nvidia-smi query failed for GPU {gpu}"
+                continue
+            if free >= budget:
+                return gpu, []
+            last_error = f"GPU {gpu} free VRAM {free} MiB < budget {budget} MiB"
+
+        # Pass 2: make room by evicting non-pinned incumbents (oldest first).
+        # v1 evicts ALL non-pinned incumbents on the chosen GPU rather than the
+        # minimum needed — the manager doesn't track per-model VRAM, so it relies
+        # on the post-eviction free-VRAM re-check in start_model to confirm fit.
+        for gpu in candidates:
+            evictable = sorted(
+                ((n, a) for n, a in self.active.items()
+                 if a.gpu == gpu and not registry.is_fixed(n)),
+                key=lambda item: item[1].started,
+            )
+            if evictable:
+                return gpu, evictable
+
+        raise RuntimeError(last_error or "No suitable GPU found")
+
+    async def _allocate_gpu(self, model_name, cfg):
+        """Allocate a GPU for a model. Returns (gpu_id, incumbents_to_evict)."""
+        pinned_gpu = registry.get_fixed_gpu(model_name)
+        if pinned_gpu is not None and pinned_gpu >= self.gpu_count:
+            raise RuntimeError(f"Pinned GPU {pinned_gpu} is outside available range")
+
+        budget = self._model_budget_mib(cfg)
+        if budget is None:
+            return self._allocate_exclusive(pinned_gpu)
+        return await self._allocate_budgeted(pinned_gpu, budget)
 
     def _find_available_port(self, gpu_id):
         """Find an available port for a model on a given GPU."""
@@ -469,6 +597,15 @@ class ModelManager:
                 return port
             port += 1
         raise RuntimeError("No available ports found")
+
+    CPU_PORT_BASE = 8500
+
+    def _find_cpu_port(self):
+        used = {m.port for m in self.active.values() if m.is_running()}
+        port = self.CPU_PORT_BASE
+        while port in used:
+            port += 1
+        return port
 
     @staticmethod
     def _startup_timeout(cfg):
@@ -538,26 +675,21 @@ class ModelManager:
             if not valid:
                 raise RuntimeError(reason)
 
-            incumbents = []
-            pinned_gpu = registry.get_fixed_gpu(model_name)
-            if pinned_gpu is not None:
-                if pinned_gpu >= self.gpu_count:
-                    raise RuntimeError(f"Pinned GPU {pinned_gpu} is outside available range")
-                gpu = pinned_gpu
-                for name, active in list(self.active.items()):
-                    if active.gpu != gpu:
-                        continue
-                    if registry.is_fixed(name):
-                        raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {gpu}")
-                    incumbents.append((name, active))
-            else:
-                gpu = self._find_free_gpu()
-                if gpu is None:
-                    victim = self._find_oldest_evictable()
-                    if not victim:
-                        raise RuntimeError("All GPUs occupied by pinned models")
-                    incumbents.append((victim.name, victim))
-                    gpu = victim.gpu
+            if cfg.get("cpu-only"):
+                if model_name in self.active:
+                    if self.active[model_name].is_running():
+                        return self.active[model_name]
+                    await asyncio.to_thread(self.active[model_name].stop)
+                    del self.active[model_name]
+
+                port = self._find_cpu_port()
+                active = ActiveModel(model_name, cfg, port, gpu=None)
+                self.active[model_name] = active
+                await self._start_active_model(active)
+                return active
+
+            budget = self._model_budget_mib(cfg)
+            gpu, incumbents = await self._allocate_gpu(model_name, cfg)
 
             ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
             port = self._find_available_port_excluding(gpu, ignored_ports)
@@ -567,6 +699,25 @@ class ModelManager:
                 for name, incumbent in incumbents:
                     logger.info(f"Evicting {name} from GPU {gpu} for replacement model {model_name}")
                     await asyncio.to_thread(incumbent.stop)
+                # Budgeted co-location relies on freed VRAM; after evicting, let the
+                # CUDA contexts tear down, then confirm the budget is actually met
+                # before launching. (No eviction => pass 1 already verified the fit.)
+                if budget is not None and incumbents:
+                    await asyncio.sleep(0.5)
+                    free = await asyncio.to_thread(self._get_gpu_free_vram_mib, gpu)
+                    if free is None:
+                        # Eviction already happened; a transient nvidia-smi failure
+                        # shouldn't abort + roll back. Proceed and let the backend
+                        # surface an OOM if the budget genuinely wasn't freed.
+                        logger.warning(
+                            f"Post-eviction VRAM query failed on GPU {gpu}; "
+                            f"proceeding optimistically for {model_name}"
+                        )
+                    elif free < budget:
+                        raise RuntimeError(
+                            f"Post-eviction VRAM check failed on GPU {gpu}: "
+                            f"free={free} MiB, budget={budget} MiB"
+                        )
                 self.active[model_name] = active
                 await self._start_active_model(active)
             except Exception as e:

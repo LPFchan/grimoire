@@ -123,9 +123,10 @@ def _validate_model_config(data: dict) -> None:
     if not file_val or not isinstance(file_val, str):
         raise HTTPException(status_code=400, detail="'file' is required and must be a string")
     for field in ("ctx-size", "predict", "parallel", "n-gpu-layers",
-                  "image-min-tokens", "image-max-tokens"):
+                  "image-min-tokens", "image-max-tokens", "vram-budget-mib"):
         val = data.get(field)
-        if val is not None and (not isinstance(val, int) or val <= 0):
+        # bool is an int subclass; reject it so `true` isn't read as 1.
+        if val is not None and (isinstance(val, bool) or not isinstance(val, int) or val <= 0):
             raise HTTPException(status_code=400, detail=f"'{field}' must be a positive integer")
     for field in ("cache-type-k", "cache-type-v"):
         val = data.get(field)
