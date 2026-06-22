@@ -80,6 +80,29 @@ generation. It did **not** hold for high-RPS small requests (rerank/embeddings),
 where the per-request connection setup dominates and caps throughput at ~30/s.
 Both can be true; the earlier memo only measured the chat regime.
 
+### Scaling across both GPUs: data parallelism, not `--parallel`
+
+A tiny model does not benefit from tensor-splitting across GPUs; the way to use
+both is independent replicas (one per GPU) with the load split across them.
+Measured (embeddings, concurrency 32):
+
+| Setup | req/s | vs 1 GPU |
+| --- | --- | --- |
+| 1 GPU | 115 | 1.0x |
+| 2 GPUs, **direct** to llama-servers | 226 | 2.0x |
+| 2 GPUs, **through the single-process gateway** | ~141 | 1.2x |
+
+The GPUs scale perfectly, but the single-threaded gateway became the new ceiling
+(~150 req/s, ~60-67% of one core forwarding each request twice). A lock-free fast
+path in `start_model` gave only +5% — the cap is cumulative per-request async
+overhead, not one hotspot.
+
+The fix (DEC-20260622-002): N stateless proxy workers + a shared route table +
+data-parallel replicas round-robined under one model name. A 4-worker PoC hit
+223.7 req/s; the integrated production gateway hits **224 req/s** under a single
+model name across both GPUs — the full 2x. Chat stays on the single manager
+(stateful KV slots/pflash; per-request overhead amortizes over generation).
+
 ## Rejected paths
 
 - Raising `--parallel` for the reranker — flat-to-negative throughput.
