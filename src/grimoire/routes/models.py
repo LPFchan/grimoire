@@ -146,6 +146,10 @@ def _validate_model_config(data: dict) -> None:
     if extra_args is not None:
         if not isinstance(extra_args, list) or not all(isinstance(a, str) for a in extra_args):
             raise HTTPException(status_code=400, detail="'extra-args' must be an array of strings")
+    replica_peers = data.get("replica_peers")
+    if replica_peers is not None:
+        if not isinstance(replica_peers, list) or not all(isinstance(a, str) for a in replica_peers):
+            raise HTTPException(status_code=400, detail="'replica_peers' must be an array of strings")
     spec_type = data.get("speculative-type")
     if spec_type == "mtp":
         if not data.get("mtp-head"):

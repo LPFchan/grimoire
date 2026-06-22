@@ -198,6 +198,9 @@
         "--embeddings",
         "--pooling",
         "last"
+      ],
+      "replica_peers": [
+        "eastself-embedder-0.6B-gpu0"
       ]
     },
     "eastself-reranker-0.6B": {
@@ -218,12 +221,61 @@
       "vram-budget-mib": 1800,
       "extra-args": [
         "--reranking"
+      ],
+      "replica_peers": [
+        "eastself-reranker-0.6B-gpu0"
       ]
+    },
+    "eastself-embedder-0.6B-gpu0": {
+      "file": "gguf/Qwen3-Embedding-0.6B-Q8_0.gguf",
+      "capabilities": [
+        "embedding"
+      ],
+      "cost": {
+        "input": 0.0,
+        "output": 0.0,
+        "cache_read": 0.0
+      },
+      "ctx-size": 2048,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "always-on": true,
+      "cpu-only": false,
+      "vram-budget-mib": 1800,
+      "extra-args": [
+        "--embeddings",
+        "--pooling",
+        "last"
+      ],
+      "alias": "eastself-embedder-0.6B"
+    },
+    "eastself-reranker-0.6B-gpu0": {
+      "file": "gguf/Qwen3-Reranker-0.6B.Q8_0.gguf",
+      "capabilities": [
+        "reranking"
+      ],
+      "cost": {
+        "input": 0.0,
+        "output": 0.0,
+        "cache_read": 0.0
+      },
+      "ctx-size": 2048,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "always-on": true,
+      "cpu-only": false,
+      "vram-budget-mib": 1800,
+      "extra-args": [
+        "--reranking"
+      ],
+      "alias": "eastself-reranker-0.6B"
     }
   },
   "fixed": {
     "eastself-embedder-0.6B": 1,
-    "eastself-reranker-0.6B": 1
+    "eastself-reranker-0.6B": 1,
+    "eastself-embedder-0.6B-gpu0": 0,
+    "eastself-reranker-0.6B-gpu0": 0
   },
   "family_defaults": {
     "qwen": {

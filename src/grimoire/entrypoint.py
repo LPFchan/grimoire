@@ -511,13 +511,57 @@ async def cors_proxy(request: Request):
     )
 
 
+@app.post("/internal/ensure-loaded")
+async def ensure_loaded(request: Request):
+    """Internal: proxy workers call this to load a cold model on demand.
+
+    Localhost-only (manager binds 127.0.0.1); the public-facing proxy enforces auth.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    model = payload.get("model") if isinstance(payload, dict) else None
+    if not model:
+        raise HTTPException(status_code=400, detail="model required")
+    await manager.start_model(model)
+    return {"status": "ok", "model": model}
+
+
 _mount_webui()
 
 
 def main():
     args = parse_args()
     app.state.initial_model = args.model
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+    manager_host = "127.0.0.1"
+    manager_port = int(os.environ.get("GRIMOIRE_MANAGER_PORT", "9000"))
+    proxy_workers = int(os.environ.get("GRIMOIRE_PROXY_WORKERS", "4"))
+
+    # Control plane (this process): owns ModelManager + admin routes, on an
+    # internal port. Data plane: N stateless proxy workers own the public port and
+    # forward to the manager. This is what lets request throughput scale past a
+    # single Python process (see RSH-20260622-001).
+    proxy_env = {**os.environ, "GRIMOIRE_MANAGER_URL": f"http://{manager_host}:{manager_port}"}
+    proxy = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "grimoire.proxy_app:app",
+         "--host", args.host, "--port", str(args.port),
+         "--workers", str(proxy_workers), "--log-level", "warning"],
+        env=proxy_env,
+    )
+    logger.info(
+        "Started %d proxy workers on %s:%d; manager on %s:%d",
+        proxy_workers, args.host, args.port, manager_host, manager_port,
+    )
+    try:
+        uvicorn.run(app, host=manager_host, port=manager_port, log_level="info")
+    finally:
+        proxy.terminate()
+        try:
+            proxy.wait(timeout=10)
+        except Exception:
+            proxy.kill()
 
 
 if __name__ == "__main__":

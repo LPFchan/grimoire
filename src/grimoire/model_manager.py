@@ -23,6 +23,7 @@ from grimoire.registry import (
     _strip_hf_prefix,
     BACKEND_LLAMA,
 )
+from grimoire.proxy.routes_table import publish as _publish_route_table
 
 logger = logging.getLogger(__name__)
 
@@ -447,6 +448,35 @@ class ModelManager:
         self.gpu_count = gpu_count
         self._lock = asyncio.Lock()
 
+    def _build_route_table(self):
+        """Map each running model -> its replica backends for the proxy workers.
+
+        A model's replicas are itself plus any running `replica_peers` (sibling
+        data-parallel copies on other GPUs), so the proxy can round-robin a single
+        model name across GPUs.
+        """
+        running = {name: a for name, a in self.active.items() if a.is_running()}
+
+        def entry(name):
+            a = running[name]
+            return {"port": a.port, "backend_model_id": a.cfg.get("alias") or a.backend_model_id or name}
+
+        models = {}
+        for name in running:
+            replicas = [entry(name)]
+            for peer in (registry.get(name) or {}).get("replica_peers", []) or []:
+                if peer != name and peer in running:
+                    replicas.append(entry(peer))
+            models[name] = {"status": "loaded", "replicas": replicas}
+        return models
+
+    def _publish_routes(self):
+        """Publish the current route table for the stateless proxy workers."""
+        try:
+            _publish_route_table(self._build_route_table())
+        except Exception as e:
+            logger.warning(f"route table publish failed: {e}")
+
     def _incumbents_on(self, gpu):
         """All active models currently placed on a GPU."""
         return [(name, active) for name, active in self.active.items() if active.gpu == gpu]
@@ -660,9 +690,17 @@ class ModelManager:
             raise KeyError(f"Model '{model_name}' not found in registry")
         model_name = resolved_name
 
+        # Fast path: an already-running model is the common case for proxied
+        # traffic. Return it without taking the global lock so high-RPS requests
+        # don't serialize through one async critical section. Safe in asyncio:
+        # no await between the dict read and is_running(), so it's atomic; the
+        # rare not-running case falls through to the locked start path.
+        existing = self.active.get(model_name)
+        if existing is not None and existing.is_running():
+            return existing
+
         async with self._lock:
             if model_name in self.active and self.active[model_name].is_running():
-                logger.info(f"{model_name} is already active")
                 return self.active[model_name]
             if model_name in self.active:
                 del self.active[model_name]
@@ -686,6 +724,7 @@ class ModelManager:
                 active = ActiveModel(model_name, cfg, port, gpu=None)
                 self.active[model_name] = active
                 await self._start_active_model(active)
+                self._publish_routes()
                 return active
 
             budget = self._model_budget_mib(cfg)
@@ -737,6 +776,7 @@ class ModelManager:
                 if self.active.get(name) is incumbent:
                     self.active.pop(name, None)
             logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
+            self._publish_routes()
             return active
 
     def get_status(self, model_name):
@@ -755,6 +795,7 @@ class ModelManager:
                 return False
             await asyncio.to_thread(active.stop)
             logger.info(f"Stopped {model_name}")
+            self._publish_routes()
             return True
 
     def get_active(self, model_name):
@@ -776,6 +817,7 @@ class ModelManager:
                 logger.info(f"Shutting down {name}")
                 await asyncio.to_thread(active.stop)
             self.active.clear()
+            self._publish_routes()
 
 
 def detect_gpu_count():
