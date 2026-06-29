@@ -452,6 +452,7 @@ class ModelRegistry:
         self.seed_path = REGISTRY_SEED_PATH if seed_path is None else seed_path
         self._lock = RLock()
         self._stamp = None
+        self._loaded_from = None
         self._data = {"models": {}, "fixed": {}}
         self.reload()
 
@@ -470,30 +471,59 @@ class ModelRegistry:
             family_defaults = {}
         return {**data, "models": models, "fixed": fixed, "family_defaults": family_defaults}
 
-    def _load(self):
-        path = self.path
-        if not os.path.exists(path) and self.seed_path and os.path.exists(self.seed_path):
-            path = self.seed_path
+    @staticmethod
+    def _file_stamp(path):
+        """Return mtime_ns of a file, or None if it doesn't exist."""
         try:
-            with open(path) as f:
-                return self._normalize(json.load(f))
+            return os.stat(path).st_mtime_ns
+        except FileNotFoundError:
+            return None
+
+    def _latest_stamp(self):
+        """Return the highest mtime of runtime and seed paths."""
+        rt = self._file_stamp(self.path)
+        se = self._file_stamp(self.seed_path) if self.seed_path else None
+        if rt is None and se is None:
+            return None
+        if rt is None:
+            return se
+        if se is None:
+            return rt
+        return max(rt, se)
+
+    def _load(self):
+        """Load from the newest source (runtime or seed)."""
+        rt_stamp = self._file_stamp(self.path) or 0
+        se_stamp = self._file_stamp(self.seed_path) or 0
+
+        if rt_stamp == 0 and se_stamp == 0:
+            return {"models": {}, "fixed": {}}
+
+        if rt_stamp >= se_stamp:
+            source = self.path
+        else:
+            source = self.seed_path
+
+        try:
+            with open(source) as f:
+                data = self._normalize(json.load(f))
+
+            if source == self.seed_path and os.path.exists(self.path):
+                logger.info("Registry: seed (%s) is newer than runtime; loading from seed and syncing", self.seed_path)
+                self._loaded_from = self.seed_path
+                self._write_data(data)
+            else:
+                self._loaded_from = source
+
+            return data
         except FileNotFoundError:
             return {"models": {}, "fixed": {}}
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse registry: {e}")
             return {"models": {}, "fixed": {}}
 
-    def _stat_stamp(self):
-        path = self.path
-        if not os.path.exists(path) and self.seed_path and os.path.exists(self.seed_path):
-            path = self.seed_path
-        try:
-            return os.stat(path).st_mtime_ns
-        except FileNotFoundError:
-            return None
-
     def _maybe_reload(self):
-        stamp = self._stat_stamp()
+        stamp = self._latest_stamp()
         if stamp != self._stamp:
             self._data = self._load()
             self._stamp = stamp
@@ -502,17 +532,22 @@ class ModelRegistry:
         """Reload the registry from disk and return a snapshot."""
         with self._lock:
             self._data = self._load()
-            self._stamp = self._stat_stamp()
+            self._stamp = self._latest_stamp()
             return copy.deepcopy(self._data)
 
-    def _save(self):
+    def _write_data(self, data):
+        """Write data dict to the runtime path atomically."""
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         tmp_path = f"{self.path}.tmp"
         with open(tmp_path, "w") as f:
-            json.dump(self._data, f, indent=2)
+            json.dump(data, f, indent=2)
             f.write("\n")
         os.replace(tmp_path, self.path)
-        self._stamp = self._stat_stamp()
+        self._loaded_from = self.path
+
+    def _save(self):
+        self._write_data(self._data)
+        self._stamp = self._latest_stamp()
         logger.info(f"Registry saved to {self.path}")
 
     def snapshot(self):
@@ -668,6 +703,15 @@ class ModelRegistry:
                 raise KeyError(f"Model '{model_name}' not found")
             self._data.get("fixed", {}).pop(model_name, None)
             self._save()
+
+    def swap_fixed(self, new_fixed):
+        """Atomically replace the fixed GPU pin map and return the old map."""
+        with self._lock:
+            self._maybe_reload()
+            old = dict(self._data.get("fixed", {}))
+            self._data["fixed"] = dict(new_fixed) if new_fixed else {}
+            self._save()
+            return old
 
     def validate(self, model_name, gpu_count=None):
         """Check if a model config is valid."""
