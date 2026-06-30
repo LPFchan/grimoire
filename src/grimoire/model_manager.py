@@ -447,6 +447,16 @@ class ModelManager:
         self.active = {}
         self.gpu_count = gpu_count
         self._lock = asyncio.Lock()
+        self.preset_lock = None
+        self.gpu_mask = None  # set[int] or None (None = all GPUs available)
+
+    def _is_gpu_allowed(self, gpu_id):
+        return self.gpu_mask is None or gpu_id in self.gpu_mask
+
+    def _allowed_gpus(self):
+        if self.gpu_mask is not None:
+            return sorted(self.gpu_mask)
+        return list(range(self.gpu_count))
 
     def _build_route_table(self):
         """Map each running model -> its replica backends for the proxy workers.
@@ -543,7 +553,7 @@ class ModelManager:
         #      last resort, used only when there is no exclusive to evict.
         # Budgeted incumbents are never evicted by an exclusive model.
         empty, budgeted_only = [], []
-        for gpu in range(self.gpu_count):
+        for gpu in self._allowed_gpus():
             incumbents = self._incumbents_on(gpu)
             if not incumbents:
                 empty.append(gpu)
@@ -554,6 +564,8 @@ class ModelManager:
 
         victim = None
         for name, active in self.active.items():
+            if not self._is_gpu_allowed(active.gpu):
+                continue
             if self._is_budgeted_incumbent(active) or registry.is_fixed(name):
                 continue
             if victim is None or active.started < victim[1].started:
@@ -573,7 +585,9 @@ class ModelManager:
         incumbents (pinned incumbents are never evicted). A post-eviction VRAM
         re-check in start_model guards against eviction not freeing enough.
         """
-        candidates = [pinned_gpu] if pinned_gpu is not None else list(range(self.gpu_count))
+        candidates = [pinned_gpu] if pinned_gpu is not None else self._allowed_gpus()
+        if not candidates:
+            raise RuntimeError("No GPUs available for allocation")
 
         last_error = None
         # Pass 1: co-locate without eviction if free VRAM already covers the budget.
@@ -606,6 +620,8 @@ class ModelManager:
         pinned_gpu = registry.get_fixed_gpu(model_name)
         if pinned_gpu is not None and pinned_gpu >= self.gpu_count:
             raise RuntimeError(f"Pinned GPU {pinned_gpu} is outside available range")
+        if pinned_gpu is not None and not self._is_gpu_allowed(pinned_gpu):
+            raise RuntimeError(f"Pinned GPU {pinned_gpu} is excluded by active GPU mask")
 
         budget = self._model_budget_mib(cfg)
         if budget is None:
@@ -683,7 +699,7 @@ class ModelManager:
                     errors.append(f"{name}: {e}; {stop_error}")
         return errors
 
-    async def start_model(self, model_name):
+    async def start_model(self, model_name, _preset_bypass=False):
         """Start a model with GPU allocation priority: pinned, free, oldest eviction."""
         resolved_name = registry.resolve(model_name)
         if not resolved_name:
@@ -700,6 +716,11 @@ class ModelManager:
             return existing
 
         async with self._lock:
+            if self.preset_lock is not None and not _preset_bypass:
+                raise RuntimeError(
+                    f"Preset '{self.preset_lock}' is active. "
+                    f"Deactivate the preset before manually starting models."
+                )
             if model_name in self.active and self.active[model_name].is_running():
                 return self.active[model_name]
             if model_name in self.active:
@@ -786,10 +807,15 @@ class ModelManager:
             return config.MODEL_STATUS_UNLOADED
         return active.status
 
-    async def stop_model(self, model_name):
+    async def stop_model(self, model_name, _preset_bypass=False):
         """Stop an active model."""
         model_name = registry.resolve(model_name) or model_name
         async with self._lock:
+            if self.preset_lock is not None and not _preset_bypass:
+                raise RuntimeError(
+                    f"Preset '{self.preset_lock}' is active. "
+                    f"Deactivate the preset before manually stopping models."
+                )
             active = self.active.pop(model_name, None)
             if not active:
                 return False

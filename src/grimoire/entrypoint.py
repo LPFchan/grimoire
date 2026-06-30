@@ -62,6 +62,7 @@ from grimoire.dflash.prefill import PromptBlock, materialize_blocks, maybe_compr
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
 from grimoire.plugins import plugin_manager
+from grimoire.presets import presets
 from grimoire.registry import (
     MODELS_DIR,
     registry,
@@ -104,6 +105,7 @@ from grimoire.routes.dashboard import router as dashboard_router
 from grimoire.routes.models import router as models_router
 from grimoire.routes.plugins import router as plugins_router
 from grimoire.routes.settings import router as settings_router
+from grimoire.routes.presets import router as presets_router
 from grimoire.proxy.sse import (
     _extract_assistant_text,
     _usage_from_object,
@@ -159,16 +161,43 @@ async def lifespan(_app):
         logger.info(f"Imported legacy token stats from {LEGACY_STATS_PATH}")
 
     initial_model = getattr(_app.state, "initial_model", None)
-    if initial_model:
-        await manager.start_model(initial_model)
+    preset_name = presets.get_active_name()
 
-    for name, cfg in registry.snapshot().get("models", {}).items():
-        if isinstance(cfg, dict) and cfg.get("always-on") and isinstance(cfg.get("cpu-only"), bool):
-            if name != initial_model:
-                try:
-                    await manager.start_model(name)
-                except Exception as exc:
-                    logger.error("Failed to start always-on model %s: %s", name, exc)
+    if preset_name:
+        logger.info(f"Restoring preset '{preset_name}' on boot")
+        try:
+            result = await presets.activate(preset_name, manager, registry)
+            logger.info(f"Preset restored: started={result['started']}, "
+                        f"failed={result['failed']}, stopped={result['stopped']}")
+        except Exception as exc:
+            logger.error(f"Failed to restore preset '{preset_name}': {exc}")
+            logger.warning("Falling back to always-on boot")
+            saved_fixed = presets.get_pre_preset_fixed()
+            if saved_fixed is not None:
+                registry.swap_fixed(saved_fixed)
+            manager.preset_lock = None
+            presets._set_active(None)
+            presets._set_pre_preset_fixed(None)
+            if initial_model:
+                await manager.start_model(initial_model)
+            for name, cfg in registry.snapshot().get("models", {}).items():
+                if isinstance(cfg, dict) and cfg.get("always-on") and isinstance(cfg.get("cpu-only"), bool):
+                    if name != initial_model:
+                        try:
+                            await manager.start_model(name)
+                        except Exception as exc2:
+                            logger.error("Failed to start always-on model %s: %s", name, exc2)
+    else:
+        if initial_model:
+            await manager.start_model(initial_model)
+
+        for name, cfg in registry.snapshot().get("models", {}).items():
+            if isinstance(cfg, dict) and cfg.get("always-on") and isinstance(cfg.get("cpu-only"), bool):
+                if name != initial_model:
+                    try:
+                        await manager.start_model(name)
+                    except Exception as exc:
+                        logger.error("Failed to start always-on model %s: %s", name, exc)
 
     sampler_task = asyncio.create_task(telemetry_sampler())
     try:
@@ -190,6 +219,7 @@ app.include_router(dashboard_router)
 app.include_router(models_router)
 app.include_router(plugins_router)
 app.include_router(settings_router)
+app.include_router(presets_router)
 
 
 @app.get("/health")
@@ -524,7 +554,10 @@ async def ensure_loaded(request: Request):
     model = payload.get("model") if isinstance(payload, dict) else None
     if not model:
         raise HTTPException(status_code=400, detail="model required")
-    await manager.start_model(model)
+    try:
+        await manager.start_model(model)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"status": "ok", "model": model}
 
 

@@ -251,7 +251,10 @@ async def stop_model_endpoint(model_name: str, request: Request):
     manager = _get_manager()
     if not manager.get_active(model_name):
         raise HTTPException(status_code=404, detail=f"Model '{model_name}' is not active")
-    await manager.stop_model(model_name)
+    try:
+        await manager.stop_model(model_name)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"status": "stopped", "model": model_name}
 
 
