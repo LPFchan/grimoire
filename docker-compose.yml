@@ -6,6 +6,7 @@ services:
     mem_limit: 28g
     memswap_limit: 28g
     oom_score_adj: 500
+    runtime: nvidia
     restart: unless-stopped
     ports:
       - "9001:9001"
