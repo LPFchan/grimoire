@@ -255,16 +255,18 @@
         "output": 0.0,
         "cache_read": 0.0
       },
-      "ctx-size": 2048,
-      "parallel": 2,
+      "ctx-size": 4096,
+      "parallel": 1,
       "n-gpu-layers": 999,
       "cpu-only": false,
-      "vram-budget-mib": 2400,
+      "vram-budget-mib": 4200,
       "replica_peers": [
         "eastself-reranker-0.6B-g1"
       ],
       "extra-args": [
         "--reranking",
+        "--batch-size",
+        "4096",
         "--ubatch-size",
         "4096"
       ]
@@ -279,13 +281,15 @@
         "output": 0.0,
         "cache_read": 0.0
       },
-      "ctx-size": 2048,
+      "ctx-size": 4096,
       "parallel": 1,
       "n-gpu-layers": 999,
       "cpu-only": false,
-      "vram-budget-mib": 1800,
+      "vram-budget-mib": 4200,
       "extra-args": [
         "--reranking",
+        "--batch-size",
+        "4096",
         "--ubatch-size",
         "4096"
       ]
