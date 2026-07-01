@@ -21,6 +21,22 @@ DEFAULT_REGISTRY_SEED_PATH = "/etc/grimoire/models.json"
 REGISTRY_PATH = os.environ.get("GRIMOIRE_REGISTRY_PATH", DEFAULT_REGISTRY_PATH)
 REGISTRY_SEED_PATH = os.environ.get("GRIMOIRE_REGISTRY_SEED_PATH", DEFAULT_REGISTRY_SEED_PATH)
 
+# Staging directory for downloaded/uploaded model files. Lives inside the
+# writable ./state bind mount (see docker-compose.yml:18), not under MODELS_DIR
+# (which is mounted :ro). Downloaded models get registered with an absolute
+# path under this directory; operator-managed models keep the relative
+# "gguf/<filename>" form anchored at MODELS_DIR.
+INGEST_STAGING_DIR = os.environ.get(
+    "GRIMOIRE_INGEST_STAGING_DIR", "/var/lib/grimoire/ingest"
+)
+
+# IMPORTANT: do not refactor `os.path.join(MODELS_DIR, cfg["file"])` calls
+# (registry.py:validate, launcher.py:build_cmd) to use os.path.normpath or
+# Path.resolve(). Both would re-anchor an absolute path under MODELS_DIR and
+# break downloaded-model lookups. The current os.path.join behaviour is
+# load-bearing: when the second argument is absolute, the first is discarded
+# (POSIX semantics). The new staging design relies on this.
+
 BACKEND_LLAMA = "llama"
 
 _GGUF_MAGIC = 0x46554747

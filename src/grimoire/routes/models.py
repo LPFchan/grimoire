@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import shutil
 from pathlib import Path
 
 import httpx
@@ -12,7 +13,7 @@ from fastapi.responses import JSONResponse
 from grimoire.auth import require_api, require_admin
 from grimoire.config import DEFAULT_CTX_SIZE, DEFAULT_GENERATION_PARAMS
 from grimoire.ingest import download_model_file, model_filename_from_url, parse_hf_url, download_model_file_with_progress, _DownloadCancelled, MAX_BYTES as INGEST_MAX_BYTES
-from grimoire.registry import MODELS_DIR, registry
+from grimoire.registry import MODELS_DIR, INGEST_STAGING_DIR, registry
 
 _REFERENCE_FIELDS = ("file", "mmproj", "mtp-head", "spec-draft-model", "draft", "drafter")
 _MAX_GGUF_UPLOAD_BYTES = int(os.environ.get("GRIMOIRE_MAX_GGUF_UPLOAD_BYTES", 40 * 1024**3))
@@ -71,11 +72,44 @@ def _model_payload_name(payload):
 
 
 def _containment_check(filename: str) -> str:
+    """Verify a path is within MODELS_DIR or INGEST_STAGING_DIR.
+
+    Relative paths (the gguf/<filename> form) are anchored at MODELS_DIR.
+    Absolute paths (the downloaded-model form) must be within INGEST_STAGING_DIR.
+    """
+    if os.path.isabs(filename):
+        resolved = os.path.realpath(filename)
+        real_staging = os.path.realpath(INGEST_STAGING_DIR)
+        if os.path.commonpath([real_staging, resolved]) != real_staging:
+            raise HTTPException(status_code=400, detail="Path escapes staging directory")
+        return resolved
+
     real_models = os.path.realpath(MODELS_DIR)
     resolved = os.path.realpath(os.path.join(MODELS_DIR, filename))
     if os.path.commonpath([real_models, resolved]) != real_models:
         raise HTTPException(status_code=400, detail="Path escapes models directory")
     return resolved
+
+
+def _check_new_path_parent(new_filename: str) -> str:
+    """Verify the parent of a would-be new file path is within an allowed root.
+
+    Returns the realpath of the new file's parent directory.
+    """
+    if os.path.isabs(new_filename):
+        parent = os.path.dirname(new_filename) or INGEST_STAGING_DIR
+        real_parent = os.path.realpath(parent)
+        real_staging = os.path.realpath(INGEST_STAGING_DIR)
+        if os.path.commonpath([real_staging, real_parent]) != real_staging:
+            raise HTTPException(status_code=400, detail="Path escapes staging directory")
+        return real_parent
+
+    parent = os.path.dirname(new_filename) or "gguf"
+    real_parent = os.path.realpath(os.path.join(MODELS_DIR, parent))
+    real_models = os.path.realpath(MODELS_DIR)
+    if os.path.commonpath([real_models, real_parent]) != real_models:
+        raise HTTPException(status_code=400, detail="Path escapes models directory")
+    return real_parent
 
 
 def _file_referenced_by(filename: str) -> list[str]:
@@ -91,9 +125,6 @@ def _file_referenced_by(filename: str) -> list[str]:
 
 
 def _scan_gguf_files() -> list[dict]:
-    gguf_dir = os.path.join(MODELS_DIR, "gguf")
-    if not os.path.isdir(gguf_dir):
-        return []
     models = registry.snapshot().get("models", {})
     used_map: dict[str, list[str]] = {}
     for name, cfg in models.items():
@@ -102,17 +133,34 @@ def _scan_gguf_files() -> list[dict]:
             if val and isinstance(val, str):
                 used_map.setdefault(val, []).append(name)
     files = []
-    for entry in sorted(os.listdir(gguf_dir)):
-        if not entry.lower().endswith(".gguf"):
-            continue
-        rel_path = f"gguf/{entry}"
-        full_path = os.path.join(gguf_dir, entry)
-        try:
-            size = os.path.getsize(full_path)
-        except OSError:
-            size = 0
-        used_by = used_map.get(rel_path)
-        files.append({"filename": rel_path, "size_bytes": size, "used_by": used_by or None})
+    gguf_dir = os.path.join(MODELS_DIR, "gguf")
+    if os.path.isdir(gguf_dir):
+        for entry in sorted(os.listdir(gguf_dir)):
+            if not entry.lower().endswith(".gguf"):
+                continue
+            rel_path = f"gguf/{entry}"
+            full_path = os.path.join(gguf_dir, entry)
+            try:
+                size = os.path.getsize(full_path)
+            except OSError:
+                size = 0
+            used_by = used_map.get(rel_path)
+            files.append({"filename": rel_path, "size_bytes": size, "used_by": used_by or None})
+    if os.path.isdir(INGEST_STAGING_DIR):
+        for task_id in os.listdir(INGEST_STAGING_DIR):
+            task_dir = os.path.join(INGEST_STAGING_DIR, task_id)
+            if not os.path.isdir(task_dir):
+                continue
+            for entry in sorted(os.listdir(task_dir)):
+                if not entry.lower().endswith(".gguf") or entry.endswith(".part"):
+                    continue
+                full_path = os.path.join(task_dir, entry)
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError:
+                    size = 0
+                used_by = used_map.get(full_path)
+                files.append({"filename": full_path, "size_bytes": size, "used_by": used_by or None})
     return files
 
 
@@ -307,9 +355,10 @@ async def ingest_model(request: Request):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    model_dir = os.path.join(MODELS_DIR, "gguf")
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, model_filename)
+    ingest_id = os.urandom(8).hex()
+    ingest_dir = os.path.join(INGEST_STAGING_DIR, f"ingest-{ingest_id}")
+    os.makedirs(ingest_dir, exist_ok=True)
+    model_path = os.path.join(ingest_dir, model_filename)
 
     if os.path.exists(model_path):
         raise HTTPException(status_code=409, detail=f"Model file already exists at {model_path}")
@@ -324,7 +373,7 @@ async def ingest_model(request: Request):
 
     try:
         registry.add(model_alias, {
-            "file": f"gguf/{model_filename}",
+            "file": model_path,
             "mmproj": None,
             "ctx-size": ctx_size,
         })
@@ -533,12 +582,13 @@ async def upload_registry_gguf(request: Request, file: UploadFile):
     if not safe_name or safe_name != original or ".." in safe_name:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    gguf_dir = os.path.join(MODELS_DIR, "gguf")
-    os.makedirs(gguf_dir, exist_ok=True)
-    target_path = os.path.join(gguf_dir, safe_name)
+    upload_id = os.urandom(8).hex()
+    upload_dir = os.path.join(INGEST_STAGING_DIR, f"upload-{upload_id}")
+    os.makedirs(upload_dir, exist_ok=True)
+    target_path = os.path.join(upload_dir, safe_name)
 
     if os.path.exists(target_path):
-        raise HTTPException(status_code=409, detail=f"File already exists: gguf/{safe_name}")
+        raise HTTPException(status_code=409, detail=f"File already exists: {target_path}")
 
     try:
         total = 0
@@ -568,7 +618,7 @@ async def upload_registry_gguf(request: Request, file: UploadFile):
             pass
         raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
 
-    return {"filename": f"gguf/{safe_name}", "size_bytes": total}
+    return {"filename": target_path, "size_bytes": total}
 
 
 # ---------------------------------------------------------------------------
@@ -593,21 +643,61 @@ async def prune_old_ingest_tasks():
             ]
             for tid in stale_ids:
                 task = _ingest_tasks.pop(tid, None)
-                if task:
-                    for path_key in ("tmp_path", "target_path"):
-                        p = task.get(path_key)
-                        if p and os.path.isfile(p):
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
-            # Clean orphaned .part files older than 1 hour
-            gguf_dir = os.path.join(MODELS_DIR, "gguf")
-            if os.path.isdir(gguf_dir):
-                for entry in os.listdir(gguf_dir):
+                if not task:
+                    continue
+                # Always safe to remove tmp_path: it's renamed to target_path
+                # on success (ingest.py:210), so the path no longer exists.
+                tmp = task.get("tmp_path")
+                if tmp and os.path.isfile(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                # Only remove target_path for terminal-failure tasks. For
+                # status == "done", target_path is the registered model file
+                # and must be preserved.
+                if task.get("status") in ("cancelled", "failed"):
+                    tgt = task.get("target_path", "")
+                    if tgt and os.path.isfile(tgt):
+                        try:
+                            os.remove(tgt)
+                        except OSError:
+                            pass
+                    _cleanup_task_dir(tgt)
+
+            # Orphan sweep under INGEST_STAGING_DIR. Skip any task_dir that
+            # still has a registered model file in it.
+            if not os.path.isdir(INGEST_STAGING_DIR):
+                continue
+            referenced_abs_paths: set[str] = set()
+            models = registry.snapshot().get("models", {})
+            for cfg in models.values():
+                for field in _REFERENCE_FIELDS:
+                    val = (cfg or {}).get(field)
+                    if val and os.path.isabs(val):
+                        referenced_abs_paths.add(os.path.realpath(val))
+            for task_id_dir in os.listdir(INGEST_STAGING_DIR):
+                task_dir = os.path.join(INGEST_STAGING_DIR, task_id_dir)
+                if not os.path.isdir(task_dir):
+                    continue
+                referenced_in_dir = False
+                for entry in os.listdir(task_dir):
+                    full_path = os.path.realpath(os.path.join(task_dir, entry))
+                    if full_path in referenced_abs_paths:
+                        referenced_in_dir = True
+                        break
+                if referenced_in_dir:
+                    continue
+                try:
+                    if _time.time() - os.path.getmtime(task_dir) > 3600:
+                        shutil.rmtree(task_dir, ignore_errors=True)
+                        continue
+                except OSError:
+                    pass
+                for entry in os.listdir(task_dir):
                     if not entry.endswith(".part"):
                         continue
-                    part_path = os.path.join(gguf_dir, entry)
+                    part_path = os.path.join(task_dir, entry)
                     try:
                         if _time.time() - os.path.getmtime(part_path) > 3600:
                             os.remove(part_path)
@@ -641,9 +731,9 @@ async def ingest_start(request: Request):
     suggested_alias = os.path.splitext(os.path.basename(filename))[0].lower()
 
     task_id = os.urandom(8).hex()
-    gguf_dir = os.path.join(MODELS_DIR, "gguf")
-    os.makedirs(gguf_dir, exist_ok=True)
-    target_path = os.path.join(gguf_dir, os.path.basename(filename))
+    task_dir = os.path.join(INGEST_STAGING_DIR, task_id)
+    os.makedirs(task_dir, exist_ok=True)
+    target_path = os.path.join(task_dir, os.path.basename(filename))
 
     task = {
         "task_id": task_id,
@@ -682,16 +772,13 @@ async def ingest_start(request: Request):
             async with _ingest_lock:
                 task["status"] = "cancelled"
                 task["_completed_at"] = _time.time()
-                if os.path.isfile(target_path):
-                    try:
-                        os.remove(target_path)
-                    except OSError:
-                        pass
+            _cleanup_task_dir(target_path)
         except Exception as e:
             async with _ingest_lock:
                 task["status"] = "failed"
                 task["error"] = str(e)
                 task["_completed_at"] = _time.time()
+            _cleanup_task_dir(target_path)
 
     asyncio.create_task(_run_download())
 
@@ -823,6 +910,8 @@ async def ingest_cancel(task_id: str, request: Request):
         task["status"] = "cancelled"
         task["_completed_at"] = _time.time()
 
+    _cleanup_task_dir(task.get("target_path", ""))
+
     return {"status": "cancelled"}
 
 
@@ -848,10 +937,7 @@ async def rename_gguf(request: Request, filename: str = "", new_filename: str = 
         raise HTTPException(status_code=400, detail="'new_filename' must end with .gguf")
 
     # Containment check on parent of new filename (file doesn't exist yet)
-    new_parent = os.path.realpath(os.path.join(MODELS_DIR, os.path.dirname(new_filename) or "."))
-    real_models = os.path.realpath(MODELS_DIR)
-    if os.path.commonpath([real_models, new_parent]) != real_models:
-        raise HTTPException(status_code=400, detail="Path escapes models directory")
+    new_parent = _check_new_path_parent(new_filename)
 
     real_new = os.path.join(new_parent, os.path.basename(new_filename))
 
@@ -881,6 +967,20 @@ async def rename_gguf(request: Request, filename: str = "", new_filename: str = 
     return {"status": "renamed", "updated_models": updated}
 
 
+def _cleanup_task_dir(target_path: str) -> None:
+    """Remove the per-task staging subdirectory if it exists and is safe to remove."""
+    if not target_path:
+        return
+    task_dir = os.path.dirname(target_path)
+    if not task_dir:
+        return
+    real_staging = os.path.realpath(INGEST_STAGING_DIR)
+    real_dir = os.path.realpath(task_dir)
+    if os.path.commonpath([real_staging, real_dir]) != real_staging:
+        return
+    shutil.rmtree(task_dir, ignore_errors=True)
+
+
 def _register_model(task_id: str):
     """Register a completed download into the registry. Caller must hold _ingest_lock."""
     task = _ingest_tasks.get(task_id)
@@ -893,7 +993,7 @@ def _register_model(task_id: str):
         return
 
     config = {
-        "file": f"gguf/{filename}",
+        "file": task["target_path"],
         "capabilities": ["completion"],
         "ctx-size": 262144,
         "predict": 16384,
