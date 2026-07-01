@@ -7,7 +7,7 @@ import os
 import sys
 
 from grimoire.ingest import download_model_file, model_filename_from_url
-from grimoire.registry import registry, MODELS_DIR, INGEST_STAGING_DIR
+from grimoire.registry import registry, MODELS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +44,9 @@ def cmd_ingest(args):
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
-    ingest_id = os.urandom(8).hex()
-    ingest_dir = os.path.join(INGEST_STAGING_DIR, f"ingest-{ingest_id}")
-    os.makedirs(ingest_dir, exist_ok=True)
-    model_path = os.path.join(ingest_dir, model_filename)
+    model_dir = os.path.join(MODELS_DIR, "gguf")
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, model_filename)
 
     if os.path.exists(model_path):
         print(f"Error: Model file already exists at {model_path}", file=sys.stderr)
@@ -66,7 +65,7 @@ def cmd_ingest(args):
 
     try:
         registry.add(model_alias, {
-            "file": model_path,
+            "file": f"gguf/{model_filename}",
             "mmproj": None,
             "ctx-size": ctx_size,
         })

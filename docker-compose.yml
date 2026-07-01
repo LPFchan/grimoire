@@ -11,7 +11,7 @@ services:
     ports:
       - "9001:9001"
     volumes:
-      - ${MODELS_DIR}:/models:ro
+      - ${MODELS_DIR}:/models
       - ${TEMPLATES_DIR}:/templates:ro
       - ${GRAMMARS_DIR}:/etc/grimoire/grammars:ro
       - ${TOKEN_STATS_PATH}:/var/lib/grimoire/token-stats.json:ro
