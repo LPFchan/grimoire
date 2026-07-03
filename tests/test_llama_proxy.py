@@ -101,6 +101,21 @@ class _FakeClient:
 
 
 class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
+    def test_model_logit_bias_merges_cli_style_defaults(self):
+        payload = {"logit_bias": {"262143": 1.0, "5": -2}}
+        cfg = {"logit-bias": ["262143+5", "111038-inf", [7, 1.5]]}
+        result = llama_proxy._apply_model_logit_bias(payload.copy(), cfg)
+        self.assertEqual(result["logit_bias"], {"262143": 1.0, "111038": -100.0, "7": 1.5, "5": -2.0})
+
+    def test_request_logit_bias_overrides_cli_logit_bias(self):
+        payload = {"messages": []}
+        cfg = {
+            "logit-bias": ["262143+5"],
+            "request-logit-bias": {262143: 3, 111038: -6},
+        }
+        result = llama_proxy._apply_model_logit_bias(payload.copy(), cfg)
+        self.assertEqual(result["logit_bias"], {"262143": 3.0, "111038": -6.0})
+
     def setUp(self):
         _FakeClient.instances.clear()
 

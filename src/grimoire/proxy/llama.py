@@ -2,8 +2,10 @@
 
 import asyncio
 import copy
+import math
 import json
 import logging
+import re
 
 import httpx
 from fastapi import HTTPException
@@ -64,6 +66,65 @@ def _backend_response_headers(headers):
             continue
         clean[key] = value
     return clean
+
+
+_LOGIT_BIAS_CLI_RE = re.compile(r"^(?P<token>\d+)(?P<sign>[+-])(?P<bias>inf|\d+(?:\.\d+)?)$", re.IGNORECASE)
+
+def _json_safe_bias(value):
+    value = float(value)
+    if math.isinf(value):
+        return 100.0 if value > 0 else -100.0
+    return value
+
+def _parse_logit_bias_entries(raw):
+    if raw in (None, ""):
+        return {}
+    if isinstance(raw, dict):
+        return {str(int(token)): _json_safe_bias(bias) for token, bias in raw.items()}
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return {}
+
+    parsed = {}
+    for item in raw:
+        if isinstance(item, str):
+            match = _LOGIT_BIAS_CLI_RE.match(item.strip())
+            if not match:
+                continue
+            token = str(int(match.group("token")))
+            bias_text = match.group("bias").lower()
+            bias = math.inf if bias_text == "inf" else float(bias_text)
+            if match.group("sign") == "-":
+                bias = -bias
+            parsed[token] = _json_safe_bias(bias)
+            continue
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            token, bias = item
+            parsed[str(int(token))] = _json_safe_bias(bias)
+            continue
+        if isinstance(item, dict):
+            parsed.update(_parse_logit_bias_entries(item))
+    return parsed
+
+def _apply_model_logit_bias(payload, model_cfg):
+    """Merge configured model logit bias into a request payload.
+
+    `logit-bias` is also used for llama-server CLI flags, so it commonly uses
+    strings like `262143+5` or `111038-inf`. The backend JSON API expects a
+    finite JSON object, so map infinities to hard bias values and let explicit
+    request bias override model defaults.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    configured = _parse_logit_bias_entries(model_cfg.get("request-logit-bias", model_cfg.get("logit-bias")))
+    if not configured:
+        return payload
+    merged = dict(configured)
+    merged.update(_parse_logit_bias_entries(payload.get("logit_bias")))
+    if merged:
+        payload["logit_bias"] = merged
+    return payload
 
 
 async def _try_restore_kv(client, slot_url, prompt_ids, store, log, override_hash=None):
@@ -269,6 +330,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         payload = await plugin_manager.before_backend_request(
             payload, active.name, model_cfg, backend_model_id, client, url, headers
         )
+        payload = _apply_model_logit_bias(payload, model_cfg)
 
         # Three-tier KV cache: VRAM → RAM (tmpfs) → SSD
         # Within same conversation: slot stays alive, cache_prompt handles delta.
