@@ -190,7 +190,8 @@ class PresetManager:
                     warnings.append(msg)
 
             restored_fixed = None
-            if not target and not preset.get("fixed"):
+            has_gpu_mask = preset.get("gpus") is not None
+            if not target and not preset.get("fixed") and not has_gpu_mask:
                 manager.preset_lock = None
                 manager.gpu_mask = None
                 if self._pre_preset_fixed is not None:
