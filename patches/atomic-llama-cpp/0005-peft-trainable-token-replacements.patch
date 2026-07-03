@@ -1,0 +1,328 @@
+diff --git a/convert_lora_to_gguf.py b/convert_lora_to_gguf.py
+index d583342..5dd5031 100755
+--- a/convert_lora_to_gguf.py
++++ b/convert_lora_to_gguf.py
+@@ -418,8 +418,12 @@ if __name__ == '__main__':
+ 
+             def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+                 tensor_map: dict[str, PartialLoraTensor] = {}
++                token_replacements: Tensor | None = None
+ 
+                 for name, tensor in lora_model.items():
++                    if name.endswith(".embed_tokens.token_adapter.trainable_tokens_delta"):
++                        token_replacements = tensor
++                        continue
+                     if self.lazy:
+                         tensor = LazyTorchTensor.from_eager(tensor)
+                     base_name = get_base_tensor_name(name)
+@@ -455,7 +459,49 @@ if __name__ == '__main__':
+                     assert tensor.B is not None
+                     yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
+ 
++                if token_replacements is not None:
++                    token_indices = lparams.get("trainable_token_indices")
++                    if not isinstance(token_indices, list) or not all(isinstance(i, int) for i in token_indices):
++                        raise ValueError("trainable_tokens_delta requires integer adapter_config.json trainable_token_indices")
++                    if len(token_indices) != token_replacements.shape[0]:
++                        raise ValueError(
++                            "trainable_tokens_delta row count does not match trainable_token_indices length: "
++                            f"{token_replacements.shape[0]} != {len(token_indices)}"
++                        )
++
++                    vocab_size = hparams.get("vocab_size")
++                    text_config = hparams.get("text_config")
++                    if vocab_size is None and isinstance(text_config, dict):
++                        vocab_size = text_config.get("vocab_size")
++                    if not isinstance(vocab_size, int) or vocab_size <= 0:
++                        raise ValueError("Unable to determine base vocab_size for trainable token map")
++                    if min(token_indices) < 0 or max(token_indices) >= vocab_size:
++                        raise ValueError("trainable_token_indices contains token IDs outside base vocab")
++
++                    token_replacements = token_replacements.to(torch.float32)
++                    zero_row = torch.zeros(
++                        (1, token_replacements.shape[1]),
++                        dtype=token_replacements.dtype,
++                        device=token_replacements.device,
++                    )
++                    replacement_table = torch.cat([zero_row, token_replacements], dim=0).contiguous()
++
++                    token_ids = torch.tensor(token_indices, dtype=torch.int32)
++                    token_map = torch.zeros(vocab_size, dtype=torch.int32)
++                    token_mask = torch.zeros(vocab_size, dtype=torch.float32)
++                    token_map[token_ids.to(torch.long)] = torch.arange(1, len(token_indices) + 1, dtype=torch.int32)
++                    token_mask[token_ids.to(torch.long)] = 1.0
++
++                    yield ("token_embd.weight.token_replacements", replacement_table)
++                    yield ("token_embd.weight.token_map", token_map)
++                    yield ("token_embd.weight.token_mask", token_mask)
++                    yield ("token_embd.weight.token_ids", token_ids)
++
+             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++                if name.startswith("token_embd.weight.token_"):
++                    yield (name, data_torch)
++                    return
++
+                 dest = list(super().modify_tensors(data_torch, name, bid))
+                 # some archs may have the same tensor for lm_head and output (tie word embeddings)
+                 # in this case, adapters targeting lm_head will fail when using llama-export-lora
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 4a1aaa9..bfe2e9f 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -146,6 +146,17 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
+     return nullptr;
+ }
+ 
++llama_adapter_token_replacements * llama_adapter_lora::get_token_replacements(ggml_tensor * w) {
++    const std::string name(w->name);
++
++    const auto pos = token_replacements_map.find(name);
++    if (pos != token_replacements_map.end()) {
++        return &pos->second;
++    }
++
++    return nullptr;
++}
++
+ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
+     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
+ 
+@@ -262,8 +273,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
+         return it->second;
+     };
+ 
+-    // bundle lora_a and lora_b into pairs
++    // bundle lora_a/lora_b and optional PEFT trainable-token replacement tensors
+     std::map<std::string, llama_adapter_lora_weight> ab_map;
++    std::map<std::string, llama_adapter_token_replacements> token_replacements_map;
+     auto str_endswith = [](const std::string & str, const std::string & suffix) {
+         return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
+     };
+@@ -284,6 +296,18 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
+             } else {
+                 ab_map[name].b = cur;
+             }
++        } else if (str_endswith(name, ".token_replacements")) {
++            replace_all(name, ".token_replacements", "");
++            token_replacements_map[name].replacements = cur;
++        } else if (str_endswith(name, ".token_map")) {
++            replace_all(name, ".token_map", "");
++            token_replacements_map[name].map = cur;
++        } else if (str_endswith(name, ".token_mask")) {
++            replace_all(name, ".token_mask", "");
++            token_replacements_map[name].mask = cur;
++        } else if (str_endswith(name, ".token_ids")) {
++            replace_all(name, ".token_ids", "");
++            token_replacements_map[name].token_ids = cur;
+         } else if (str_endswith(name, "_norm.weight")) {
+             // TODO: add support for norm vector
+             // for now, we don't really care because most adapters still work fine without it
+@@ -375,6 +399,71 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
+         adapter.ab_map[name] = llama_adapter_lora_weight(tensor_a, tensor_b);
+     }
+ 
++    for (auto & it : token_replacements_map) {
++        const std::string & name = it.first;
++        llama_adapter_token_replacements & tr = it.second;
++
++        if (!tr.replacements || !tr.map || !tr.mask || !tr.token_ids) {
++            throw std::runtime_error("Token replacement tensors for '" + name + "' are incomplete");
++        }
++
++        const auto * model_tensor = model.get_tensor(name.c_str());
++        if (!model_tensor) {
++            throw std::runtime_error("Token replacement tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
++        }
++
++        if (tr.replacements->type != GGML_TYPE_F32 && tr.replacements->type != GGML_TYPE_F16 && tr.replacements->type != GGML_TYPE_BF16) {
++            throw std::runtime_error("token_replacements tensor for '" + name + "' must be F32/F16/BF16");
++        }
++        if (tr.map->type != GGML_TYPE_I32 && tr.map->type != GGML_TYPE_F32) {
++            throw std::runtime_error("token_map tensor for '" + name + "' must be I32 or F32");
++        }
++        if (tr.mask->type != GGML_TYPE_F32) {
++            throw std::runtime_error("token_mask tensor for '" + name + "' must be F32");
++        }
++        if (tr.token_ids->type != GGML_TYPE_I32 && tr.token_ids->type != GGML_TYPE_F32) {
++            throw std::runtime_error("token_ids tensor for '" + name + "' must be I32 or F32");
++        }
++        if (model_tensor->ne[0] != tr.replacements->ne[0]) {
++            throw std::runtime_error("token_replacements tensor for '" + name + "' has incorrect embedding size");
++        }
++        if (model_tensor->ne[1] != tr.map->ne[0] || model_tensor->ne[1] != tr.mask->ne[0]) {
++            throw std::runtime_error("token_map/token_mask tensor for '" + name + "' has incorrect vocab size");
++        }
++        if (tr.replacements->ne[1] != tr.token_ids->ne[0] + 1) {
++            throw std::runtime_error("token_replacements tensor for '" + name + "' must include a zero row plus one row per token_id");
++        }
++
++        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
++        for (auto & ex : buft_extra) {
++            if (ex == buft) {
++                LLAMA_LOG_WARN("%s: token replacements for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
++
++                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++                if (!cpu_dev) {
++                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
++                }
++                buft = ggml_backend_dev_buffer_type(cpu_dev);
++
++                break;
++            }
++        }
++
++        LLAMA_LOG_DEBUG("%s: token replacements for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
++
++        ggml_context * dev_ctx = ctx_for_buft(buft);
++        llama_adapter_token_replacements dev_tr;
++        dev_tr.replacements = ggml_dup_tensor(dev_ctx, tr.replacements);
++        dev_tr.map          = ggml_dup_tensor(dev_ctx, tr.map);
++        dev_tr.mask         = ggml_dup_tensor(dev_ctx, tr.mask);
++        dev_tr.token_ids    = ggml_dup_tensor(dev_ctx, tr.token_ids);
++        ggml_set_name(dev_tr.replacements, tr.replacements->name);
++        ggml_set_name(dev_tr.map,          tr.map->name);
++        ggml_set_name(dev_tr.mask,         tr.mask->name);
++        ggml_set_name(dev_tr.token_ids,    tr.token_ids->name);
++        adapter.token_replacements_map[name] = dev_tr;
++    }
++
+     // allocate tensors / buffers and zero
+     {
+         adapter.ctxs.reserve(ctx_map.size());
+@@ -409,12 +498,21 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
+             set_tensor(orig.a, dev.a);
+             set_tensor(orig.b, dev.b);
+         }
++        for (auto & it : adapter.token_replacements_map) {
++            auto orig = token_replacements_map[it.first];
++            auto dev  = it.second;
++            set_tensor(orig.replacements, dev.replacements);
++            set_tensor(orig.map,          dev.map);
++            set_tensor(orig.mask,         dev.mask);
++            set_tensor(orig.token_ids,    dev.token_ids);
++        }
+     }
+ 
+     // register adapter with model
+     model.loras.insert(&adapter);
+ 
+-    LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
++    LLAMA_LOG_INFO("%s: loaded %zu LoRA tensor pairs and %zu token replacement tables from lora file\n",
++            __func__, adapter.ab_map.size(), adapter.token_replacements_map.size());
+ }
+ 
+ llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {
+diff --git a/src/llama-adapter.h b/src/llama-adapter.h
+index f0b1e50..38520b4 100644
+--- a/src/llama-adapter.h
++++ b/src/llama-adapter.h
+@@ -60,11 +60,19 @@ struct llama_adapter_lora_weight {
+     llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
+ };
+ 
++struct llama_adapter_token_replacements {
++    ggml_tensor * replacements = nullptr;
++    ggml_tensor * map          = nullptr;
++    ggml_tensor * mask         = nullptr;
++    ggml_tensor * token_ids    = nullptr;
++};
++
+ struct llama_adapter_lora {
+     llama_model * model = nullptr;
+ 
+     // map tensor name to lora_a_b
+     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;
++    std::unordered_map<std::string, llama_adapter_token_replacements> token_replacements_map;
+ 
+     std::vector<ggml_context_ptr> ctxs;
+     std::vector<ggml_backend_buffer_ptr> bufs;
+@@ -81,9 +89,12 @@ struct llama_adapter_lora {
+     ~llama_adapter_lora() = default;
+ 
+     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
++    llama_adapter_token_replacements * get_token_replacements(ggml_tensor * w);
+ 
+     uint32_t get_n_nodes() const {
+-        return ab_map.size() * 6u; // a, b, scale, add, 2 x mul_mat
++        // LoRA: a, b, scale, add, 2 x mul_mat.
++        // Token replacements: input replacement + output projection correction.
++        return ab_map.size() * 6u + token_replacements_map.size() * 16u;
+     }
+ };
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 8e2b6ab..86d99ef 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -989,6 +989,38 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+         res = ggml_add(ctx0, res, ab_cur);
+     }
+ 
++    for (const auto & lora : *loras) {
++        llama_adapter_token_replacements * tr = lora.first->get_token_replacements(w);
++        if (tr == nullptr) {
++            continue;
++        }
++
++        const float adapter_scale = lora.second;
++
++        ggml_tensor * token_ids = tr->token_ids;
++        if (token_ids->type != GGML_TYPE_I32) {
++            token_ids = ggml_cast(ctx0, token_ids, GGML_TYPE_I32);
++        }
++
++        ggml_tensor * base_rows = ggml_get_rows(ctx0, w, token_ids);
++        ggml_tensor * repl_rows = ggml_view_2d(
++                ctx0, tr->replacements,
++                tr->replacements->ne[0], tr->replacements->ne[1] - 1,
++                tr->replacements->nb[1], tr->replacements->nb[1]);
++        ggml_tensor * delta_rows = ggml_sub(ctx0, repl_rows, base_rows);
++        if (adapter_scale != 1.0f) {
++            delta_rows = ggml_scale(ctx0, delta_rows, adapter_scale);
++        }
++
++        ggml_tensor * delta_logits   = ggml_mul_mat(ctx0, delta_rows, cur);
++        ggml_tensor * delta_logits_t = ggml_cont(ctx0, ggml_transpose(ctx0, delta_logits));
++        ggml_tensor * res_t          = ggml_cont(ctx0, ggml_transpose(ctx0, res));
++        ggml_tensor * full_delta_t   = ggml_fill(ctx0, res_t, 0.0f);
++        full_delta_t = ggml_set_rows(ctx0, full_delta_t, delta_logits_t, token_ids);
++        ggml_tensor * full_delta = ggml_cont(ctx0, ggml_transpose(ctx0, full_delta_t));
++        res = ggml_add(ctx0, res, full_delta);
++    }
++
+     if (w_s) {
+         res = ggml_mul(ctx0, res, w_s);
+     }
+@@ -1667,6 +1699,32 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+             cur = ggml_add(ctx0, cur, inpL_delta);
+         }
+ 
++        // apply PEFT TrainableTokens replacement rows if present
++        for (const auto & lora : *loras) {
++            llama_adapter_token_replacements * tr = lora.first->get_token_replacements(tok_embd);
++            if (tr == nullptr) {
++                continue;
++            }
++
++            const float adapter_scale = lora.second;
++
++            ggml_tensor * replacement_map = ggml_reshape_2d(ctx0, tr->map, 1, tr->map->ne[0]);
++            ggml_tensor * replacement_ids = ggml_get_rows(ctx0, replacement_map, inp->tokens);
++            if (replacement_ids->type != GGML_TYPE_I32) {
++                replacement_ids = ggml_cast(ctx0, replacement_ids, GGML_TYPE_I32);
++            }
++            replacement_ids = ggml_reshape_1d(ctx0, replacement_ids, inp->tokens->ne[0]);
++            ggml_tensor * replacement_rows = ggml_get_rows(ctx0, tr->replacements, replacement_ids);
++            ggml_tensor * replacement_mask_table = ggml_reshape_2d(ctx0, tr->mask, 1, tr->mask->ne[0]);
++            ggml_tensor * replacement_mask = ggml_get_rows(ctx0, replacement_mask_table, inp->tokens);
++            ggml_tensor * replacement_delta = ggml_sub(ctx0, replacement_rows, cur);
++            replacement_delta = ggml_mul(ctx0, replacement_delta, ggml_repeat(ctx0, replacement_mask, replacement_delta));
++            if (adapter_scale != 1.0f) {
++                replacement_delta = ggml_scale(ctx0, replacement_delta, adapter_scale);
++            }
++            cur = ggml_add(ctx0, cur, replacement_delta);
++        }
++
+         if (n_embd_inp != n_embd) {
+             cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);
+         }

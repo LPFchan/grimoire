@@ -21,6 +21,7 @@ The decision to ship this chain with graphs ON is documented in `records/researc
 | --- | --- |
 | `0001-cuda-fa-temp-buffers-bypass-vmm-pool.patch` | V1, kept for rollback / repro. Superseded by V2. |
 | `0003-cuda-fa-view_src-sizing.patch` | Backport of closed upstream PR #23620. Tested and rejected for our boundary case — see RSH-20260526-003 §"The View_src False Positive". Kept for slow-VRAM-creep mitigation if that regime ever fires. |
+| `0005-peft-trainable-token-replacements.patch` | Native PEFT TrainableTokens replacement rows for compact Gemma adapter serving. Tested with `eastself-v1-lora-ck6500-tokenrep.gguf`; not default-shipped yet. |
 
 ## Build Examples
 

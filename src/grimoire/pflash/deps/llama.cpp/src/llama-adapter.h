@@ -60,11 +60,19 @@ struct llama_adapter_lora_weight {
     llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
 };
 
+struct llama_adapter_token_replacements {
+    ggml_tensor * replacements = nullptr;
+    ggml_tensor * map          = nullptr;
+    ggml_tensor * mask         = nullptr;
+    ggml_tensor * token_ids    = nullptr;
+};
+
 struct llama_adapter_lora {
     llama_model * model = nullptr;
 
     // map tensor name to lora_a_b
     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;
+    std::unordered_map<std::string, llama_adapter_token_replacements> token_replacements_map;
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -81,9 +89,12 @@ struct llama_adapter_lora {
     ~llama_adapter_lora() = default;
 
     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
+    llama_adapter_token_replacements * get_token_replacements(ggml_tensor * w);
 
     uint32_t get_n_nodes() const {
-        return ab_map.size() * 6u; // a, b, scale, add, 2 x mul_mat
+        // LoRA: a, b, scale, add, 2 x mul_mat.
+        // Token replacements: input replacement + output projection correction.
+        return ab_map.size() * 6u + token_replacements_map.size() * 16u;
     }
 };
 

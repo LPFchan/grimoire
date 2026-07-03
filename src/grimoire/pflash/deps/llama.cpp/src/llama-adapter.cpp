@@ -146,6 +146,17 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
+llama_adapter_token_replacements * llama_adapter_lora::get_token_replacements(ggml_tensor * w) {
+    const std::string name(w->name);
+
+    const auto pos = token_replacements_map.find(name);
+    if (pos != token_replacements_map.end()) {
+        return &pos->second;
+    }
+
+    return nullptr;
+}
+
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {
     LLAMA_LOG_INFO("%s: loading lora adapter from '%s' ...\n", __func__, path_lora);
 
@@ -262,8 +273,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         return it->second;
     };
 
-    // bundle lora_a and lora_b into pairs
+    // bundle lora_a/lora_b and optional PEFT trainable-token replacement tensors
     std::map<std::string, llama_adapter_lora_weight> ab_map;
+    std::map<std::string, llama_adapter_token_replacements> token_replacements_map;
     auto str_endswith = [](const std::string & str, const std::string & suffix) {
         return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
     };
@@ -284,6 +296,18 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             } else {
                 ab_map[name].b = cur;
             }
+        } else if (str_endswith(name, ".token_replacements")) {
+            replace_all(name, ".token_replacements", "");
+            token_replacements_map[name].replacements = cur;
+        } else if (str_endswith(name, ".token_map")) {
+            replace_all(name, ".token_map", "");
+            token_replacements_map[name].map = cur;
+        } else if (str_endswith(name, ".token_mask")) {
+            replace_all(name, ".token_mask", "");
+            token_replacements_map[name].mask = cur;
+        } else if (str_endswith(name, ".token_ids")) {
+            replace_all(name, ".token_ids", "");
+            token_replacements_map[name].token_ids = cur;
         } else if (str_endswith(name, "_norm.weight")) {
             // TODO: add support for norm vector
             // for now, we don't really care because most adapters still work fine without it
@@ -375,6 +399,71 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
         adapter.ab_map[name] = llama_adapter_lora_weight(tensor_a, tensor_b);
     }
 
+    for (auto & it : token_replacements_map) {
+        const std::string & name = it.first;
+        llama_adapter_token_replacements & tr = it.second;
+
+        if (!tr.replacements || !tr.map || !tr.mask || !tr.token_ids) {
+            throw std::runtime_error("Token replacement tensors for '" + name + "' are incomplete");
+        }
+
+        const auto * model_tensor = model.get_tensor(name.c_str());
+        if (!model_tensor) {
+            throw std::runtime_error("Token replacement tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
+        }
+
+        if (tr.replacements->type != GGML_TYPE_F32 && tr.replacements->type != GGML_TYPE_F16 && tr.replacements->type != GGML_TYPE_BF16) {
+            throw std::runtime_error("token_replacements tensor for '" + name + "' must be F32/F16/BF16");
+        }
+        if (tr.map->type != GGML_TYPE_I32 && tr.map->type != GGML_TYPE_F32) {
+            throw std::runtime_error("token_map tensor for '" + name + "' must be I32 or F32");
+        }
+        if (tr.mask->type != GGML_TYPE_F32) {
+            throw std::runtime_error("token_mask tensor for '" + name + "' must be F32");
+        }
+        if (tr.token_ids->type != GGML_TYPE_I32 && tr.token_ids->type != GGML_TYPE_F32) {
+            throw std::runtime_error("token_ids tensor for '" + name + "' must be I32 or F32");
+        }
+        if (model_tensor->ne[0] != tr.replacements->ne[0]) {
+            throw std::runtime_error("token_replacements tensor for '" + name + "' has incorrect embedding size");
+        }
+        if (model_tensor->ne[1] != tr.map->ne[0] || model_tensor->ne[1] != tr.mask->ne[0]) {
+            throw std::runtime_error("token_map/token_mask tensor for '" + name + "' has incorrect vocab size");
+        }
+        if (tr.replacements->ne[1] != tr.token_ids->ne[0] + 1) {
+            throw std::runtime_error("token_replacements tensor for '" + name + "' must include a zero row plus one row per token_id");
+        }
+
+        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
+        for (auto & ex : buft_extra) {
+            if (ex == buft) {
+                LLAMA_LOG_WARN("%s: token replacements for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                }
+                buft = ggml_backend_dev_buffer_type(cpu_dev);
+
+                break;
+            }
+        }
+
+        LLAMA_LOG_DEBUG("%s: token replacements for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+
+        ggml_context * dev_ctx = ctx_for_buft(buft);
+        llama_adapter_token_replacements dev_tr;
+        dev_tr.replacements = ggml_dup_tensor(dev_ctx, tr.replacements);
+        dev_tr.map          = ggml_dup_tensor(dev_ctx, tr.map);
+        dev_tr.mask         = ggml_dup_tensor(dev_ctx, tr.mask);
+        dev_tr.token_ids    = ggml_dup_tensor(dev_ctx, tr.token_ids);
+        ggml_set_name(dev_tr.replacements, tr.replacements->name);
+        ggml_set_name(dev_tr.map,          tr.map->name);
+        ggml_set_name(dev_tr.mask,         tr.mask->name);
+        ggml_set_name(dev_tr.token_ids,    tr.token_ids->name);
+        adapter.token_replacements_map[name] = dev_tr;
+    }
+
     // allocate tensors / buffers and zero
     {
         adapter.ctxs.reserve(ctx_map.size());
@@ -409,12 +498,21 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             set_tensor(orig.a, dev.a);
             set_tensor(orig.b, dev.b);
         }
+        for (auto & it : adapter.token_replacements_map) {
+            auto orig = token_replacements_map[it.first];
+            auto dev  = it.second;
+            set_tensor(orig.replacements, dev.replacements);
+            set_tensor(orig.map,          dev.map);
+            set_tensor(orig.mask,         dev.mask);
+            set_tensor(orig.token_ids,    dev.token_ids);
+        }
     }
 
     // register adapter with model
     model.loras.insert(&adapter);
 
-    LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
+    LLAMA_LOG_INFO("%s: loaded %zu LoRA tensor pairs and %zu token replacement tables from lora file\n",
+            __func__, adapter.ab_map.size(), adapter.token_replacements_map.size());
 }
 
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {

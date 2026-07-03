@@ -418,8 +418,12 @@ if __name__ == '__main__':
 
             def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
                 tensor_map: dict[str, PartialLoraTensor] = {}
+                token_replacements: Tensor | None = None
 
                 for name, tensor in lora_model.items():
+                    if name.endswith(".embed_tokens.token_adapter.trainable_tokens_delta"):
+                        token_replacements = tensor
+                        continue
                     if self.lazy:
                         tensor = LazyTorchTensor.from_eager(tensor)
                     base_name = get_base_tensor_name(name)
@@ -455,7 +459,49 @@ if __name__ == '__main__':
                     assert tensor.B is not None
                     yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
 
+                if token_replacements is not None:
+                    token_indices = lparams.get("trainable_token_indices")
+                    if not isinstance(token_indices, list) or not all(isinstance(i, int) for i in token_indices):
+                        raise ValueError("trainable_tokens_delta requires integer adapter_config.json trainable_token_indices")
+                    if len(token_indices) != token_replacements.shape[0]:
+                        raise ValueError(
+                            "trainable_tokens_delta row count does not match trainable_token_indices length: "
+                            f"{token_replacements.shape[0]} != {len(token_indices)}"
+                        )
+
+                    vocab_size = hparams.get("vocab_size")
+                    text_config = hparams.get("text_config")
+                    if vocab_size is None and isinstance(text_config, dict):
+                        vocab_size = text_config.get("vocab_size")
+                    if not isinstance(vocab_size, int) or vocab_size <= 0:
+                        raise ValueError("Unable to determine base vocab_size for trainable token map")
+                    if min(token_indices) < 0 or max(token_indices) >= vocab_size:
+                        raise ValueError("trainable_token_indices contains token IDs outside base vocab")
+
+                    token_replacements = token_replacements.to(torch.float32)
+                    zero_row = torch.zeros(
+                        (1, token_replacements.shape[1]),
+                        dtype=token_replacements.dtype,
+                        device=token_replacements.device,
+                    )
+                    replacement_table = torch.cat([zero_row, token_replacements], dim=0).contiguous()
+
+                    token_ids = torch.tensor(token_indices, dtype=torch.int32)
+                    token_map = torch.zeros(vocab_size, dtype=torch.int32)
+                    token_mask = torch.zeros(vocab_size, dtype=torch.float32)
+                    token_map[token_ids.to(torch.long)] = torch.arange(1, len(token_indices) + 1, dtype=torch.int32)
+                    token_mask[token_ids.to(torch.long)] = 1.0
+
+                    yield ("token_embd.weight.token_replacements", replacement_table)
+                    yield ("token_embd.weight.token_map", token_map)
+                    yield ("token_embd.weight.token_mask", token_mask)
+                    yield ("token_embd.weight.token_ids", token_ids)
+
             def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+                if name.startswith("token_embd.weight.token_"):
+                    yield (name, data_torch)
+                    return
+
                 dest = list(super().modify_tensors(data_torch, name, bid))
                 # some archs may have the same tensor for lm_head and output (tie word embeddings)
                 # in this case, adapters targeting lm_head will fail when using llama-export-lora

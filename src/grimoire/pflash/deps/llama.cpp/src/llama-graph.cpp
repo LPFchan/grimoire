@@ -989,6 +989,38 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_add(ctx0, res, ab_cur);
     }
 
+    for (const auto & lora : *loras) {
+        llama_adapter_token_replacements * tr = lora.first->get_token_replacements(w);
+        if (tr == nullptr) {
+            continue;
+        }
+
+        const float adapter_scale = lora.second;
+
+        ggml_tensor * token_ids = tr->token_ids;
+        if (token_ids->type != GGML_TYPE_I32) {
+            token_ids = ggml_cast(ctx0, token_ids, GGML_TYPE_I32);
+        }
+
+        ggml_tensor * base_rows = ggml_get_rows(ctx0, w, token_ids);
+        ggml_tensor * repl_rows = ggml_view_2d(
+                ctx0, tr->replacements,
+                tr->replacements->ne[0], tr->replacements->ne[1] - 1,
+                tr->replacements->nb[1], tr->replacements->nb[1]);
+        ggml_tensor * delta_rows = ggml_sub(ctx0, repl_rows, base_rows);
+        if (adapter_scale != 1.0f) {
+            delta_rows = ggml_scale(ctx0, delta_rows, adapter_scale);
+        }
+
+        ggml_tensor * delta_logits   = ggml_mul_mat(ctx0, delta_rows, cur);
+        ggml_tensor * delta_logits_t = ggml_cont(ctx0, ggml_transpose(ctx0, delta_logits));
+        ggml_tensor * res_t          = ggml_cont(ctx0, ggml_transpose(ctx0, res));
+        ggml_tensor * full_delta_t   = ggml_fill(ctx0, res_t, 0.0f);
+        full_delta_t = ggml_set_rows(ctx0, full_delta_t, delta_logits_t, token_ids);
+        ggml_tensor * full_delta = ggml_cont(ctx0, ggml_transpose(ctx0, full_delta_t));
+        res = ggml_add(ctx0, res, full_delta);
+    }
+
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
     }
@@ -1665,6 +1697,32 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
                         ), scale);
 
             cur = ggml_add(ctx0, cur, inpL_delta);
+        }
+
+        // apply PEFT TrainableTokens replacement rows if present
+        for (const auto & lora : *loras) {
+            llama_adapter_token_replacements * tr = lora.first->get_token_replacements(tok_embd);
+            if (tr == nullptr) {
+                continue;
+            }
+
+            const float adapter_scale = lora.second;
+
+            ggml_tensor * replacement_map = ggml_reshape_2d(ctx0, tr->map, 1, tr->map->ne[0]);
+            ggml_tensor * replacement_ids = ggml_get_rows(ctx0, replacement_map, inp->tokens);
+            if (replacement_ids->type != GGML_TYPE_I32) {
+                replacement_ids = ggml_cast(ctx0, replacement_ids, GGML_TYPE_I32);
+            }
+            replacement_ids = ggml_reshape_1d(ctx0, replacement_ids, inp->tokens->ne[0]);
+            ggml_tensor * replacement_rows = ggml_get_rows(ctx0, tr->replacements, replacement_ids);
+            ggml_tensor * replacement_mask_table = ggml_reshape_2d(ctx0, tr->mask, 1, tr->mask->ne[0]);
+            ggml_tensor * replacement_mask = ggml_get_rows(ctx0, replacement_mask_table, inp->tokens);
+            ggml_tensor * replacement_delta = ggml_sub(ctx0, replacement_rows, cur);
+            replacement_delta = ggml_mul(ctx0, replacement_delta, ggml_repeat(ctx0, replacement_mask, replacement_delta));
+            if (adapter_scale != 1.0f) {
+                replacement_delta = ggml_scale(ctx0, replacement_delta, adapter_scale);
+            }
+            cur = ggml_add(ctx0, cur, replacement_delta);
         }
 
         if (n_embd_inp != n_embd) {
