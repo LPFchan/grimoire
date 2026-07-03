@@ -448,6 +448,7 @@ class ModelManager:
         self.gpu_count = gpu_count
         self._lock = asyncio.Lock()
         self.preset_lock = None
+        self.preset_allows_manual_control = False
         self.gpu_mask = None  # set[int] or None (None = all GPUs available)
 
     def _is_gpu_allowed(self, gpu_id):
@@ -716,7 +717,7 @@ class ModelManager:
             return existing
 
         async with self._lock:
-            if self.preset_lock is not None and not _preset_bypass:
+            if self.preset_lock is not None and not _preset_bypass and not self.preset_allows_manual_control:
                 raise RuntimeError(
                     f"Preset '{self.preset_lock}' is active. "
                     f"Deactivate the preset before manually starting models."
@@ -811,7 +812,7 @@ class ModelManager:
         """Stop an active model."""
         model_name = registry.resolve(model_name) or model_name
         async with self._lock:
-            if self.preset_lock is not None and not _preset_bypass:
+            if self.preset_lock is not None and not _preset_bypass and not self.preset_allows_manual_control:
                 raise RuntimeError(
                     f"Preset '{self.preset_lock}' is active. "
                     f"Deactivate the preset before manually stopping models."

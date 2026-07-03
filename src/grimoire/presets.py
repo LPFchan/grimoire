@@ -125,6 +125,7 @@ class PresetManager:
                 raise KeyError(f"Preset '{name}' not found")
 
             target = set(preset.get("models", []))
+            manual_control = not target and not preset.get("fixed")
             current = set(manager.list_active())
 
             missing = [m for m in target if not registry.get(m)]
@@ -139,10 +140,12 @@ class PresetManager:
                 fixed_drifted = current_subset != preset_fixed
                 intended_mask = set(preset.get("gpus")) if preset.get("gpus") is not None else None
                 mask_changed = manager.gpu_mask != intended_mask
-                if not missing_models and not fixed_drifted and not mask_changed:
+                manual_control_changed = getattr(manager, "preset_allows_manual_control", False) != manual_control
+                if not missing_models and not fixed_drifted and not mask_changed and not manual_control_changed:
                     return {"active": name, "unchanged": True}
 
             manager.preset_lock = name
+            manager.preset_allows_manual_control = manual_control
 
             gpu_list = preset.get("gpus")
             manager.gpu_mask = set(gpu_list) if gpu_list is not None else None
@@ -193,6 +196,7 @@ class PresetManager:
             has_gpu_mask = preset.get("gpus") is not None
             if not target and not preset.get("fixed") and not has_gpu_mask:
                 manager.preset_lock = None
+                manager.preset_allows_manual_control = False
                 manager.gpu_mask = None
                 if self._pre_preset_fixed is not None:
                     registry.swap_fixed(self._pre_preset_fixed)
