@@ -25,3 +25,4 @@ Thumbs.db
 # build artifacts
 tmp/
 state/
+unsloth_compiled_cache/
