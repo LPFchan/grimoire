@@ -991,16 +991,24 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
     if (clip_is_llava(ctx_clip)
         || clip_is_minicpmv(ctx_clip)
         || clip_is_glm(ctx_clip)
-        || proj_type == PROJECTOR_TYPE_INTERNVL) {
-        // TODO @ngxson : llava does not support batched encoding ; this should be fixed inside clip_image_batch_encode()
+        || proj_type == PROJECTOR_TYPE_INTERNVL
+        || proj_type == PROJECTOR_TYPE_GEMMA4V) {
+        // Some projectors build a single-image graph or validate output against
+        // only the first image. Encode those image chunks one at a time and
+        // append each image's embeddings into the mtmd output buffer.
         const auto & entries = image_tokens->batch_f32.entries;
+        size_t output_offset = 0;
         for (size_t i = 0; i < entries.size(); i++) {
             int n_tokens_per_image = clip_n_output_tokens(ctx_clip, entries[i].get());
             ok = clip_image_encode(
                 ctx_clip,
                 ctx->n_threads,
                 entries[i].get(),
-                ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_image);
+                ctx->image_embd_v.data() + output_offset);
+            if (!ok) {
+                break;
+            }
+            output_offset += (size_t) n_mmproj_embd * (size_t) n_tokens_per_image;
         }
     } else {
         ok = clip_image_batch_encode(

@@ -9,11 +9,11 @@ ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=4595fff0bbd15ee01663699b788eea70e7e1cd69
-ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=0
+ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
 ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
 # Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
-# Default ships V2 (graph-safe FA scratch owner) + #22155 backport (legacy pool flush-on-OOM).
-ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0002-cuda-fa-v2-scratch-owner.patch,0004-pool-flush-on-oom.patch
+# Default ships PEFT token replacements plus the Gemma4V multi-image mtmd fix for the current pinned llama.cpp SHA.
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0005-peft-trainable-token-replacements.patch,0006-mtmd-gemma4v-sequential-images.patch
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
 ARG CACHE_BUST=11
 
@@ -51,11 +51,11 @@ COPY patches/atomic-llama-cpp/ /app/patches/atomic-llama-cpp/
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL
 ARG GRIMOIRE_LLAMA_CPP_REF
 ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
-ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=0
+ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
 ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
 # Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
-# Default ships V2 (graph-safe FA scratch owner) + #22155 backport (legacy pool flush-on-OOM).
-ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0002-cuda-fa-v2-scratch-owner.patch,0004-pool-flush-on-oom.patch
+# Default ships PEFT token replacements plus the Gemma4V multi-image mtmd fix for the current pinned llama.cpp SHA.
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0005-peft-trainable-token-replacements.patch,0006-mtmd-gemma4v-sequential-images.patch
 ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 
@@ -90,12 +90,13 @@ RUN --mount=type=cache,target=/root/.ccache \
         rm -f /app/.cache/llama-cpp-build/.built; \
     fi; \
 fi; \
+    git -C /app/.cache/llama-cpp-src/repo fetch --depth 1 origin "$GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
+    git -C /app/.cache/llama-cpp-src/repo reset --hard "$GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
     current_sha=$(git -C /app/.cache/llama-cpp-src/repo rev-parse HEAD); \
     if [ "$current_sha" != "$GRIMOIRE_LLAMA_CPP_PINNED_SHA" ]; then \
         echo "ERROR: cloned SHA $current_sha != pinned $GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
         exit 1; \
     fi; \
-    git -C /app/.cache/llama-cpp-src/repo reset --hard "$GRIMOIRE_LLAMA_CPP_PINNED_SHA"; \
     git -C /app/.cache/llama-cpp-src/repo clean -fdx; \
     # Resolve patch files (comma-separated list, applied in order).
     patch_files=$(echo "$GRIMOIRE_LLAMA_CPP_PATCH_FILE" | tr ',' ' '); \
