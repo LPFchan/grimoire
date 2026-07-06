@@ -23,6 +23,7 @@ from fastapi import HTTPException
 import grimoire.config as config
 import grimoire.entrypoint as entrypoint
 import grimoire.model_manager as mm_module
+import grimoire.routes.models as models_routes
 from grimoire.history import HistoryStore, identity_hash
 from grimoire.registry import ModelRegistry
 
@@ -636,6 +637,41 @@ class DropInBlockerTests(unittest.TestCase):
             self.assertEqual(cfg.get("capabilities"), ["completion"], name)
             self.assertNotIn("mmproj", cfg, name)
 
+    def test_ingested_model_preserves_source_mmproj(self):
+        class FakeRegistry:
+            def __init__(self):
+                self.added = None
+            def get(self, name):
+                if name != "gemma-vision":
+                    raise AssertionError(name)
+                return {
+                    "file": "gguf/base.gguf",
+                    "mmproj": "gguf/gemma4-mmproj-BF16.gguf",
+                    "capabilities": ["completion", "multimodal"],
+                    "ctx-size": 120000,
+                    "cache-type-k": "turbo4",
+                    "cache-type-v": "turbo4",
+                }
+            def add(self, alias, config):
+                self.added = (alias, config)
+        fake_registry = FakeRegistry()
+        old_registry = models_routes.registry
+        try:
+            models_routes.registry = fake_registry
+            models_routes._ingest_tasks["task-mmproj"] = {
+                "alias": "derived-vision",
+                "filename": "derived.gguf",
+                "load_settings_from": "gemma-vision",
+            }
+            models_routes._register_model("task-mmproj")
+        finally:
+            models_routes.registry = old_registry
+            models_routes._ingest_tasks.pop("task-mmproj", None)
+        alias, config = fake_registry.added
+        self.assertEqual(alias, "derived-vision")
+        self.assertEqual(config["file"], "gguf/derived.gguf")
+        self.assertEqual(config["mmproj"], "gguf/gemma4-mmproj-BF16.gguf")
+        self.assertEqual(config["capabilities"], ["completion", "multimodal"])
     def test_llama_side_pflash_startup_fails_closed_when_daemon_boot_fails(self):
         class FakeRegistry:
             def resolve(self, name):

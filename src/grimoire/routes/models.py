@@ -915,7 +915,7 @@ def _register_model(task_id: str):
         src = registry.get(load_from)
         if src:
             for k, v in src.items():
-                if k not in ("file", "mmproj", "alias", "added", "backend",
+                if k not in ("file", "alias", "added", "backend",
                              "mtp-head", "spec-draft-model", "draft", "drafter"):
                     config[k] = v
 
