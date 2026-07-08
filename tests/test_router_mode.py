@@ -33,6 +33,28 @@ class FakeActive:
         return self.status == entrypoint.MODEL_STATUS_LOADED
 
 
+class FakeLoraResponse:
+    status_code = 200
+    text = '{"success":true}'
+
+
+class FakeLoraClient:
+    last_post = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, json):
+        type(self).last_post = (url, json)
+        return FakeLoraResponse()
+
+
 class RouterModeContractTests(unittest.TestCase):
     def setUp(self):
         self._old_api = config.API_KEY
@@ -138,12 +160,53 @@ class RouterModeContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(called["name"], "gemma-4-31B")
 
+    def test_alpha_get_returns_active_adapter_scales(self):
+        registry_aliases = entrypoint.registry.list_all()
+        if not registry_aliases:
+            self.skipTest("registry seed empty")
+        name = registry_aliases[0]
+        entrypoint.manager.active[name] = FakeActive(name)
+
+        async def fake_adapters(_active):
+            return [{"id": 0, "scale": 0.8}]
+
+        with patch.object(models_routes, "_backend_lora_adapters", fake_adapters):
+            response = self.client.get("/alpha", headers=self.auth)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], name)
+        self.assertEqual(response.json()["adapters"][0]["scale"], 0.8)
+
+    def test_alpha_post_updates_active_backend_lora_scale(self):
+        registry_aliases = entrypoint.registry.list_all()
+        if not registry_aliases:
+            self.skipTest("registry seed empty")
+        name = registry_aliases[0]
+        entrypoint.manager.active[name] = FakeActive(name, port=8123)
+        FakeLoraClient.last_post = None
+
+        async def fake_adapters(_active):
+            return [{"id": 0, "scale": 0.6}]
+
+        with patch.object(models_routes, "_backend_lora_adapters", fake_adapters), \
+                patch.object(models_routes.httpx, "AsyncClient", FakeLoraClient):
+            response = self.client.post("/alpha", json=0.6, headers=self.auth)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["alpha"], 0.6)
+        self.assertEqual(
+            FakeLoraClient.last_post,
+            ("http://127.0.0.1:8123/lora-adapters", [{"id": 0, "scale": 0.6}]),
+        )
+
     def test_router_endpoints_require_auth(self):
         for path, method, body in [
             ("/props", "get", None),
             ("/v1/models", "get", None),
             ("/models/load", "post", {"model": "x"}),
             ("/models/unload", "post", {"model": "x"}),
+            ("/alpha", "get", None),
+            ("/alpha", "post", 0.6),
         ]:
             response = self.client.request(method, path, json=body)
             self.assertEqual(response.status_code, 401, f"{method} {path} should require auth")

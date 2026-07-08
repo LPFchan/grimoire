@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -68,6 +69,72 @@ def _model_payload_name(payload):
         return None
     name = payload.get("model")
     return name if isinstance(name, str) and name else None
+
+
+def _alpha_payload_value(payload, body: bytes):
+    if isinstance(payload, bool):
+        return None
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if isinstance(payload, dict):
+        value = payload.get("alpha", payload.get("scale"))
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
+    if isinstance(payload, str):
+        try:
+            return float(payload)
+        except ValueError:
+            return None
+    if body:
+        try:
+            return float(body.decode("utf-8").strip())
+        except (UnicodeDecodeError, ValueError):
+            return None
+    return None
+
+
+async def _active_alpha_target(request: Request):
+    manager = _get_manager()
+    requested = request.query_params.get("model")
+    if requested:
+        resolved = registry.resolve(requested)
+        if not resolved:
+            raise HTTPException(status_code=404, detail=f"Model '{requested}' was not found in the registry")
+        active = manager.get_active(resolved)
+        if not active:
+            raise HTTPException(status_code=404, detail=f"Model '{resolved}' is not active")
+        return resolved, active
+
+    active_names = manager.list_active()
+    if len(active_names) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Expected exactly one active model or ?model=..., found {len(active_names)}",
+        )
+    model_name = active_names[0]
+    active = manager.get_active(model_name)
+    if not active:
+        raise HTTPException(status_code=404, detail=f"Model '{model_name}' is not active")
+    return model_name, active
+
+
+async def _backend_lora_adapters(active) -> list[dict]:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"http://127.0.0.1:{active.port}/lora-adapters")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Backend rejected /lora-adapters GET: {resp.text}")
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Backend returned invalid /lora-adapters JSON") from exc
+    return data if isinstance(data, list) else []
 
 
 def _containment_check(filename: str) -> str:
@@ -284,6 +351,60 @@ async def models_unload(request: Request):
     if not name:
         raise HTTPException(status_code=400, detail="Missing 'model' in body")
     return await stop_model_endpoint(name, request)
+
+
+@router.get("/alpha")
+async def get_alpha(request: Request):
+    """Return runtime LoRA adapter scales for the active backend."""
+    require_api(request)
+    model_name, active = await _active_alpha_target(request)
+    return {
+        "model": model_name,
+        "port": active.port,
+        "adapters": await _backend_lora_adapters(active),
+    }
+
+
+@router.post("/alpha")
+async def set_alpha(request: Request):
+    """Set runtime LoRA alpha for the active backend without rebaking GGUFs."""
+    require_admin(request)
+    body = await request.body()
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    alpha = _alpha_payload_value(payload, body)
+    if alpha is None or not math.isfinite(alpha) or alpha < 0:
+        raise HTTPException(status_code=400, detail="Body must be a non-negative finite alpha float")
+
+    adapter_id_raw = request.query_params.get("id", "0")
+    try:
+        adapter_id = int(adapter_id_raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="'id' must be an integer")
+    if adapter_id < 0:
+        raise HTTPException(status_code=400, detail="'id' must be non-negative")
+
+    model_name, active = await _active_alpha_target(request)
+    before = await _backend_lora_adapters(active)
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(
+            f"http://127.0.0.1:{active.port}/lora-adapters",
+            json=[{"id": adapter_id, "scale": alpha}],
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Backend rejected alpha update: {resp.text}")
+    after = await _backend_lora_adapters(active)
+    return {
+        "status": "updated",
+        "model": model_name,
+        "port": active.port,
+        "adapter_id": adapter_id,
+        "alpha": alpha,
+        "before": before,
+        "adapters": after,
+    }
 
 
 @router.post("/ingest")
