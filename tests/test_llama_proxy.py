@@ -148,63 +148,45 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status_code, 503)
         self.assertIn("pflash compression failed", cm.exception.detail)
 
-    async def test_slot_restore_and_save_use_content_hash(self):
+    async def test_slot_restore_declined_compression_returns_413(self):
         active = _FakeActive()
-        store = llama_proxy._kv_store(active)
         payload = {
             "model": active.name,
             "messages": [{"role": "user", "content": "ping"}],
             "stream": False,
         }
 
-        saved = []
-
-        async def capture_save(sc, url, h, st, log):
-            saved.append(st.kv_filename(h))
-            return True
-
         with patch.object(llama_proxy, "_prompt_layout_from_messages", return_value=([1, 2, 3], [])), \
              patch.object(llama_proxy, "maybe_compress", side_effect=lambda p, d, c, blocks=None: (p, False, [])), \
              patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
-             patch.object(llama_proxy, "get_proxy_client", _FakeClient), \
-             patch.object(llama_proxy, "_save_kv", side_effect=capture_save):
-            response = await llama_proxy._proxy_chat(active.name, payload, active)
-            async for _ in response.body_iterator:
-                pass
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient):
+            with self.assertRaises(HTTPException) as cm:
+                await llama_proxy._proxy_chat(active.name, payload, active)
 
-        expected_name = store.kv_filename(store.hash_prefix([1, 2, 3]))
-        self.assertEqual(saved, [expected_name])
+        self.assertEqual(cm.exception.status_code, 413)
+        self.assertIn("compression declined", cm.exception.detail)
 
-    async def test_restore_success_saves_even_without_compression(self):
+    async def test_restore_success_declined_compression_returns_413(self):
         active = _FakeActive()
-        store = llama_proxy._kv_store(active)
         payload = {
             "model": active.name,
             "messages": [{"role": "user", "content": "ping"}],
             "stream": False,
         }
 
-        saved = []
-
-        async def capture_save(sc, url, h, st, log):
-            saved.append(st.kv_filename(h))
-            return True
-
         with patch.object(llama_proxy, "_prompt_layout_from_messages", return_value=([1, 2, 3], [])), \
              patch.object(llama_proxy, "maybe_compress", side_effect=lambda p, d, c, blocks=None: (p, False, [])), \
              patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
              patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
-             patch.object(llama_proxy, "get_proxy_client", _FakeClient), \
-             patch.object(llama_proxy, "_save_kv", side_effect=capture_save):
-            response = await llama_proxy._proxy_chat(active.name, payload, active)
-            async for _ in response.body_iterator:
-                pass
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient):
+            with self.assertRaises(HTTPException) as cm:
+                await llama_proxy._proxy_chat(active.name, payload, active)
 
-        expected_name = store.kv_filename(store.hash_prefix([1, 2, 3]))
-        self.assertEqual(saved, [expected_name])
+        self.assertEqual(cm.exception.status_code, 413)
+        self.assertIn("compression declined", cm.exception.detail)
 
     async def test_first_turn_saves_content_hash_kv(self):
         active = _FakeActive()
@@ -258,6 +240,30 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(saved), 1)
         self.assertTrue(saved[0].startswith("kv-"))
+
+    async def test_plain_chat_requests_do_not_wait_for_slot_lock(self):
+        active = _FakeActive()
+        active.prefill_config = None
+        payload = {
+            "model": active.name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+        }
+
+        with patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
+             patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
+             patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient):
+            responses = await asyncio.wait_for(
+                asyncio.gather(
+                    llama_proxy._proxy_chat(active.name, payload, active),
+                    llama_proxy._proxy_chat(active.name, payload, active),
+                ),
+                timeout=1.0,
+            )
+            for response in responses:
+                async for _ in response.body_iterator:
+                    pass
 
     def test_kv_filename_format(self):
         from grimoire.dflash.kv_cache_store import KVCacheStore, KV_PREFIX, KV_SUFFIX

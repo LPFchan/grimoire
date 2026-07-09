@@ -199,6 +199,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                 tokenizer, messages, add_generation_prompt=True,
                 model_cfg=model_cfg, active=active,
             )
+            _save_hash = store.hash_prefix(prompt_ids)
             if len(prompt_ids) >= pcfg.threshold:
                 if not daemon or not daemon.is_running():
                     raise HTTPException(
@@ -211,7 +212,6 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                         ),
                     )
 
-                _save_hash = store.hash_prefix(prompt_ids)
                 is_warm = store.lookup(_save_hash) is not None
 
                 if not is_warm:
@@ -324,28 +324,35 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             )
 
     client = get_proxy_client()
-    slot_guard = _slot_lock(active)
-    await slot_guard.acquire()
+    slot_guard = None
+    slot_url = None
+    pflash_slots_enabled = bool(pcfg and pcfg.enabled)
+    needs_slot_guard = pflash_slots_enabled or validated_conversation_id is not None
+    if needs_slot_guard:
+        slot_guard = _slot_lock(active)
+        await slot_guard.acquire()
     try:
         payload = await plugin_manager.before_backend_request(
             payload, active.name, model_cfg, backend_model_id, client, url, headers
         )
         payload = _apply_model_logit_bias(payload, model_cfg)
 
-        # Three-tier KV cache: VRAM → RAM (tmpfs) → SSD
-        # Within same conversation: slot stays alive, cache_prompt handles delta.
-        # On conversation switch: save old to tmpfs, restore target if cached.
-        slot_url = f"http://127.0.0.1:{active.port}/slots/0"
-        prev_conv = getattr(active, "_current_conv_id", None)
-        if _save_hash is not None:
-            # pflash path: restore by compressed content hash
-            await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
-        elif validated_conversation_id and validated_conversation_id != prev_conv:
-            # Same-model conversation switch: save old slot, restore target
-            if prev_conv:
-                await store.save_conv(client, slot_url, prev_conv)
-            await store.restore_conv(client, slot_url, validated_conversation_id)
-            active._current_conv_id = validated_conversation_id
+        if needs_slot_guard:
+            # Three-tier KV cache: VRAM -> RAM (tmpfs) -> SSD.
+            # The guard is only for slot-0 save/restore mutations; ordinary
+            # chat completions must stay concurrent so llama-server can use
+            # its configured parallel slots.
+            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+            prev_conv = getattr(active, "_current_conv_id", None)
+            if _save_hash is not None:
+                # pflash path: restore by compressed content hash
+                await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
+            elif validated_conversation_id and validated_conversation_id != prev_conv:
+                # Same-model conversation switch: save old to tmpfs, restore target.
+                if prev_conv:
+                    await store.save_conv(client, slot_url, prev_conv)
+                await store.restore_conv(client, slot_url, validated_conversation_id)
+                active._current_conv_id = validated_conversation_id
 
         upstream = await client.send(
             client.build_request(
@@ -357,7 +364,8 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             stream=True,
         )
     except Exception:
-        slot_guard.release()
+        if slot_guard is not None:
+            slot_guard.release()
         raise
 
     non_streaming = not payload.get("stream", True)
@@ -396,10 +404,11 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         finally:
             await upstream.aclose()
             # KV prefix cache: save slot by content hash (pflash path only)
-            if _save_hash:
+            if _save_hash and slot_url:
                 async with httpx.AsyncClient(timeout=5) as sc:
                     await _save_kv(sc, slot_url, _save_hash, store, log)
-            slot_guard.release()
+            if slot_guard is not None:
+                slot_guard.release()
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")
