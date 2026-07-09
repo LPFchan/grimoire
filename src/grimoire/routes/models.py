@@ -378,7 +378,13 @@ async def set_alpha(request: Request):
     if alpha is None or not math.isfinite(alpha) or alpha < 0:
         raise HTTPException(status_code=400, detail="Body must be a non-negative finite alpha float")
 
-    adapter_id_raw = request.query_params.get("id", "0")
+    adapter_id_raw = request.query_params.get("id")
+    if adapter_id_raw is None and isinstance(payload, dict):
+        body_id = payload.get("id", payload.get("adapter_id"))
+        if body_id is not None:
+            adapter_id_raw = str(body_id)
+    if adapter_id_raw is None:
+        adapter_id_raw = "0"
     try:
         adapter_id = int(adapter_id_raw)
     except ValueError:
@@ -388,10 +394,22 @@ async def set_alpha(request: Request):
 
     model_name, active = await _active_alpha_target(request)
     before = await _backend_lora_adapters(active)
+    # The backend replaces its entire adapter-scale list on every call, so a
+    # single-entry payload silently zeroes every other adapter's scale. Preserve
+    # the current scale for every adapter not targeted by this request.
+    scales_by_id = {
+        int(entry["id"]): entry.get("scale", 1.0)
+        for entry in before
+        if isinstance(entry, dict) and "id" in entry
+    }
+    scales_by_id[adapter_id] = alpha
+    updated_payload = [
+        {"id": entry_id, "scale": scale} for entry_id, scale in sorted(scales_by_id.items())
+    ]
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.post(
             f"http://127.0.0.1:{active.port}/lora-adapters",
-            json=[{"id": adapter_id, "scale": alpha}],
+            json=updated_payload,
         )
     if resp.status_code != 200:
         raise HTTPException(status_code=502, detail=f"Backend rejected alpha update: {resp.text}")
