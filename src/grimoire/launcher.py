@@ -8,6 +8,12 @@ import sys
 import subprocess
 
 from grimoire.registry import registry, MODELS_DIR
+from grimoire.model_manager import (
+    GpuPlacement,
+    configure_gpu_environment,
+    detect_gpu_count,
+    effective_extra_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,14 +65,7 @@ def build_cmd(cfg, port, ctx_size_override=None):
             sys.exit(1)
         cmd.extend(["--mmproj", mmproj_path])
 
-    for arg in cfg.get("extra-args", []) or []:
-        cmd.append(str(arg))
-
-    family = cfg.get("family")
-    if family:
-        fd = registry.get_family_defaults(family)
-        for arg in fd.get("extra-args", []) or []:
-            cmd.append(str(arg))
+    cmd.extend(effective_extra_args(cfg))
 
     return cmd
 
@@ -79,20 +78,37 @@ def main():
         logger.error(f"Model '{args.model}' not found in registry")
         sys.exit(1)
 
+    gpu_count = detect_gpu_count()
+    valid, reason = registry.validate(args.model, gpu_count=gpu_count)
+    if not valid:
+        logger.error(reason)
+        sys.exit(1)
+
     pinned_gpu = registry.get_fixed_gpu(args.model)
-    gpu = pinned_gpu if pinned_gpu is not None else 0
+    configured_gpu_ids = cfg.get("gpu-ids")
     if args.gpu is not None:
         if args.gpu < 0:
             logger.error("GPU ID must be a non-negative integer")
             sys.exit(1)
-        gpu = args.gpu
+        if configured_gpu_ids is not None:
+            logger.error("--gpu cannot override a model configured with 'gpu-ids'")
+            sys.exit(1)
+        placement = GpuPlacement((args.gpu,))
+    elif configured_gpu_ids is not None:
+        placement = GpuPlacement(tuple(configured_gpu_ids))
+    else:
+        placement = GpuPlacement((pinned_gpu if pinned_gpu is not None else 0,))
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    try:
+        configure_gpu_environment(env, cfg, placement)
+    except ValueError as exc:
+        logger.error(str(exc))
+        sys.exit(1)
 
     cmd = build_cmd(cfg, args.port, args.ctx_size)
 
-    logger.info(f"Starting {args.model} on GPU {gpu}, port {args.port}")
+    logger.info(f"Starting {args.model} on GPU placement {list(placement.device_ids)}, port {args.port}")
     logger.info(f"Command: {' '.join(cmd)}")
 
     try:

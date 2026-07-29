@@ -636,6 +636,7 @@ class ModelRegistry:
             "cost": cfg.get("cost", {"input": 0, "output": 0}),
             "backend": _get_backend(cfg),
             "pinned_gpu": self.get_fixed_gpu(model_name),
+            "gpu_ids": copy.deepcopy(cfg.get("gpu-ids")),
         }
 
     def list_metadata(self):
@@ -686,12 +687,23 @@ class ModelRegistry:
 
     def pin_gpu(self, model_name, gpu_id):
         """Pin a model to a specific GPU."""
-        if not isinstance(gpu_id, int) or gpu_id < 0:
+        if isinstance(gpu_id, bool) or not isinstance(gpu_id, int) or gpu_id < 0:
             raise ValueError("GPU ID must be a non-negative integer")
         with self._lock:
             self._maybe_reload()
             if model_name not in self._data.get("models", {}):
                 raise KeyError(f"Model '{model_name}' not found")
+            gpu_ids = self._data["models"][model_name].get("gpu-ids")
+            if gpu_ids is not None:
+                if (
+                    not isinstance(gpu_ids, list)
+                    or len(gpu_ids) < 2
+                    or any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in gpu_ids)
+                    or len(set(gpu_ids)) != len(gpu_ids)
+                ):
+                    raise ValueError("Model has invalid 'gpu-ids'; expected at least two unique non-negative integers")
+                if gpu_id != gpu_ids[0]:
+                    raise ValueError(f"Pinned GPU must equal primary gpu-ids[0] ({gpu_ids[0]})")
             self._data.setdefault("fixed", {})[model_name] = gpu_id
             self._save()
 
@@ -746,10 +758,48 @@ class ModelRegistry:
 
         fixed_gpu = self.get_fixed_gpu(model_name)
         if fixed_gpu is not None:
-            if not isinstance(fixed_gpu, int) or fixed_gpu < 0:
+            if isinstance(fixed_gpu, bool) or not isinstance(fixed_gpu, int) or fixed_gpu < 0:
                 return False, f"Invalid pinned GPU ID for '{model_name}': {fixed_gpu}"
             if gpu_count is not None and fixed_gpu >= gpu_count:
                 return False, f"Pinned GPU {fixed_gpu} is outside available range 0-{gpu_count - 1}"
+
+        gpu_ids = cfg.get("gpu-ids")
+        if gpu_ids is not None:
+            if not isinstance(gpu_ids, list) or len(gpu_ids) < 2:
+                return False, f"'gpu-ids' for '{model_name}' must contain at least two GPU IDs"
+            if any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in gpu_ids):
+                return False, f"'gpu-ids' for '{model_name}' must contain non-negative integers"
+            if len(set(gpu_ids)) != len(gpu_ids):
+                return False, f"'gpu-ids' for '{model_name}' must not contain duplicates"
+            if gpu_count is not None and any(gpu >= gpu_count for gpu in gpu_ids):
+                return False, f"'gpu-ids' for '{model_name}' contains a GPU outside range 0-{gpu_count - 1}"
+            incompatible = []
+            if cfg.get("cpu-only"):
+                incompatible.append("cpu-only")
+            if cfg.get("vram-budget-mib") is not None:
+                incompatible.append("vram-budget-mib")
+            if cfg.get("pflash"):
+                incompatible.append("pflash")
+            if cfg.get("park-unpark"):
+                incompatible.append("park-unpark")
+            if cfg.get("speculative-type") == "dflash":
+                incompatible.append("speculative-type=dflash")
+            if incompatible:
+                return False, f"'gpu-ids' for '{model_name}' is incompatible with {', '.join(incompatible)}"
+            if fixed_gpu is not None and fixed_gpu != gpu_ids[0]:
+                return False, (
+                    f"Pinned GPU {fixed_gpu} for '{model_name}' must equal primary "
+                    f"gpu-ids[0] ({gpu_ids[0]})"
+                )
+            try:
+                from grimoire.model_manager import GpuPlacement, validate_multi_gpu_selectors
+                validate_multi_gpu_selectors(
+                    cfg,
+                    GpuPlacement(tuple(gpu_ids)),
+                    family_defaults_getter=self.get_family_defaults,
+                )
+            except ValueError as exc:
+                return False, str(exc)
 
         # A malformed vram-budget-mib (string/float/<=0) would otherwise be
         # silently coerced to None by the allocator and revert the model to

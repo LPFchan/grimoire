@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,11 +24,13 @@ import grimoire.routes.models as models_routes
 
 
 class FakeActive:
-    def __init__(self, name, gpu=0, port=8001, status=entrypoint.MODEL_STATUS_LOADED):
+    def __init__(self, name, gpu=0, gpus=None, port=8001, status=entrypoint.MODEL_STATUS_LOADED):
         self.name = name
         self.gpu = gpu
+        self.gpus = list(gpus) if gpus is not None else [gpu]
         self.port = port
         self.status = status
+        self.started = datetime.now(timezone.utc)
 
     def is_running(self):
         return self.status == entrypoint.MODEL_STATUS_LOADED
@@ -123,6 +126,23 @@ class RouterModeContractTests(unittest.TestCase):
         loaded = [e for e in response.json()["data"] if e["id"] == name][0]
         self.assertEqual(loaded["status"]["value"], entrypoint.MODEL_STATUS_LOADED)
         self.assertTrue(loaded["active"])
+
+    def test_status_and_switch_preserve_primary_gpu_and_add_full_placement(self):
+        registry_aliases = entrypoint.registry.list_all()
+        if not registry_aliases:
+            self.skipTest("registry seed empty")
+        name = registry_aliases[0]
+        entrypoint.manager.active[name] = FakeActive(name, gpu=1, gpus=[1, 0])
+
+        status_response = self.client.get("/status", headers=self.auth)
+        self.assertEqual(status_response.status_code, 200)
+        self.assertEqual(status_response.json()["active"][name]["gpu"], 1)
+        self.assertEqual(status_response.json()["active"][name]["gpus"], [1, 0])
+
+        switch_response = self.client.post(f"/switch/{name}", headers=self.auth)
+        self.assertEqual(switch_response.status_code, 200)
+        self.assertEqual(switch_response.json()["gpu"], 1)
+        self.assertEqual(switch_response.json()["gpus"], [1, 0])
 
     def test_models_load_calls_switch_with_payload_model(self):
         called = {}

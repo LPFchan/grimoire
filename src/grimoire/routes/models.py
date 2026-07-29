@@ -183,7 +183,7 @@ def _scan_gguf_files() -> list[dict]:
     return files
 
 
-def _validate_model_config(data: dict) -> None:
+def _validate_model_config(data: dict, gpu_count=None) -> None:
     if not isinstance(data, dict):
         raise HTTPException(status_code=400, detail="Body must be a JSON object")
     file_val = data.get("file")
@@ -217,6 +217,40 @@ def _validate_model_config(data: dict) -> None:
     if replica_peers is not None:
         if not isinstance(replica_peers, list) or not all(isinstance(a, str) for a in replica_peers):
             raise HTTPException(status_code=400, detail="'replica_peers' must be an array of strings")
+    gpu_ids = data.get("gpu-ids")
+    if gpu_ids is not None:
+        if not isinstance(gpu_ids, list) or len(gpu_ids) < 2:
+            raise HTTPException(status_code=400, detail="'gpu-ids' must contain at least two GPU IDs")
+        if any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in gpu_ids):
+            raise HTTPException(status_code=400, detail="'gpu-ids' must contain non-negative integers")
+        if len(set(gpu_ids)) != len(gpu_ids):
+            raise HTTPException(status_code=400, detail="'gpu-ids' must not contain duplicates")
+        if gpu_count is not None and any(gpu >= gpu_count for gpu in gpu_ids):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'gpu-ids' contains a GPU outside range 0-{gpu_count - 1}",
+            )
+        incompatible = []
+        if data.get("cpu-only"):
+            incompatible.append("cpu-only")
+        if data.get("vram-budget-mib") is not None:
+            incompatible.append("vram-budget-mib")
+        if data.get("pflash"):
+            incompatible.append("pflash")
+        if data.get("park-unpark"):
+            incompatible.append("park-unpark")
+        if data.get("speculative-type") == "dflash":
+            incompatible.append("speculative-type=dflash")
+        if incompatible:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'gpu-ids' is incompatible with {', '.join(incompatible)}",
+            )
+        try:
+            from grimoire.model_manager import GpuPlacement, validate_multi_gpu_selectors
+            validate_multi_gpu_selectors(data, GpuPlacement(tuple(gpu_ids)))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     spec_type = data.get("speculative-type")
     if spec_type == "mtp":
         if not data.get("mtp-head"):
@@ -274,6 +308,7 @@ async def status(request: Request):
             continue
         active_info[name] = {
             "gpu": active.gpu,
+            "gpus": getattr(active, "gpus", [] if active.gpu is None else [active.gpu]),
             "port": active.port,
             "started": active.started.isoformat(),
             "pinned": registry.is_fixed(name),
@@ -298,6 +333,7 @@ async def switch_model(model_name: str, request: Request):
             "status": "started",
             "model": model_name,
             "gpu": active.gpu,
+            "gpus": getattr(active, "gpus", [] if active.gpu is None else [active.gpu]),
             "port": active.port
         }
     except KeyError as e:
@@ -566,7 +602,15 @@ async def put_registry_model(name: str, request: Request):
         data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON")
-    _validate_model_config(data)
+    manager = _get_manager()
+    _validate_model_config(data, gpu_count=manager.gpu_count)
+    fixed_gpu = registry.get_fixed_gpu(name)
+    gpu_ids = data.get("gpu-ids")
+    if fixed_gpu is not None and gpu_ids is not None and fixed_gpu != gpu_ids[0]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Pinned GPU {fixed_gpu} must equal primary gpu-ids[0] ({gpu_ids[0]})",
+        )
 
     created = False
     try:
@@ -575,7 +619,6 @@ async def put_registry_model(name: str, request: Request):
     except ValueError:
         result = registry.update(name, data)
 
-    manager = _get_manager()
     valid, msg = registry.validate(name, gpu_count=manager.gpu_count)
     return JSONResponse(
         content={"model": result, "valid": valid, "message": msg},

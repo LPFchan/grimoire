@@ -3,11 +3,13 @@
 import asyncio
 import ctypes
 import logging
+import math
 import os
 import signal
 import subprocess
 from pathlib import Path
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -26,6 +28,136 @@ from grimoire.registry import (
 from grimoire.proxy.routes_table import publish as _publish_route_table
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class GpuPlacement:
+    """Ordered physical CUDA devices assigned to one backend process."""
+
+    device_ids: tuple[int, ...]
+
+    def __post_init__(self):
+        object.__setattr__(self, "device_ids", tuple(self.device_ids))
+        if not self.device_ids:
+            raise ValueError("GPU placement must contain at least one device")
+        if any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in self.device_ids):
+            raise ValueError("GPU placement IDs must be non-negative integers")
+        if len(set(self.device_ids)) != len(self.device_ids):
+            raise ValueError("GPU placement IDs must be unique")
+
+    @property
+    def primary(self):
+        return self.device_ids[0]
+
+    @property
+    def is_multi(self):
+        return len(self.device_ids) > 1
+
+
+_SELECTOR_FLAGS = {
+    "--split-mode": "split_mode",
+    "-sm": "split_mode",
+    "--tensor-split": "tensor_split",
+    "-ts": "tensor_split",
+    "--main-gpu": "main_gpu",
+    "-mg": "main_gpu",
+}
+_UNSAFE_MULTI_DEVICE_FLAGS = {
+    "--device",
+    "-dev",
+    "--device-draft",
+    "-devd",
+}
+_SELECTOR_ENV_VARS = (
+    "LLAMA_ARG_SPLIT_MODE",
+    "LLAMA_ARG_TENSOR_SPLIT",
+    "LLAMA_ARG_MAIN_GPU",
+)
+
+
+def effective_extra_args(cfg, family_defaults_getter=None):
+    """Return model and family extra arguments in command-line order."""
+    args = [str(arg) for arg in (cfg.get("extra-args", []) or [])]
+    family = cfg.get("family")
+    if family:
+        getter = family_defaults_getter or registry.get_family_defaults
+        fd = getter(family)
+        args.extend(str(arg) for arg in (fd.get("extra-args", []) or []))
+    return args
+
+
+def validate_multi_gpu_selectors(cfg, placement, family_defaults_getter=None):
+    """Validate llama.cpp selectors against CUDA's placement-local numbering."""
+    if not placement.is_multi:
+        return
+
+    args = effective_extra_args(cfg, family_defaults_getter=family_defaults_getter)
+    selectors = {}
+    index = 0
+    while index < len(args):
+        token = args[index]
+        flag, separator, inline_value = token.partition("=")
+        if flag in _UNSAFE_MULTI_DEVICE_FLAGS:
+            raise ValueError(f"'{flag}' is not supported with 'gpu-ids'")
+        selector = _SELECTOR_FLAGS.get(flag)
+        if selector is None:
+            index += 1
+            continue
+        if selector in selectors:
+            raise ValueError(f"Duplicate or conflicting GPU selector '{flag}'")
+        if separator:
+            value = inline_value
+        else:
+            index += 1
+            if index >= len(args) or args[index].startswith("-"):
+                raise ValueError(f"GPU selector '{flag}' requires a value")
+            value = args[index]
+        if not value:
+            raise ValueError(f"GPU selector '{flag}' requires a value")
+        selectors[selector] = value
+        index += 1
+
+    split_mode = selectors.get("split_mode")
+    if split_mode is not None:
+        if split_mode not in {"layer", "row", "tensor"}:
+            raise ValueError(f"Invalid multi-GPU split mode '{split_mode}'")
+
+    tensor_split = selectors.get("tensor_split")
+    if tensor_split is not None:
+        pieces = tensor_split.split(",")
+        if len(pieces) != len(placement.device_ids):
+            raise ValueError(
+                f"--tensor-split has {len(pieces)} values for "
+                f"{len(placement.device_ids)} visible GPUs"
+            )
+        try:
+            proportions = [float(piece) for piece in pieces]
+        except ValueError as exc:
+            raise ValueError("--tensor-split values must be numeric") from exc
+        if any(not math.isfinite(value) or value < 0 for value in proportions) or not any(proportions):
+            raise ValueError("--tensor-split values must be finite non-negative proportions with a positive total")
+
+    main_gpu = selectors.get("main_gpu")
+    if main_gpu is not None:
+        try:
+            logical_gpu = int(main_gpu)
+        except ValueError as exc:
+            raise ValueError("--main-gpu must be a logical GPU integer") from exc
+        if str(logical_gpu) != main_gpu.strip() or not 0 <= logical_gpu < len(placement.device_ids):
+            raise ValueError(
+                f"--main-gpu {main_gpu!r} is outside logical visible-device range "
+                f"0-{len(placement.device_ids) - 1}"
+            )
+
+
+def configure_gpu_environment(env, cfg, placement):
+    """Apply validated ordered CUDA visibility for one placement."""
+    validate_multi_gpu_selectors(cfg, placement)
+    if placement.is_multi:
+        for key in _SELECTOR_ENV_VARS:
+            env.pop(key, None)
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in placement.device_ids)
+    return env
 
 
 def _spawn_child_preexec():
@@ -201,7 +333,14 @@ class ActiveModel:
         self.name = name
         self.cfg = cfg
         self.port = port
-        self.gpu = gpu
+        if isinstance(gpu, GpuPlacement):
+            self.placement = gpu
+        elif gpu is None:
+            self.placement = None
+        else:
+            self.placement = GpuPlacement((gpu,))
+        self.gpu = self.placement.primary if self.placement is not None else None
+        self.gpus = list(self.placement.device_ids) if self.placement is not None else []
         self.process = None
         self.started = datetime.now(timezone.utc)
         self.backend_model_id = None
@@ -223,8 +362,8 @@ class ActiveModel:
         """Start the llama-server process."""
         cmd = build_cmd(self.cfg, self.port, alias=self.name)
         env = os.environ.copy()
-        if self.gpu is not None:
-            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+        if self.placement is not None:
+            configure_gpu_environment(env, self.cfg, self.placement)
             # Put turboquant ggml libraries first so llama-server doesn't
             # accidentally load dflash's (older) ggml-cuda which lacks the
             # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
@@ -262,7 +401,8 @@ class ActiveModel:
                     verify_tokens, n_max, branch_budget, draft_topk, tree_budget
                 )
 
-        logger.info(f"Starting {self.name} (llama) on {'CPU' if self.gpu is None else f'GPU {self.gpu}'}, port {self.port}")
+        device_label = "CPU" if self.placement is None else f"GPU(s) {','.join(map(str, self.gpus))}"
+        logger.info(f"Starting {self.name} (llama) on {device_label}, port {self.port}")
         logger.info(f"Command: {' '.join(cmd)}")
 
         self.process = subprocess.Popen(cmd, env=env, preexec_fn=_spawn_child_preexec)
@@ -490,7 +630,35 @@ class ModelManager:
 
     def _incumbents_on(self, gpu):
         """All active models currently placed on a GPU."""
-        return [(name, active) for name, active in self.active.items() if active.gpu == gpu]
+        return [
+            (name, active)
+            for name, active in self.active.items()
+            if gpu in getattr(active, "gpus", [active.gpu])
+        ]
+
+    def _allocate_explicit(self, model_name, cfg):
+        """Reserve every member of an explicit multi-GPU placement."""
+        placement = GpuPlacement(tuple(cfg["gpu-ids"]))
+        for gpu in placement.device_ids:
+            if gpu >= self.gpu_count:
+                raise RuntimeError(f"GPU {gpu} is outside available range")
+            if not self._is_gpu_allowed(gpu):
+                raise RuntimeError(f"GPU {gpu} is excluded by active GPU mask")
+
+        victims = []
+        seen = set()
+        for gpu in placement.device_ids:
+            for name, active in self._incumbents_on(gpu):
+                identity = id(active)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if registry.is_fixed(name):
+                    raise RuntimeError(
+                        f"Cannot evict pinned model '{name}' from GPU placement {list(placement.device_ids)}"
+                    )
+                victims.append((name, active))
+        return placement, victims
 
     def _is_budgeted_incumbent(self, active):
         """A budgeted incumbent declared a footprint and shares spare VRAM; an
@@ -542,7 +710,7 @@ class ModelManager:
                 if registry.is_fixed(name):
                     raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {pinned_gpu}")
                 evict.append((name, active))
-            return pinned_gpu, evict
+            return GpuPlacement((pinned_gpu,)), evict
 
         # Unpinned tiering, safest-for-an-undeclared-footprint first:
         #   1. a truly-empty GPU;
@@ -561,21 +729,25 @@ class ModelManager:
             elif all(self._is_budgeted_incumbent(a) for _, a in incumbents):
                 budgeted_only.append(gpu)
         if empty:
-            return empty[0], []
+            return GpuPlacement((empty[0],)), []
 
         victim = None
         for name, active in self.active.items():
-            if not self._is_gpu_allowed(active.gpu):
+            allowed_members = [
+                gpu for gpu in getattr(active, "gpus", [active.gpu])
+                if self._is_gpu_allowed(gpu)
+            ]
+            if not allowed_members:
                 continue
             if self._is_budgeted_incumbent(active) or registry.is_fixed(name):
                 continue
             if victim is None or active.started < victim[1].started:
-                victim = (name, active)
+                victim = (name, active, allowed_members[0])
         if victim is not None:
-            return victim[1].gpu, [victim]
+            return GpuPlacement((victim[2],)), [(victim[0], victim[1])]
 
         if budgeted_only:
-            return budgeted_only[0], []
+            return GpuPlacement((budgeted_only[0],)), []
         raise RuntimeError("All GPUs occupied by pinned or budgeted models")
 
     async def _allocate_budgeted(self, pinned_gpu, budget):
@@ -593,12 +765,20 @@ class ModelManager:
         last_error = None
         # Pass 1: co-locate without eviction if free VRAM already covers the budget.
         for gpu in candidates:
+            sharded_incumbents = [
+                name
+                for name, active in self._incumbents_on(gpu)
+                if len(getattr(active, "gpus", [active.gpu])) > 1
+            ]
+            if sharded_incumbents:
+                last_error = f"GPU {gpu} is exclusively occupied by sharded model(s): {', '.join(sharded_incumbents)}"
+                continue
             free = await asyncio.to_thread(self._get_gpu_free_vram_mib, gpu)
             if free is None:
                 last_error = f"nvidia-smi query failed for GPU {gpu}"
                 continue
             if free >= budget:
-                return gpu, []
+                return GpuPlacement((gpu,)), []
             last_error = f"GPU {gpu} free VRAM {free} MiB < budget {budget} MiB"
 
         # Pass 2: make room by evicting non-pinned incumbents (oldest first).
@@ -608,21 +788,24 @@ class ModelManager:
         for gpu in candidates:
             evictable = sorted(
                 ((n, a) for n, a in self.active.items()
-                 if a.gpu == gpu and not registry.is_fixed(n)),
+                 if gpu in getattr(a, "gpus", [a.gpu]) and not registry.is_fixed(n)),
                 key=lambda item: item[1].started,
             )
             if evictable:
-                return gpu, evictable
+                return GpuPlacement((gpu,)), evictable
 
         raise RuntimeError(last_error or "No suitable GPU found")
 
     async def _allocate_gpu(self, model_name, cfg):
-        """Allocate a GPU for a model. Returns (gpu_id, incumbents_to_evict)."""
+        """Allocate an ordered placement and return incumbents to evict."""
         pinned_gpu = registry.get_fixed_gpu(model_name)
         if pinned_gpu is not None and pinned_gpu >= self.gpu_count:
             raise RuntimeError(f"Pinned GPU {pinned_gpu} is outside available range")
         if pinned_gpu is not None and not self._is_gpu_allowed(pinned_gpu):
             raise RuntimeError(f"Pinned GPU {pinned_gpu} is excluded by active GPU mask")
+
+        if cfg.get("gpu-ids") is not None:
+            return self._allocate_explicit(model_name, cfg)
 
         budget = self._model_budget_mib(cfg)
         if budget is None:
@@ -750,16 +933,22 @@ class ModelManager:
                 return active
 
             budget = self._model_budget_mib(cfg)
-            gpu, incumbents = await self._allocate_gpu(model_name, cfg)
+            placement, incumbents = await self._allocate_gpu(model_name, cfg)
+            gpu = placement.primary
 
             ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
             port = self._find_available_port_excluding(gpu, ignored_ports)
-            active = ActiveModel(model_name, cfg, port, gpu)
+            active = ActiveModel(model_name, cfg, port, placement)
 
+            stopped_incumbents = []
             try:
                 for name, incumbent in incumbents:
-                    logger.info(f"Evicting {name} from GPU {gpu} for replacement model {model_name}")
+                    logger.info(
+                        f"Evicting {name} from GPU placement "
+                        f"{getattr(incumbent, 'gpus', [incumbent.gpu])} for replacement model {model_name}"
+                    )
                     await asyncio.to_thread(incumbent.stop)
+                    stopped_incumbents.append((name, incumbent))
                 # Budgeted co-location relies on freed VRAM; after evicting, let the
                 # CUDA contexts tear down, then confirm the budget is actually met
                 # before launching. (No eviction => pass 1 already verified the fit.)
@@ -787,17 +976,17 @@ class ModelManager:
                     await self._stop_active_model(model_name, active)
                 except Exception as stop_error:
                     raise RuntimeError(f"{e}; {stop_error}") from e
-                rollback_errors = await self._restore_incumbents(incumbents)
+                rollback_errors = await self._restore_incumbents(stopped_incumbents)
                 if rollback_errors:
                     raise RuntimeError(
                         f"{e}; rollback failed for evicted incumbents: {'; '.join(rollback_errors)}"
                     ) from e
                 raise
 
-            for name, incumbent in incumbents:
+            for name, incumbent in stopped_incumbents:
                 if self.active.get(name) is incumbent:
                     self.active.pop(name, None)
-            logger.info(f"Started {model_name} on GPU {gpu}, port {port}")
+            logger.info(f"Started {model_name} on GPU placement {active.gpus}, port {port}")
             self._publish_routes()
             return active
 

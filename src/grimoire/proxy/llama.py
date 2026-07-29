@@ -155,6 +155,12 @@ async def _save_kv(sc, slot_url, hash_bytes, store, log):
     return False
 
 
+def _telemetry_gpu_index(active):
+    """Return a physical GPU only when one card owns all reported throughput."""
+    gpus = getattr(active, "gpus", [] if active.gpu is None else [active.gpu])
+    return active.gpu if len(gpus) == 1 else None
+
+
 async def _proxy_chat(requested_model, payload, active, user_hash=None, conversation_id=None):
     """Proxy chat completions while keeping the upstream client open."""
     # Local imports avoid circular dependency with entrypoint.
@@ -382,7 +388,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
                     active.name,
                     model_cfg,
                     payload,
-                    gpu_index=active.gpu,
+                    gpu_index=_telemetry_gpu_index(active),
                     record_history=upstream.status_code < 400,
                 )
             if non_streaming:

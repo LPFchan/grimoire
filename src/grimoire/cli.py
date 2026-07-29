@@ -90,7 +90,7 @@ def cmd_pin(args):
     try:
         registry.pin_gpu(args.model, args.gpu)
         print(f"Pinned {args.model} to GPU {args.gpu}")
-    except KeyError as e:
+    except (KeyError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 

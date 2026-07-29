@@ -71,7 +71,7 @@ class AllocatorTests(unittest.TestCase):
         self.mgr.active = {"a": FakeActive("a", gpu=0, port=8001)}
         with self._patch_registry():
             gpu, evict = run(self.mgr._allocate_gpu("new", {}))
-        self.assertEqual(gpu, 1)
+        self.assertEqual(gpu.primary, 1)
         self.assertEqual(evict, [])
 
     def test_exclusive_pinned_refuses_pinned_exclusive_incumbent(self):
@@ -91,7 +91,7 @@ class AllocatorTests(unittest.TestCase):
         }
         with self._patch_registry(fixed={"emb": 1, "rer": 1, "chat": 1}):
             gpu, evict = run(self.mgr._allocate_gpu("chat", {}))
-        self.assertEqual(gpu, 1)
+        self.assertEqual(gpu.primary, 1)
         self.assertEqual(evict, [])
 
     def test_exclusive_unpinned_prefers_empty_over_budgeted_only(self):
@@ -99,7 +99,7 @@ class AllocatorTests(unittest.TestCase):
         self.mgr.active = {"emb": FakeActive("emb", gpu=1, port=8011, cfg=BUDGETED)}
         with self._patch_registry(fixed={"emb": 1}):
             gpu, evict = run(self.mgr._allocate_gpu("chat", {}))
-        self.assertEqual(gpu, 0)
+        self.assertEqual(gpu.primary, 0)
         self.assertEqual(evict, [])
 
     def test_exclusive_unpinned_swaps_exclusive_rather_than_cramming_budgeted_gpu(self):
@@ -113,7 +113,7 @@ class AllocatorTests(unittest.TestCase):
         }
         with self._patch_registry(fixed={"embA": 1, "embB": 1}):
             gpu, evict = run(self.mgr._allocate_gpu("chatB", {}))
-        self.assertEqual(gpu, 0)
+        self.assertEqual(gpu.primary, 0)
         self.assertEqual([n for n, _ in evict], ["chatA"])
 
     def test_exclusive_unpinned_colocates_on_budgeted_only_as_last_resort(self):
@@ -125,7 +125,7 @@ class AllocatorTests(unittest.TestCase):
         }
         with self._patch_registry(fixed={"embA": 0, "embB": 1}):
             gpu, evict = run(self.mgr._allocate_gpu("chat", {}))
-        self.assertEqual(gpu, 0)
+        self.assertEqual(gpu.primary, 0)
         self.assertEqual(evict, [])
 
     def test_exclusive_unpinned_evicts_oldest_exclusive_when_all_full(self):
@@ -135,7 +135,7 @@ class AllocatorTests(unittest.TestCase):
         self.mgr.active = {"old": old, "new": new}
         with self._patch_registry():
             gpu, evict = run(self.mgr._allocate_gpu("x", {}))
-        self.assertEqual(gpu, 0)
+        self.assertEqual(gpu.primary, 0)
         self.assertEqual([n for n, _ in evict], ["old"])
 
     # ---- budgeted (co-location) ----
@@ -145,7 +145,7 @@ class AllocatorTests(unittest.TestCase):
         cfg = {"vram-budget-mib": 1500}
         with self._patch_registry(fixed={"emb": 1, "rer": 1}), self._patch_vram({1: 22000}):
             gpu, evict = run(self.mgr._allocate_gpu("rer", cfg))
-        self.assertEqual(gpu, 1)
+        self.assertEqual(gpu.primary, 1)
         self.assertEqual(evict, [])
 
     def test_budgeted_pinned_refuses_when_only_pinned_incumbents(self):
@@ -164,7 +164,7 @@ class AllocatorTests(unittest.TestCase):
         cfg = {"vram-budget-mib": 20500}
         with self._patch_registry(fixed={"chat": 1}), self._patch_vram({1: 4000}):
             gpu, evict = run(self.mgr._allocate_gpu("chat", cfg))
-        self.assertEqual(gpu, 1)
+        self.assertEqual(gpu.primary, 1)
         self.assertEqual([n for n, _ in evict], ["junk"])
 
     def test_budgeted_unpinned_prefers_no_eviction_gpu(self):
@@ -173,7 +173,7 @@ class AllocatorTests(unittest.TestCase):
         cfg = {"vram-budget-mib": 20500}
         with self._patch_registry(), self._patch_vram({0: 4000, 1: 22000}):
             gpu, evict = run(self.mgr._allocate_gpu("chat", cfg))
-        self.assertEqual(gpu, 1)
+        self.assertEqual(gpu.primary, 1)
         self.assertEqual(evict, [])
 
     def test_budgeted_nvidia_smi_failure_refuses_gpu(self):
