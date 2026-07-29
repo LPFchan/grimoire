@@ -1,6 +1,7 @@
 """Model backend lifecycle management — ActiveModel and ModelManager."""
 
 import asyncio
+import copy
 import ctypes
 import logging
 import math
@@ -52,6 +53,23 @@ class GpuPlacement:
     @property
     def is_multi(self):
         return len(self.device_ids) > 1
+
+
+_PIN_INHERIT = "inherit"
+_PIN_UNPINNED = "unpinned"
+
+
+@dataclass(frozen=True)
+class RuntimeModelOverride:
+    """Ephemeral placement/protection overlay; never persisted in the registry."""
+
+    gpu_ids: tuple[int, ...] | None = None
+    tensor_split: tuple[float, ...] | None = None
+    pin_state: str | int = _PIN_INHERIT
+
+    @property
+    def empty(self):
+        return self.gpu_ids is None and self.pin_state == _PIN_INHERIT
 
 
 _SELECTOR_FLAGS = {
@@ -590,6 +608,91 @@ class ModelManager:
         self.preset_lock = None
         self.preset_allows_manual_control = False
         self.gpu_mask = None  # set[int] or None (None = all GPUs available)
+        self._runtime_overrides: dict[str, RuntimeModelOverride] = {}
+        self._pending_overrides: dict[str, RuntimeModelOverride] = {}
+
+    def _override(self, model_name, *, include_pending=True):
+        if include_pending and model_name in self._pending_overrides:
+            return self._pending_overrides[model_name]
+        return self._runtime_overrides.get(model_name, RuntimeModelOverride())
+
+    def runtime_override_names(self):
+        return sorted(self._runtime_overrides)
+
+    def effective_config(self, model_name, *, include_pending=True):
+        cfg = copy.deepcopy(registry.get(model_name) or {})
+        override = self._override(model_name, include_pending=include_pending)
+        if override.gpu_ids is not None:
+            cfg["gpu-ids"] = list(override.gpu_ids)
+            if override.tensor_split is not None:
+                cfg["extra-args"] = list(cfg.get("extra-args", []) or []) + [
+                    "--tensor-split", ",".join(str(value) for value in override.tensor_split)
+                ]
+        return cfg
+
+    def effective_fixed_gpu(self, model_name, *, include_pending=True):
+        state = self._override(model_name, include_pending=include_pending).pin_state
+        if isinstance(state, int):
+            return state
+        if state == _PIN_UNPINNED:
+            return None
+        return registry.get_fixed_gpu(model_name)
+
+    def is_effectively_fixed(self, model_name):
+        state = self._override(model_name).pin_state
+        if isinstance(state, int):
+            return True
+        if state == _PIN_UNPINNED:
+            return False
+        return registry.is_fixed(model_name)
+
+    def override_metadata(self, model_name):
+        override = self._override(model_name, include_pending=False)
+        cfg = self.effective_config(model_name, include_pending=False)
+        active = self.get_active(model_name)
+        requested = cfg.get("gpu-ids")
+        pin = self.effective_fixed_gpu(model_name, include_pending=False)
+        if requested is None and pin is not None:
+            requested = [pin]
+        if override.gpu_ids is not None:
+            placement_source = "runtime"
+        elif cfg.get("gpu-ids") is not None:
+            placement_source = "registry"
+        elif isinstance(override.pin_state, int):
+            placement_source = "runtime"
+        elif override.pin_state == _PIN_UNPINNED:
+            placement_source = "dynamic"
+        elif registry.get_fixed_gpu(model_name) is not None:
+            placement_source = "registry"
+        else:
+            placement_source = "dynamic"
+        return {
+            "gpu": active.gpu if active else None,
+            "gpus": list(active.gpus) if active else [],
+            "requested_gpu": requested[0] if requested else None,
+            "requested_gpus": list(requested or []),
+            "placement_source": placement_source,
+            "pinned": pin is not None,
+            "pinned_gpu": pin,
+            "pin_source": ("runtime" if override.pin_state != _PIN_INHERIT else ("registry" if registry.get_fixed_gpu(model_name) is not None else None)),
+            "runtime_override": {
+                "gpu_ids": list(override.gpu_ids) if override.gpu_ids is not None else None,
+                "tensor_split": list(override.tensor_split) if override.tensor_split is not None else None,
+                "pin": override.pin_state,
+            } if not override.empty else None,
+        }
+
+    async def prepare_preset_activation(self, name, *, manual_control, gpu_mask):
+        async with self._lock:
+            cleared = []
+            if not manual_control:
+                cleared = sorted(self._runtime_overrides)
+                self._runtime_overrides.clear()
+            self.preset_lock = name
+            self.preset_allows_manual_control = manual_control
+            self.gpu_mask = set(gpu_mask) if gpu_mask is not None else None
+            active = self.list_active()
+        return active, cleared
 
     def _is_gpu_allowed(self, gpu_id):
         return self.gpu_mask is None or gpu_id in self.gpu_mask
@@ -653,7 +756,7 @@ class ModelManager:
                 if identity in seen:
                     continue
                 seen.add(identity)
-                if registry.is_fixed(name):
+                if self.is_effectively_fixed(name):
                     raise RuntimeError(
                         f"Cannot evict pinned model '{name}' from GPU placement {list(placement.device_ids)}"
                     )
@@ -707,7 +810,7 @@ class ModelManager:
             for name, active in self._incumbents_on(pinned_gpu):
                 if self._is_budgeted_incumbent(active):
                     continue  # budgeted co-tenant shares the GPU; never evicted here
-                if registry.is_fixed(name):
+                if self.is_effectively_fixed(name):
                     raise RuntimeError(f"Cannot evict pinned model '{name}' from GPU {pinned_gpu}")
                 evict.append((name, active))
             return GpuPlacement((pinned_gpu,)), evict
@@ -739,7 +842,7 @@ class ModelManager:
             ]
             if not allowed_members:
                 continue
-            if self._is_budgeted_incumbent(active) or registry.is_fixed(name):
+            if self._is_budgeted_incumbent(active) or self.is_effectively_fixed(name):
                 continue
             if victim is None or active.started < victim[1].started:
                 victim = (name, active, allowed_members[0])
@@ -788,7 +891,7 @@ class ModelManager:
         for gpu in candidates:
             evictable = sorted(
                 ((n, a) for n, a in self.active.items()
-                 if gpu in getattr(a, "gpus", [a.gpu]) and not registry.is_fixed(n)),
+                 if gpu in getattr(a, "gpus", [a.gpu]) and not self.is_effectively_fixed(n)),
                 key=lambda item: item[1].started,
             )
             if evictable:
@@ -798,7 +901,7 @@ class ModelManager:
 
     async def _allocate_gpu(self, model_name, cfg):
         """Allocate an ordered placement and return incumbents to evict."""
-        pinned_gpu = registry.get_fixed_gpu(model_name)
+        pinned_gpu = self.effective_fixed_gpu(model_name)
         if pinned_gpu is not None and pinned_gpu >= self.gpu_count:
             raise RuntimeError(f"Pinned GPU {pinned_gpu} is outside available range")
         if pinned_gpu is not None and not self._is_gpu_allowed(pinned_gpu):
@@ -883,6 +986,92 @@ class ModelManager:
                     errors.append(f"{name}: {e}; {stop_error}")
         return errors
 
+    def _validate_effective_config(self, model_name, cfg):
+        gpu_ids = cfg.get("gpu-ids")
+        if gpu_ids is None:
+            return
+        placement = GpuPlacement(tuple(gpu_ids))
+        if len(gpu_ids) < 2:
+            raise ValueError("gpu_ids must contain at least two GPU IDs")
+        if any(gpu >= self.gpu_count for gpu in gpu_ids):
+            raise ValueError(f"gpu_ids contains a GPU outside range 0-{self.gpu_count - 1}")
+        incompatible = []
+        for field in ("cpu-only", "vram-budget-mib", "pflash", "park-unpark"):
+            if cfg.get(field):
+                incompatible.append(field)
+        if cfg.get("speculative-type") == "dflash":
+            incompatible.append("speculative-type=dflash")
+        if incompatible:
+            raise ValueError(f"gpu_ids is incompatible with {', '.join(incompatible)}")
+        pin = self.effective_fixed_gpu(model_name)
+        if pin is not None and pin != placement.primary:
+            raise ValueError(f"Pinned GPU {pin} must equal primary gpu_ids[0] ({placement.primary})")
+        validate_multi_gpu_selectors(cfg, placement)
+
+    async def _start_model_locked(self, model_name):
+        """Locked lifecycle body shared by ordinary starts and runtime reconfiguration."""
+        if model_name in self.active and self.active[model_name].is_running():
+            return self.active[model_name]
+        if model_name in self.active:
+            del self.active[model_name]
+
+        cfg = self.effective_config(model_name)
+        if not cfg:
+            raise KeyError(f"Model '{model_name}' not found in registry")
+        valid, reason = registry.validate(model_name, gpu_count=self.gpu_count)
+        if not valid:
+            raise RuntimeError(reason)
+        self._validate_effective_config(model_name, cfg)
+
+        if cfg.get("cpu-only"):
+            port = self._find_cpu_port()
+            active = ActiveModel(model_name, cfg, port, gpu=None)
+            self.active[model_name] = active
+            await self._start_active_model(active)
+            self._publish_routes()
+            return active
+
+        budget = self._model_budget_mib(cfg)
+        placement, incumbents = await self._allocate_gpu(model_name, cfg)
+        gpu = placement.primary
+        ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
+        port = self._find_available_port_excluding(gpu, ignored_ports)
+        active = ActiveModel(model_name, cfg, port, placement)
+        stopped_incumbents = []
+        try:
+            for name, incumbent in incumbents:
+                logger.info("Evicting %s from GPU placement %s for replacement model %s",
+                            name, getattr(incumbent, "gpus", [incumbent.gpu]), model_name)
+                await asyncio.to_thread(incumbent.stop)
+                stopped_incumbents.append((name, incumbent))
+            if budget is not None and incumbents:
+                await asyncio.sleep(0.5)
+                free = await asyncio.to_thread(self._get_gpu_free_vram_mib, gpu)
+                if free is None:
+                    logger.warning("Post-eviction VRAM query failed on GPU %s; proceeding optimistically for %s", gpu, model_name)
+                elif free < budget:
+                    raise RuntimeError(
+                        f"Post-eviction VRAM check failed on GPU {gpu}: free={free} MiB, budget={budget} MiB"
+                    )
+            self.active[model_name] = active
+            await self._start_active_model(active)
+        except Exception as exc:
+            active.status = config.MODEL_STATUS_FAILED
+            try:
+                await self._stop_active_model(model_name, active)
+            except Exception as stop_error:
+                raise RuntimeError(f"{exc}; {stop_error}") from exc
+            rollback_errors = await self._restore_incumbents(stopped_incumbents)
+            if rollback_errors:
+                raise RuntimeError(f"{exc}; rollback failed for evicted incumbents: {'; '.join(rollback_errors)}") from exc
+            raise
+        for name, incumbent in stopped_incumbents:
+            if self.active.get(name) is incumbent:
+                self.active.pop(name, None)
+        logger.info("Started %s on GPU placement %s, port %s", model_name, active.gpus, port)
+        self._publish_routes()
+        return active
+
     async def start_model(self, model_name, _preset_bypass=False):
         """Start a model with GPU allocation priority: pinned, free, oldest eviction."""
         resolved_name = registry.resolve(model_name)
@@ -905,90 +1094,146 @@ class ModelManager:
                     f"Preset '{self.preset_lock}' is active. "
                     f"Deactivate the preset before manually starting models."
                 )
-            if model_name in self.active and self.active[model_name].is_running():
-                return self.active[model_name]
-            if model_name in self.active:
-                del self.active[model_name]
+            return await self._start_model_locked(model_name)
 
-            cfg = registry.get(model_name)
-            if not cfg:
-                raise KeyError(f"Model '{model_name}' not found in registry")
+    def _require_manual_control(self):
+        if self.preset_lock is not None and not self.preset_allows_manual_control:
+            raise RuntimeError(f"Preset '{self.preset_lock}' is active. Deactivate the preset before changing runtime controls.")
 
-            valid, reason = registry.validate(model_name, gpu_count=self.gpu_count)
-            if not valid:
-                raise RuntimeError(reason)
+    @staticmethod
+    def _has_tensor_split_selector(cfg):
+        args = effective_extra_args(cfg)
+        for token in args:
+            if token.partition("=")[0] in {"--tensor-split", "-ts"}:
+                return True
+        return False
 
-            if cfg.get("cpu-only"):
-                if model_name in self.active:
-                    if self.active[model_name].is_running():
-                        return self.active[model_name]
-                    await asyncio.to_thread(self.active[model_name].stop)
-                    del self.active[model_name]
+    async def _replace_override_locked(self, model_name, override, *, reload_active, load_unloaded):
+        previous = self._runtime_overrides.get(model_name)
+        active = self.get_active(model_name)
+        self._pending_overrides[model_name] = override
 
-                port = self._find_cpu_port()
-                active = ActiveModel(model_name, cfg, port, gpu=None)
-                self.active[model_name] = active
-                await self._start_active_model(active)
-                self._publish_routes()
+        def commit_override():
+            self._pending_overrides.pop(model_name, None)
+            if override.empty:
+                self._runtime_overrides.pop(model_name, None)
+            else:
+                self._runtime_overrides[model_name] = override
+
+        try:
+            cfg = self.effective_config(model_name)
+            self._validate_effective_config(model_name, cfg)
+            if active is None:
+                result = await self._start_model_locked(model_name) if load_unloaded else None
+                commit_override()
+                return result
+            if not reload_active:
+                commit_override()
                 return active
-
-            budget = self._model_budget_mib(cfg)
-            placement, incumbents = await self._allocate_gpu(model_name, cfg)
-            gpu = placement.primary
-
-            ignored_ports = {incumbent.port for _, incumbent in incumbents if incumbent.port is not None}
-            port = self._find_available_port_excluding(gpu, ignored_ports)
-            active = ActiveModel(model_name, cfg, port, placement)
-
-            stopped_incumbents = []
+            self.active.pop(model_name, None)
+            await asyncio.to_thread(active.stop)
             try:
-                for name, incumbent in incumbents:
-                    logger.info(
-                        f"Evicting {name} from GPU placement "
-                        f"{getattr(incumbent, 'gpus', [incumbent.gpu])} for replacement model {model_name}"
-                    )
-                    await asyncio.to_thread(incumbent.stop)
-                    stopped_incumbents.append((name, incumbent))
-                # Budgeted co-location relies on freed VRAM; after evicting, let the
-                # CUDA contexts tear down, then confirm the budget is actually met
-                # before launching. (No eviction => pass 1 already verified the fit.)
-                if budget is not None and incumbents:
-                    await asyncio.sleep(0.5)
-                    free = await asyncio.to_thread(self._get_gpu_free_vram_mib, gpu)
-                    if free is None:
-                        # Eviction already happened; a transient nvidia-smi failure
-                        # shouldn't abort + roll back. Proceed and let the backend
-                        # surface an OOM if the budget genuinely wasn't freed.
-                        logger.warning(
-                            f"Post-eviction VRAM query failed on GPU {gpu}; "
-                            f"proceeding optimistically for {model_name}"
-                        )
-                    elif free < budget:
-                        raise RuntimeError(
-                            f"Post-eviction VRAM check failed on GPU {gpu}: "
-                            f"free={free} MiB, budget={budget} MiB"
-                        )
+                result = await self._start_model_locked(model_name)
+                commit_override()
+                return result
+            except Exception as replacement_error:
+                self._pending_overrides.pop(model_name, None)
                 self.active[model_name] = active
-                await self._start_active_model(active)
-            except Exception as e:
-                active.status = config.MODEL_STATUS_FAILED
                 try:
-                    await self._stop_active_model(model_name, active)
-                except Exception as stop_error:
-                    raise RuntimeError(f"{e}; {stop_error}") from e
-                rollback_errors = await self._restore_incumbents(stopped_incumbents)
-                if rollback_errors:
+                    await self._start_active_model(active)
+                except Exception as rollback_error:
                     raise RuntimeError(
-                        f"{e}; rollback failed for evicted incumbents: {'; '.join(rollback_errors)}"
-                    ) from e
+                        f"{replacement_error}; rollback failed for {model_name}: {rollback_error}"
+                    ) from replacement_error
+                self._publish_routes()
                 raise
+        except Exception:
+            self._pending_overrides.pop(model_name, None)
+            if previous is None:
+                self._runtime_overrides.pop(model_name, None)
+            else:
+                self._runtime_overrides[model_name] = previous
+            if active is not None and self.active.get(model_name) is None:
+                self.active[model_name] = active
+            raise
 
-            for name, incumbent in stopped_incumbents:
-                if self.active.get(name) is incumbent:
-                    self.active.pop(name, None)
-            logger.info(f"Started {model_name} on GPU placement {active.gpus}, port {port}")
-            self._publish_routes()
-            return active
+    async def clone_model(self, model_name, gpu_ids, tensor_split=None):
+        model_name = registry.resolve(model_name) or model_name
+        if not registry.get(model_name):
+            raise KeyError(f"Model '{model_name}' not found in registry")
+        placement = GpuPlacement(tuple(gpu_ids))
+        if not placement.is_multi:
+            raise ValueError("gpu_ids must contain at least two GPU IDs")
+        if tensor_split is not None:
+            if not isinstance(tensor_split, (list, tuple)) or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in tensor_split
+            ):
+                raise ValueError("tensor_split must contain only numeric values")
+            split = tuple(float(value) for value in tensor_split)
+        else:
+            split = None
+        if split is not None:
+            if len(split) != len(placement.device_ids):
+                raise ValueError("tensor_split must have one value per gpu_ids member")
+            if any(not math.isfinite(value) or value < 0 for value in split) or not any(split):
+                raise ValueError("tensor_split values must be finite non-negative numbers with a positive total")
+            if self._has_tensor_split_selector(registry.get(model_name) or {}):
+                raise ValueError("tensor_split conflicts with an existing model or family tensor-split selector")
+        async with self._lock:
+            self._require_manual_control()
+            if any(not self._is_gpu_allowed(gpu) for gpu in placement.device_ids):
+                raise RuntimeError("gpu_ids contains a GPU excluded by active GPU mask")
+            old = self._override(model_name)
+            override = RuntimeModelOverride(placement.device_ids, split, old.pin_state)
+            same = override == old
+            active = await self._replace_override_locked(
+                model_name, override, reload_active=not same, load_unloaded=True,
+            )
+        return active, self.override_metadata(model_name)
+
+    async def declone_model(self, model_name):
+        model_name = registry.resolve(model_name) or model_name
+        if not registry.get(model_name):
+            raise KeyError(f"Model '{model_name}' not found in registry")
+        async with self._lock:
+            self._require_manual_control()
+            old = self._override(model_name)
+            if old.gpu_ids is None:
+                return self.get_active(model_name), self.override_metadata(model_name)
+            override = RuntimeModelOverride(pin_state=old.pin_state)
+            active = await self._replace_override_locked(model_name, override, reload_active=True, load_unloaded=False)
+        return active, self.override_metadata(model_name)
+
+    async def pin_model(self, model_name, gpu):
+        model_name = registry.resolve(model_name) or model_name
+        if not registry.get(model_name):
+            raise KeyError(f"Model '{model_name}' not found in registry")
+        if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 or gpu >= self.gpu_count:
+            raise ValueError(f"gpu must be an integer in range 0-{self.gpu_count - 1}")
+        async with self._lock:
+            self._require_manual_control()
+            if not self._is_gpu_allowed(gpu):
+                raise RuntimeError(f"GPU {gpu} is excluded by active GPU mask")
+            old = self._override(model_name)
+            if old.gpu_ids is not None and gpu != old.gpu_ids[0]:
+                raise ValueError(f"gpu must equal the sharded placement primary GPU {old.gpu_ids[0]}")
+            override = RuntimeModelOverride(old.gpu_ids, old.tensor_split, gpu)
+            active = self.get_active(model_name)
+            reload_active = active is not None and (active.gpu != gpu)
+            active = await self._replace_override_locked(model_name, override, reload_active=reload_active, load_unloaded=False)
+        return active, self.override_metadata(model_name)
+
+    async def unpin_model(self, model_name):
+        model_name = registry.resolve(model_name) or model_name
+        if not registry.get(model_name):
+            raise KeyError(f"Model '{model_name}' not found in registry")
+        async with self._lock:
+            self._require_manual_control()
+            old = self._override(model_name)
+            override = RuntimeModelOverride(old.gpu_ids, old.tensor_split, _PIN_UNPINNED)
+            active = await self._replace_override_locked(model_name, override, reload_active=False, load_unloaded=False)
+        return active, self.override_metadata(model_name)
 
     def get_status(self, model_name):
         """Return router-mode status for a registry entry."""
@@ -1033,6 +1278,8 @@ class ModelManager:
                 logger.info(f"Shutting down {name}")
                 await asyncio.to_thread(active.stop)
             self.active.clear()
+            self._runtime_overrides.clear()
+            self._pending_overrides.clear()
             self._publish_routes()
 
 

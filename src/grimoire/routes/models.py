@@ -307,19 +307,101 @@ async def status(request: Request):
         if not active:
             continue
         active_info[name] = {
-            "gpu": active.gpu,
-            "gpus": getattr(active, "gpus", [] if active.gpu is None else [active.gpu]),
             "port": active.port,
             "started": active.started.isoformat(),
-            "pinned": registry.is_fixed(name),
             "running": active.is_running(),
+            **manager.override_metadata(name),
         }
     return {
         "models": registry.list_all(),
         "fixed": registry.list_fixed(),
         "active": active_info,
-        "gpu_count": manager.gpu_count
+        "gpu_count": manager.gpu_count,
+        "runtime_overrides": {
+            name: manager.override_metadata(name)
+            for name in manager.runtime_override_names()
+        },
     }
+
+
+def _runtime_control_response(model_name, operation, manager):
+    metadata = manager.override_metadata(model_name)
+    return {
+        "status": operation,
+        "operation": operation,
+        "model": model_name,
+        "active": manager.get_active(model_name) is not None,
+        **metadata,
+    }
+
+
+async def _runtime_control_call(model_name, operation, call):
+    manager = _get_manager()
+    try:
+        await call(manager)
+        resolved = registry.resolve(model_name) or model_name
+        return _runtime_control_response(resolved, operation, manager)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/models/{model_name}/clone")
+async def clone_model_endpoint(model_name: str, request: Request):
+    require_admin(request)
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+    gpu_ids = data.get("gpu_ids")
+    if (not isinstance(gpu_ids, list) or len(gpu_ids) < 2
+            or any(isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0 for gpu in gpu_ids)
+            or len(set(gpu_ids)) != len(gpu_ids)):
+        raise HTTPException(status_code=400, detail="gpu_ids must contain at least two unique non-negative integers")
+    tensor_split = data.get("tensor_split")
+    if tensor_split is not None:
+        if (not isinstance(tensor_split, list)
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in tensor_split)):
+            raise HTTPException(status_code=400, detail="tensor_split must be an array of numbers")
+    return await _runtime_control_call(
+        model_name, "cloned",
+        lambda manager: manager.clone_model(model_name, gpu_ids, tensor_split),
+    )
+
+
+@router.post("/models/{model_name}/declone")
+async def declone_model_endpoint(model_name: str, request: Request):
+    require_admin(request)
+    return await _runtime_control_call(
+        model_name, "decloned", lambda manager: manager.declone_model(model_name),
+    )
+
+
+@router.post("/models/{model_name}/pin")
+async def pin_model_endpoint(model_name: str, request: Request):
+    require_admin(request)
+    try:
+        data = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from exc
+    if not isinstance(data, dict) or "gpu" not in data:
+        raise HTTPException(status_code=400, detail="Body must contain gpu")
+    return await _runtime_control_call(
+        model_name, "pinned", lambda manager: manager.pin_model(model_name, data["gpu"]),
+    )
+
+
+@router.post("/models/{model_name}/unpin")
+async def unpin_model_endpoint(model_name: str, request: Request):
+    require_admin(request)
+    return await _runtime_control_call(
+        model_name, "unpinned", lambda manager: manager.unpin_model(model_name),
+    )
 
 
 @router.post("/switch/{model_name}")

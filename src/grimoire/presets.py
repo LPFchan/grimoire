@@ -126,29 +126,33 @@ class PresetManager:
 
             target = set(preset.get("models", []))
             manual_control = not target and not preset.get("fixed")
-            current = set(manager.list_active())
 
             missing = [m for m in target if not registry.get(m)]
             if missing:
                 raise ValueError(f"Unknown models in preset: {missing}")
 
-            if manager.preset_lock == name:
+            gpu_list = preset.get("gpus")
+            intended_mask = set(gpu_list) if gpu_list is not None else None
+            same_preset = manager.preset_lock == name
+            current, cleared_runtime_overrides = await manager.prepare_preset_activation(
+                name,
+                manual_control=manual_control,
+                gpu_mask=intended_mask,
+            )
+            current = set(current)
+            runtime_moved = current & target & set(cleared_runtime_overrides)
+
+            if same_preset:
                 missing_models = target - current
                 preset_fixed = preset.get("fixed", {})
                 current_fixed = dict(registry.list_fixed())
                 current_subset = {k: current_fixed.get(k) for k in preset_fixed}
                 fixed_drifted = current_subset != preset_fixed
-                intended_mask = set(preset.get("gpus")) if preset.get("gpus") is not None else None
                 mask_changed = manager.gpu_mask != intended_mask
                 manual_control_changed = getattr(manager, "preset_allows_manual_control", False) != manual_control
-                if not missing_models and not fixed_drifted and not mask_changed and not manual_control_changed:
+                if (not missing_models and not fixed_drifted and not mask_changed
+                        and not manual_control_changed and not cleared_runtime_overrides):
                     return {"active": name, "unchanged": True}
-
-            manager.preset_lock = name
-            manager.preset_allows_manual_control = manual_control
-
-            gpu_list = preset.get("gpus")
-            manager.gpu_mask = set(gpu_list) if gpu_list is not None else None
 
             old_fixed = registry.swap_fixed(preset.get("fixed", {}))
 
@@ -163,6 +167,7 @@ class PresetManager:
                 if (old_fixed.get(m) != new_fixed.get(m))
                 or (m in old_fixed) != (m in new_fixed)
             }
+            moved |= runtime_moved
 
             to_stop = (current - target) | moved
             to_start = target - (current - to_stop)
@@ -213,6 +218,7 @@ class PresetManager:
                 "failed": failed,
                 "warnings": warnings,
                 "active": active_name,
+                "cleared_runtime_overrides": cleared_runtime_overrides,
                 "fixed": restored_fixed if restored_fixed is not None else new_fixed,
                 "old_fixed": old_fixed,
             }

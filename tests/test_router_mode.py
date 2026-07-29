@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -180,6 +180,28 @@ class RouterModeContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(called["name"], "gemma-4-31B")
 
+    def test_runtime_clone_route_validates_and_returns_normalized_state(self):
+        name = "runtime-test-model"
+        metadata = {
+            "gpu": None, "gpus": [], "requested_gpu": 0, "requested_gpus": [0, 1],
+            "placement_source": "runtime", "pinned": False, "pinned_gpu": None,
+            "pin_source": None, "runtime_override": {"gpu_ids": [0, 1]},
+        }
+        with patch.object(entrypoint.manager, "clone_model", new=AsyncMock()) as clone, \
+                patch.object(entrypoint.manager, "override_metadata", return_value=metadata), \
+                patch.object(entrypoint.registry, "resolve", return_value=name):
+            response = self.client.post(
+                f"/models/{name}/clone", json={"gpu_ids": [0, 1], "tensor_split": [1, 1]}, headers=self.auth,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["requested_gpus"], [0, 1])
+        clone.assert_awaited_once_with(name, [0, 1], [1, 1])
+
+        for payload in ({}, {"gpu_ids": [0]}, {"gpu_ids": [0, 0]},
+                        {"gpu_ids": [0, 1], "tensor_split": [True, 1]}):
+            response = self.client.post(f"/models/{name}/clone", json=payload, headers=self.auth)
+            self.assertEqual(response.status_code, 400, payload)
+
     def test_alpha_get_returns_active_adapter_scales(self):
         registry_aliases = entrypoint.registry.list_all()
         if not registry_aliases:
@@ -225,6 +247,10 @@ class RouterModeContractTests(unittest.TestCase):
             ("/v1/models", "get", None),
             ("/models/load", "post", {"model": "x"}),
             ("/models/unload", "post", {"model": "x"}),
+            ("/models/x/clone", "post", {"gpu_ids": [0, 1]}),
+            ("/models/x/declone", "post", None),
+            ("/models/x/pin", "post", {"gpu": 0}),
+            ("/models/x/unpin", "post", None),
             ("/alpha", "get", None),
             ("/alpha", "post", 0.6),
         ]:

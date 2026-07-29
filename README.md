@@ -77,6 +77,20 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 - The first `gpu-ids` member is the primary physical GPU reported by the backward-compatible `gpu` field. llama.cpp defaults to layer splitting; `extra-args` may set `--tensor-split` proportions in the same visible-device order.
 - `gpu-ids` is initially incompatible with `cpu-only`, `vram-budget-mib`, PFlash, park/unpark, and native DFlash models
 - `fixed` — alias → GPU ID (pinned, never evicted); for a model with `gpu-ids`, the fixed ID must equal the first member
+
+Temporary runtime controls are available through admin-authenticated POST requests. They live only in manager memory, never change the registry or preset state, and clear on restart:
+
+```bash
+curl -X POST "$GRIMOIRE_ORIGIN/models/qwen/clone" \
+  -H "Authorization: Bearer $GRIMOIRE_API_KEY" -H "Content-Type: application/json" \
+  -d '{"gpu_ids":[0,1],"tensor_split":[1,1]}'
+curl -X POST "$GRIMOIRE_ORIGIN/models/qwen/declone" -H "Authorization: Bearer $GRIMOIRE_API_KEY"
+curl -X POST "$GRIMOIRE_ORIGIN/models/qwen/pin" \
+  -H "Authorization: Bearer $GRIMOIRE_API_KEY" -H "Content-Type: application/json" -d '{"gpu":0}'
+curl -X POST "$GRIMOIRE_ORIGIN/models/qwen/unpin" -H "Authorization: Bearer $GRIMOIRE_API_KEY"
+```
+
+`clone` runs one llama-server process sharded across the ordered GPUs; it does not create a replica. Clone/declone reload active models with rollback on failure. Pin reloads only when residency must move; unpin changes eviction protection without moving a running model. `/status` keeps `gpu`/`gpus` for actual residency and reports requested placement, placement/pin sources, and runtime overrides separately. Locked presets clear runtime overrides and reconcile target models; manual-control presets retain them but enforce their GPU mask.
 - Dynamic allocation: free GPU preferred, oldest non-pinned evicted when all busy
 - All models use `backend: "llama"` (Bee `llama-server` HTTP) — the legacy `backend: "dflash"` daemon path is retired
 
