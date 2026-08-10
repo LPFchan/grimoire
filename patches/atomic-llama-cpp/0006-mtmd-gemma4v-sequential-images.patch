@@ -1,16 +1,8 @@
 diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
-index 8e839ef8f..6886fc4d5 100644
+index d3899f5..39a4f99 100644
 --- a/tools/mtmd/mtmd.cpp
 +++ b/tools/mtmd/mtmd.cpp
-@@ -1418,6 +1418,7 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
-         || proj_type == PROJECTOR_TYPE_MINICPMV
-         || proj_type == PROJECTOR_TYPE_GLM_EDGE
-         || proj_type == PROJECTOR_TYPE_INTERNVL
-+        || proj_type == PROJECTOR_TYPE_GEMMA4V
-         || proj_type == PROJECTOR_TYPE_DEEPSEEKOCR2
-         || proj_type == PROJECTOR_TYPE_GRANITE4_VISION) {
-         // TODO @ngxson : llava does not support batched encoding ; this should be fixed inside clip_image_batch_encode()
-@@ -1556,6 +1557,14 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
+@@ -1581,6 +1581,14 @@ int32_t mtmd_batch_add_chunk(mtmd_batch * batch, const mtmd_input_chunk * chunk)
          return 0;
      }
  

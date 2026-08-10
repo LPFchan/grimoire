@@ -1,8 +1,8 @@
 diff --git a/convert_lora_to_gguf.py b/convert_lora_to_gguf.py
-index d583342..5dd5031 100755
+index 47c09af..4395111 100755
 --- a/convert_lora_to_gguf.py
 +++ b/convert_lora_to_gguf.py
-@@ -418,8 +418,12 @@ if __name__ == '__main__':
+@@ -456,8 +456,12 @@ if __name__ == '__main__':
  
              def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
                  tensor_map: dict[str, PartialLoraTensor] = {}
@@ -15,7 +15,7 @@ index d583342..5dd5031 100755
                      if self.lazy:
                          tensor = LazyTorchTensor.from_eager(tensor)
                      base_name = get_base_tensor_name(name)
-@@ -455,7 +459,49 @@ if __name__ == '__main__':
+@@ -498,7 +502,49 @@ if __name__ == '__main__':
                      assert tensor.B is not None
                      yield (name, cast(torch.Tensor, LoraTorchTensor(tensor.A, tensor.B)))
  
@@ -66,7 +66,7 @@ index d583342..5dd5031 100755
                  # some archs may have the same tensor for lm_head and output (tie word embeddings)
                  # in this case, adapters targeting lm_head will fail when using llama-export-lora
 diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
-index 4a1aaa9..bfe2e9f 100644
+index 3e0fe66..ed3b8c4 100644
 --- a/src/llama-adapter.cpp
 +++ b/src/llama-adapter.cpp
 @@ -146,6 +146,17 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
@@ -251,10 +251,10 @@ index f0b1e50..38520b4 100644
  };
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 8e2b6ab..86d99ef 100644
+index dff5ab6..1ac6c8d 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -989,6 +989,38 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+@@ -1500,6 +1500,38 @@ ggml_tensor * llm_graph_context::build_lora_mm(
          res = ggml_add(ctx0, res, ab_cur);
      }
  
@@ -290,10 +290,10 @@ index 8e2b6ab..86d99ef 100644
 +        res = ggml_add(ctx0, res, full_delta);
 +    }
 +
-     if (w_s) {
-         res = ggml_mul(ctx0, res, w_s);
-     }
-@@ -1667,6 +1699,32 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
+     return res;
+ }
+ 
+@@ -2314,6 +2346,32 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
              cur = ggml_add(ctx0, cur, inpL_delta);
          }
  

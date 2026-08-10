@@ -8,12 +8,13 @@ ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04
 ARG CUDA_RUNTIME=nvidia/cuda:12.8.1-runtime-ubuntu22.04
 ARG GRIMOIRE_LLAMA_CPP_REPO_URL=https://github.com/TheTom/llama-cpp-turboquant.git
 ARG GRIMOIRE_LLAMA_CPP_REF=feature/turboquant-kv-cache
-ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=4595fff0bbd15ee01663699b788eea70e7e1cd69
+ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA=2f2f32f5d9517518c9e860f30131acb09840a965
 ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
 ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
 # Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
-# Default ships PEFT token replacements plus the Gemma4V multi-image mtmd fix for the current pinned llama.cpp SHA.
-ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0005-peft-trainable-token-replacements.patch,0006-mtmd-gemma4v-sequential-images.patch
+# Default ships PEFT token replacements, the Gemma4V multi-image mtmd fix, and
+# Muse Glimmer support (llama.cpp PR #26841) for the current pinned llama.cpp SHA.
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0005-peft-trainable-token-replacements.patch,0006-mtmd-gemma4v-sequential-images.patch,0010-muse-glimmer-26841.patch
 # Bump to force rebuild of the build stage (e.g. after upstream force-push)
 ARG CACHE_BUST=11
 
@@ -54,8 +55,9 @@ ARG GRIMOIRE_LLAMA_CPP_PINNED_SHA
 ARG GRIMOIRE_LLAMA_CPP_APPLY_PATCHES=1
 ARG GRIMOIRE_LLAMA_CPP_CUDA_GRAPHS=ON
 # Comma-separated list of patch filenames in patches/atomic-llama-cpp/, applied in order.
-# Default ships PEFT token replacements plus the Gemma4V multi-image mtmd fix for the current pinned llama.cpp SHA.
-ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0005-peft-trainable-token-replacements.patch,0006-mtmd-gemma4v-sequential-images.patch
+# Default ships PEFT token replacements, the Gemma4V multi-image mtmd fix, and
+# Muse Glimmer support (llama.cpp PR #26841) for the current pinned llama.cpp SHA.
+ARG GRIMOIRE_LLAMA_CPP_PATCH_FILE=0005-peft-trainable-token-replacements.patch,0006-mtmd-gemma4v-sequential-images.patch,0010-muse-glimmer-26841.patch
 ARG CACHE_BUST
 ARG GRIMOIRE_CMAKE_CUDA_ARCHITECTURES=86;89
 

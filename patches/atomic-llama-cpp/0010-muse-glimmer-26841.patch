@@ -1,0 +1,1296 @@
+diff --git a/common/chat.cpp b/common/chat.cpp
+index e252bd5..24343dd 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -3071,6 +3071,151 @@ static common_chat_params common_chat_params_init_minicpm5(const common_chat_tem
+     return data;
+ }
+ 
++// An assistant turn is rendered as one or more messages, each
++// "<|start|>assistant to=<recipient><|message|>{content}{END}" where END is
++// <|eom|> (more messages follow) or <|eot|> (end of turn):
++//   - chain-of-thought: to=self, terminated by <|eom|>
++//   - final answer:     to=user, terminated by <|eot|>
++// The generation prompt is just "<|start|>assistant"; the model emits its own
++// " to=...<|message|>".
++static common_chat_params common_chat_params_init_muse_glimmer(const common_chat_template &          tmpl,
++                                                               const autoparser::generation_params & inputs) {
++    common_chat_params data;
++
++    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
++    data.generation_prompt = "<|start|>assistant";
++    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
++    data.supports_thinking = true;
++
++    data.preserved_tokens = {
++        "<|start|>", "<|message|>", "<|eom|>", "<|eot|>",
++        // ATEM tool-call markup emitted on " to=<tool>" turns.
++        "<atem:function_calls>", "<atem:invoke", "<atem:parameter", "</atem:parameter>",
++        "</atem:invoke>", "</atem:function_calls>",
++    };
++
++    data.message_delimiters = {
++        { COMMON_CHAT_ROLE_ASSISTANT, "<|start|>assistant" },
++        { COMMON_CHAT_ROLE_USER,      "<|start|>user"      },
++        { COMMON_CHAT_ROLE_SYSTEM,    "<|start|>system"    },
++        { COMMON_CHAT_ROLE_TOOL,      "<|start|>tool"      },
++    };
++
++    if (inputs.has_continuation()) {
++        const auto & msg = inputs.continue_msg;
++
++        data.generation_prompt = "<|start|>assistant to=self<|message|>" + msg.reasoning_content;
++        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
++            data.generation_prompt += "<|eom|><|start|>assistant to=user<|message|>" + msg.render_content();
++        }
++
++        data.prompt += data.generation_prompt;
++    }
++
++    auto extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
++
++    auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
++    // Constrained grammar whenever tools are offered.
++    auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
++
++    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
++        auto start = p.rule("start", p.literal("<|start|>assistant"));
++
++        if (!extract_reasoning && !include_grammar) {
++            return start + p.content(p.rest());
++        }
++
++        if (extract_reasoning) {
++            p.rule("analysis", p.literal(" to=self<|message|>") + p.reasoning(p.until("<|eom|>")) + p.literal("<|eom|>"));
++        } else {
++            p.rule("analysis", p.literal(" to=self<|message|>") + p.content(p.until("<|eom|>")) + p.literal("<|eom|>"));
++        }
++        auto analysis = p.ref("analysis");
++
++        auto recipient  = p.optional(p.literal(" to=user"));
++        auto final_msg  = p.rule("final", recipient + p.literal("<|message|>") + p.content(p.until("<|eot|>")));
++
++        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
++            auto string_value = p.ac(
++                p.tool_arg_string_value(p.until("</atem:parameter>")) + p.tool_arg_close(p.literal("</atem:parameter>")),
++                "</atem:parameter>");
++
++            auto tool_choice = p.choice();
++            foreach_function(inputs.tools, [&](const json & tool) {
++                const auto &      function = tool.at("function");
++                const std::string name     = function.at("name");
++                auto              params   = function.contains("parameters") ? function.at("parameters") : json::object();
++
++                auto args = p.eps();
++                if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
++                    auto schema_info = common_schema_info();
++                    schema_info.resolve_refs(params);
++
++                    auto arg_choice = p.choice();
++                    for (const auto & [prop_name, prop_schema] : params.at("properties").items()) {
++                        auto value_parser = p.eps();
++                        if (schema_info.resolves_to_string(prop_schema)) {
++                            value_parser = string_value;
++                        } else {
++                            value_parser = p.tool_arg_json_value(
++                                    p.schema(p.json(), "tool-" + name + "-arg-" + prop_name + "-schema", prop_schema, false))
++                                + p.tool_arg_close(p.literal("</atem:parameter>"));
++                        }
++
++                        auto arg_rule = p.tool_arg(
++                            p.tool_arg_open(p.literal("<atem:parameter name=\"") + p.tool_arg_name(p.literal(prop_name)) + p.literal("\">")) +
++                            value_parser);
++
++                        arg_choice |= arg_rule;
++                    }
++                    args = p.zero_or_more(arg_choice + p.space());
++                }
++
++                auto tool_parser = p.tool(
++                    p.tool_open(p.literal(" to=") + p.until("<|message|>") +
++                                p.literal("<|message|><atem:function_calls>") + p.space() +
++                                p.literal("<atem:invoke name=\"") + p.tool_name(p.literal(name)) + p.literal("\">") + p.space())
++                    << p.tool_args(args)
++                    << p.tool_close(p.literal("</atem:invoke>") + p.space() + p.literal("</atem:function_calls>")));
++
++                tool_choice |= p.rule("tool-" + name, tool_parser);
++            });
++
++            auto tool_calls = inputs.parallel_tool_calls
++                ? p.trigger_rule("tool-call", tool_choice + p.zero_or_more(p.literal("<|eom|>") + start + tool_choice))
++                : p.trigger_rule("tool-call", tool_choice);
++
++
++            if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
++                return p.zero_or_more(start + analysis) + start + tool_calls;
++            }
++            return p.zero_or_more(start + analysis) + start + (tool_calls | final_msg);
++        }
++
++        return p.zero_or_more(start + analysis) + start + final_msg;
++    });
++
++    data.parser = parser.save();
++
++    if (include_grammar) {
++        data.grammar_lazy = inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
++        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
++            foreach_function(inputs.tools, [&](const json & tool) {
++                const auto & function = tool.at("function");
++                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
++                builder.resolve_refs(schema);
++            });
++            parser.build_grammar(builder, data.grammar_lazy);
++        });
++        data.grammar_triggers = {
++            { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN,
++              "<\\|start\\|>assistant( to=(?!self<\\|message\\|>)(?!user<\\|message\\|>)[^<]*?<\\|message\\|>)" },
++        };
++    }
++
++    return data;
++}
++
+ static json common_chat_extra_context() {
+     json ctx = json::object();
+     std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+@@ -3099,6 +3244,12 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
+         return common_chat_params_init_gpt_oss(tmpl, params);
+     }
+ 
++    // Muse Glimmer format using " to=<recipient>" recipients and <|eom|>/<|eot|> message terminators.
++    if (src.find("<atem:function_calls>") != std::string::npos && src.find("<|eom|>") != std::string::npos) {
++        LOG_DBG("Using specialized template: Muse Glimmer\n");
++        return common_chat_params_init_muse_glimmer(tmpl, params);
++    }
++
+     // Functionary v3.2 - uses recipient-based format with >>>recipient\n{content}
+     // Detection: template has ">>>all" for content and ">>>" prefix for tool calls
+     if (src.find(">>>all") != std::string::npos && src.find(">>>${recipient}") != std::string::npos) {
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 3e0e9f8..c9fac06 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1051,7 +1051,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+             return true;
+         }
+ 
+-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
++        // Target prefill may contain token IDs or multimodal embeddings. Both
++        // produce the target-layer features used to seed the draft KV cache, so
++        // skipping the embedding batches leaves a hole in the draft's cache and
++        // the next injection fails to initialize.
++        // TODO: revisit after https://github.com/ggml-org/llama.cpp/pull/24669 is merged
++        const bool has_tokens     = batch_in.token != nullptr;
++        const bool has_embeddings = batch_in.embd  != nullptr;
++        if (has_tokens == has_embeddings) {
+             return true;
+         }
+ 
+diff --git a/conversion/__init__.py b/conversion/__init__.py
+index 11121e0..f018a2e 100644
+--- a/conversion/__init__.py
++++ b/conversion/__init__.py
+@@ -184,6 +184,8 @@ TEXT_MODEL_MAP: dict[str, str] = {
+     "Olmo3ForCausalLM": "olmo",
+     "OlmoForCausalLM": "olmo",
+     "OlmoeForCausalLM": "olmo",
++    "MuseGlimmerAssistantModel": "muse_glimmer",
++    "MuseGlimmerForConditionalGeneration": "muse_glimmer",
+     "OpenELMForCausalLM": "openelm",
+     "OrionForCausalLM": "orion",
+     "PLMForCausalLM": "plm",
+@@ -298,6 +300,7 @@ MMPROJ_MODEL_MAP: dict[str, str] = {
+     "MiniCPMV4_6ForConditionalGeneration": "minicpm",
+     "Mistral3ForConditionalGeneration": "llava",
+     "NemotronH_Nano_VL_V2": "nemotron",
++    "MuseGlimmerForConditionalGeneration": "muse_glimmer",
+     "PaddleOCRVisionModel": "ernie",
+     "Phi4ForCausalLMV": "phi",
+     "Qwen2AudioForConditionalGeneration": "ultravox",
+diff --git a/conversion/muse_glimmer.py b/conversion/muse_glimmer.py
+new file mode 100644
+index 0000000..cc588e8
+--- /dev/null
++++ b/conversion/muse_glimmer.py
+@@ -0,0 +1,179 @@
++from __future__ import annotations
++
++import json
++from typing import Any, Iterable, TYPE_CHECKING
++
++import torch
++
++if TYPE_CHECKING:
++    from torch import Tensor
++
++from .base import MmprojModel, ModelBase, TextModel, gguf
++
++
++def _unpermute_for_rope(tensor: "Tensor", n_heads: int) -> "Tensor":
++    """Invert transformers' `_permute_for_rope`: HF stores Q/K in rotate_half layout,
++    llama.cpp consumes the interleaved (NORM) layout."""
++    if tensor.ndim == 2:
++        dim1, dim2 = tensor.shape
++        return tensor.view(n_heads, 2, dim1 // n_heads // 2, dim2).transpose(1, 2).reshape(dim1, dim2)
++    if tensor.ndim == 1:
++        (dim1,) = tensor.shape
++        return tensor.view(n_heads, 2, dim1 // n_heads // 2).transpose(1, 2).reshape(dim1)
++    raise ValueError(f"_unpermute_for_rope: unexpected shape {tuple(tensor.shape)}")
++
++
++@ModelBase.register("MuseGlimmerForConditionalGeneration")
++class MuseGlimmerModel(TextModel):
++    model_arch = gguf.MODEL_ARCH.MUSE_GLIMMER
++
++    def norm_shift(self, name: str) -> float:
++        # All four layer norms use 1, the final norm uses 0.
++        return 1.0 if name.endswith("layernorm.weight") else 0.0
++
++    def set_vocab(self):
++        self._set_vocab_gpt2()
++
++        from transformers import AutoTokenizer
++        tok = AutoTokenizer.from_pretrained(self.dir_model)
++        eot_id = tok.convert_tokens_to_ids("<|eot|>")
++        if isinstance(eot_id, int) and eot_id >= 0:
++            self.gguf_writer.add_eot_token_id(eot_id)
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        hparams = self.hparams
++
++        self.gguf_writer.add_final_logit_softcapping(hparams["final_logit_softcapping"])
++        self.gguf_writer.add_logit_scale(hparams["output_multiplier"])
++        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
++        self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in hparams["layer_types"]])
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        shift = self.norm_shift(name)
++        if shift != 0.0:
++            data_torch = data_torch + shift
++
++        # Invert transformers' `_permute_for_rope` on Q/K, we keep ggml's NORM (interleaved) rope
++        if ".self_attn.q_proj." in name:
++            data_torch = _unpermute_for_rope(data_torch, int(self.hparams["num_attention_heads"]))
++        elif ".self_attn.k_proj." in name:
++            data_torch = _unpermute_for_rope(data_torch, int(self.hparams["num_key_value_heads"]))
++
++        # Synthesize QK-norm weights to absorb qk_scale_factor.
++        # MuseGlimmer implementation: scaleless RMSNorm followed by qk_scale_factor..
++        if bid is not None and name.endswith(f"model.layers.{bid}.self_attn.q_proj.weight"):
++            head_dim = self.hparams["head_dim"]
++            q_scale = float(self.hparams["qk_scale_factor"])
++            yield (
++                self.map_tensor_name(f"model.layers.{bid}.self_attn.q_norm.weight"),
++                torch.full((head_dim,), q_scale, dtype=torch.float32),
++            )
++            yield (
++                self.map_tensor_name(f"model.layers.{bid}.self_attn.k_norm.weight"),
++                torch.ones((head_dim,), dtype=torch.float32),
++            )
++
++        yield from super().modify_tensors(data_torch, name, bid)
++
++
++@ModelBase.register("MuseGlimmerForConditionalGeneration")
++class MuseGlimmerVisionModel(MmprojModel):
++    def get_vision_config(self) -> dict[str, Any] | None:
++        c = self.global_config.get("vision_config")
++        if not c:
++            return None
++        # MuseGlimmer actually uses dynamic size, initialize with nominal size
++        image_size = c["pos_emb_height"] * c["patch_size"] * c["merge_size"]
++        return {**c, "image_size": image_size}
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        assert self.hparams_vision is not None
++        c = self.hparams_vision  # enriched vision_config from get_vision_config()
++
++        self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.MUSE_GLIMMER)
++        self.gguf_writer.add_vision_attention_layernorm_eps(float(c["layer_norm_eps"]))
++        self.gguf_writer.add_vision_spatial_merge_size(int(c["merge_size"]))
++
++    @classmethod
++    def filter_tensors(cls, item):
++        name, gen = item
++        keep = ("model.vision_tower.", "model.vision_adapter.", "model.vision_projection.")
++        if not any(name.startswith(k) for k in keep):
++            return None
++        return super().filter_tensors((name, gen))
++
++    # 3-layer projector MLP
++    _MM_MLP_MAP = {
++        "model.vision_adapter.fc1": (gguf.MODEL_TENSOR.V_MMPROJ, 0),
++        "model.vision_adapter.fc2": (gguf.MODEL_TENSOR.V_MMPROJ, 1),
++        "model.vision_projection":  (gguf.MODEL_TENSOR.V_MMPROJ, 2),
++    }
++
++    def modify_tensors(self, data_torch, name, bid):
++        assert self.hparams_vision is not None
++        if ".attn.q_proj." in name or ".attn.k_proj." in name:
++            n_heads = int(self.hparams_vision["num_attention_heads"])
++            data_torch = _unpermute_for_rope(data_torch, n_heads)
++        # Lay out the pt=2 temporal slabs of the patch embedding as a conv2d for build_inp()
++        if name.endswith("patch_embedder.patch_embedding.weight"):
++            n_embd = data_torch.shape[0]
++            pt = int(self.hparams_vision["patch_temporal"])
++            ps = int(self.hparams_vision["patch_size"])
++            data_torch = data_torch.view(n_embd, pt, 3, ps, ps).sum(dim=1)  # (n_embd, 3, ps, ps)
++        stem, _, suffix = name.rpartition(".")
++        if stem in self._MM_MLP_MAP:
++            tensor_key, idx = self._MM_MLP_MAP[stem]
++            yield (self.format_tensor_name(tensor_key, bid=idx, suffix="." + suffix), data_torch)
++            return
++        yield (self.map_tensor_name(name), data_torch)
++
++
++@ModelBase.register("MuseGlimmerAssistantModel")
++class MuseGlimmerAssistantModel(TextModel):
++    model_arch = gguf.MODEL_ARCH.DFLASH
++
++    def set_vocab(self):
++        if self.target_model_dir is None:
++            raise ValueError(
++                "MuseGlimmerAssistant (DFlash drafter) requires --target-model-dir pointing to the "
++                "target MuseGlimmer HF directory"
++            )
++
++        original_dir = self.dir_model
++        self.dir_model = self.target_model_dir
++
++        from . import get_model_class
++        with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
++            target_arch = json.load(f)["architectures"][0]
++        target_cls = get_model_class(target_arch)
++        if target_cls is not type(self):
++            target_cls.set_vocab(self)  # ty: ignore[unresolved-attribute]
++        else:
++            super().set_vocab()
++
++        self.dir_model = original_dir
++
++        mask_token_id = self.hparams.get("mask_token_id")
++        if mask_token_id is not None:
++            self.gguf_writer.add_mask_token_id(int(mask_token_id))
++
++    def set_gguf_parameters(self):
++        super().set_gguf_parameters()
++        h = self.hparams
++
++        self.gguf_writer.add_block_size(int(h["block_size"]))
++
++        # dflash.target_layers[k] refers to the inputs going into the ith layer, which come from the (i-1)th layer's output.
++        # The transformers configuration refers to the outputs being recorded.
++        self.gguf_writer.add_target_layers([int(x) + 1 for x in h["target_layer_ids"]])
++
++        if h.get("sliding_window") and h.get("layer_types"):
++            self.gguf_writer.add_sliding_window(int(h["sliding_window"]))
++            self.gguf_writer.add_sliding_window_pattern([t == "sliding_attention" for t in h["layer_types"]])
++
++    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
++        # DFlash defaults to NEOX (rotate_half) rope, matching transformers HF layout for Q/K, QK-norms
++        # no permutation needed.
++        yield (self.map_tensor_name(name), data_torch)
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 769de47..26970df 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -489,6 +489,7 @@ class MODEL_ARCH(IntEnum):
+     OLMO             = auto()
+     OLMO2            = auto()
+     OLMOE            = auto()
++    MUSE_GLIMMER     = auto()
+     OPENELM          = auto()
+     ARCTIC           = auto()
+     DEEPSEEK         = auto()
+@@ -1101,6 +1102,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
+     MODEL_ARCH.OLMO:             "olmo",
+     MODEL_ARCH.OLMO2:            "olmo2",
+     MODEL_ARCH.OLMOE:            "olmoe",
++    MODEL_ARCH.MUSE_GLIMMER:     "muse-glimmer",
+     MODEL_ARCH.OPENELM:          "openelm",
+     MODEL_ARCH.ARCTIC:           "arctic",
+     MODEL_ARCH.DEEPSEEK:         "deepseek",
+@@ -1484,8 +1486,8 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
+     MODEL_TENSOR.V_MM_UP:                   "mm.up",
+     MODEL_TENSOR.V_MM_DOWN:                 "mm.down",
+     MODEL_TENSOR.V_MM_GATE:                 "mm.gate",
+-    MODEL_TENSOR.V_MM_MERGER_FC1:            "mm.merger.fc1",
+-    MODEL_TENSOR.V_MM_MERGER_FC2:            "mm.merger.fc2",
++    MODEL_TENSOR.V_MM_MERGER_FC1:           "mm.merger.fc1",
++    MODEL_TENSOR.V_MM_MERGER_FC2:           "mm.merger.fc2",
+     MODEL_TENSOR.V_TOK_BOI:                 "v.boi",
+     MODEL_TENSOR.V_TOK_EOI:                 "v.eoi",
+     MODEL_TENSOR.V_MM_PRE_NORM:             "mm.pre_norm",
+@@ -3133,6 +3135,25 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.FFN_UP_EXP,
+         MODEL_TENSOR.FFN_DOWN_EXP,
+     ],
++    MODEL_ARCH.MUSE_GLIMMER: [
++        MODEL_TENSOR.TOKEN_EMBD,
++        MODEL_TENSOR.OUTPUT,
++        MODEL_TENSOR.OUTPUT_NORM,
++        MODEL_TENSOR.ATTN_Q,
++        MODEL_TENSOR.ATTN_Q_NORM,
++        MODEL_TENSOR.ATTN_K,
++        MODEL_TENSOR.ATTN_K_NORM,
++        MODEL_TENSOR.ATTN_V,
++        MODEL_TENSOR.ATTN_OUT,
++        MODEL_TENSOR.ATTN_GATE,
++        MODEL_TENSOR.FFN_GATE,
++        MODEL_TENSOR.FFN_DOWN,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.ATTN_NORM,
++        MODEL_TENSOR.ATTN_POST_NORM,
++        MODEL_TENSOR.FFN_PRE_NORM,
++        MODEL_TENSOR.FFN_POST_NORM,
++    ],
+     MODEL_ARCH.OPENELM: [
+         MODEL_TENSOR.TOKEN_EMBD,
+         MODEL_TENSOR.OUTPUT_NORM,
+@@ -4932,6 +4953,7 @@ class VisionProjectorType:
+     MIMOVL         = "mimovl"
+     MIMO_AUDIO     = "mimo_audio"
+     GRANITE4_VISION = "granite4_vision"
++    MUSE_GLIMMER   = "muse-glimmer"
+ 
+ 
+ # Items here are (block size, type size)
+diff --git a/gguf-py/gguf/tensor_mapping.py b/gguf-py/gguf/tensor_mapping.py
+index d435d66..42e3972 100644
+--- a/gguf-py/gguf/tensor_mapping.py
++++ b/gguf-py/gguf/tensor_mapping.py
+@@ -382,7 +382,7 @@ class TensorNameMap:
+         ),
+ 
+         MODEL_TENSOR.ATTN_GATE: (
+-            "model.layers.{bid}.self_attn.gate_proj", # afmoe
++            "model.layers.{bid}.self_attn.gate_proj", # afmoe muse-glimmer
+             "model.layers.{bid}.linear_attn.in_proj_z",  # qwen3.5
+             "model.layers.{bid}.self_attn.g_proj",    # step3.5 head-wise attention gate
+         ),
+@@ -1298,10 +1298,12 @@ class TensorNameMap:
+             "encoder.final_layer_norm", # t5
+             "layer_norm",               # neobert
+             "model.hidden_norm",        # dflash
++            "encoder.output_norm_enc",  # dflash (transformers MuseGlimmerAssistant)
+         ),
+ 
+         MODEL_TENSOR.FC: (
+-            "model.fc", # dflash
++            "model.fc",   # dflash
++            "encoder.fc", # dflash (transformers MuseGlimmerAssistant)
+         ),
+ 
+ 
+@@ -1467,6 +1469,7 @@ class TensorNameMap:
+             "vision_tower.patch_embed.patchifier.proj", # dots.ocr
+             "vision_model.conv1", # Step3-VL
+             "model.vision_embedder.patch_dense", # gemma4 unified
++            "model.vision_tower.patch_embedder.patch_embedding", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_EMBD_NORM: (
+@@ -1534,7 +1537,8 @@ class TensorNameMap:
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.q_proj", # youtuvl
+             "model.vision_model.transformer.layers.{bid}.self_attn.q_proj", # Deepseek-OCR CLIP, generated
+             "vision_model.model.layers.{bid}.self_attn.q_proj.linear", # gemma4
+-            "model.qwen2_model.model.model.layers.{bid}.self_attn.q_proj" # Deepseek-OCR-2 qwen2
++            "model.qwen2_model.model.model.layers.{bid}.self_attn.q_proj", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.layers.{bid}.attn.q_proj", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_Q_NORM: (
+@@ -1560,7 +1564,8 @@ class TensorNameMap:
+             "model.vision_model.transformer.layers.{bid}.self_attn.k_proj", # Deepseek-OCR CLIP, generated
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.k_proj",
+             "vision_model.model.layers.{bid}.self_attn.k_proj.linear", # gemma4
+-            "model.qwen2_model.model.model.layers.{bid}.self_attn.k_proj" # Deepseek-OCR-2 qwen2
++            "model.qwen2_model.model.model.layers.{bid}.self_attn.k_proj", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.layers.{bid}.attn.k_proj", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_K_NORM: (
+@@ -1586,7 +1591,8 @@ class TensorNameMap:
+             "siglip2.vision_model.encoder.layers.{bid}.self_attn.v_proj",
+             "model.vision_model.transformer.layers.{bid}.self_attn.v_proj", # Deepseek-OCR CLIP, generated
+             "vision_model.model.layers.{bid}.self_attn.v_proj.linear", # gemma4
+-            "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj" # Deepseek-OCR-2 qwen2
++            "model.qwen2_model.model.model.layers.{bid}.self_attn.v_proj", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.layers.{bid}.attn.v_proj", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_INPUT_NORM: (
+@@ -1610,6 +1616,7 @@ class TensorNameMap:
+             "vision_tower.blocks.{bid}.norm1", # dots.ocr
+             "vision_model.transformer.resblocks.{bid}.ln_1", # Step3-VL
+             "model.qwen2_model.model.model.layers.{bid}.input_layernorm", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.layers.{bid}.norm1", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_O: (
+@@ -1635,6 +1642,7 @@ class TensorNameMap:
+             "vision_model.model.layers.{bid}.self_attn.o_proj.linear", # gemma4
+             "vision_tower.blocks.{bid}.attn.proj", # dots.ocr
+             "vision_model.transformer.resblocks.{bid}.attn.out_proj", # Step3-VL
++            "model.vision_tower.layers.{bid}.attn.proj", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_SINKS: (
+@@ -1663,6 +1671,7 @@ class TensorNameMap:
+             "vision_tower.blocks.{bid}.norm2", # dots.ocr
+             "vision_model.transformer.resblocks.{bid}.ln_2", # Step3-VL
+             "model.qwen2_model.model.model.layers.{bid}.post_attention_layernorm", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.layers.{bid}.norm2", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_FFN_UP: (
+@@ -1687,6 +1696,7 @@ class TensorNameMap:
+             "vision_model.model.layers.{bid}.mlp.up_proj", # gemma4
+             "vision_model.transformer.resblocks.{bid}.mlp.c_fc", # Step3-VL
+             "model.qwen2_model.model.model.layers.{bid}.mlp.up_proj", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.layers.{bid}.mlp.fc1", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_FFN_GATE: (
+@@ -1719,6 +1729,7 @@ class TensorNameMap:
+             "model.qwen2_model.model.model.layers.{bid}.mlp.down_proj" , # Deepseek-OCR-2 qwen2
+             "vision_model.model.layers.{bid}.mlp.down_proj", # gemma4
+             "vision_model.transformer.resblocks.{bid}.mlp.c_proj", # Step3-VL
++            "model.vision_tower.layers.{bid}.mlp.fc2", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_ENC_ATTN_POST_NORM: (
+@@ -1753,6 +1764,7 @@ class TensorNameMap:
+             "model.vision_model.pre_layrnorm", # Deepseek-OCR CLIP
+             "vision_tower.patch_embed.patchifier.norm", # dots.ocr
+             "vision_model.ln_pre", # Step3-VL
++            "model.vision_tower.ln_pre", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_POST_NORM: (
+@@ -1766,6 +1778,7 @@ class TensorNameMap:
+             "visual.post_layernorm", # glm4v
+             "siglip2.vision_model.post_layernorm",
+             "model.qwen2_model.model.model.norm", # Deepseek-OCR-2 qwen2
++            "model.vision_tower.ln_post", # muse-glimmer
+         ),
+ 
+         MODEL_TENSOR.V_MM_POST_NORM: (
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 3320975..832f751 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -71,6 +71,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_OLMO,             "olmo"             },
+     { LLM_ARCH_OLMO2,            "olmo2"            },
+     { LLM_ARCH_OLMOE,            "olmoe"            },
++    { LLM_ARCH_MUSE_GLIMMER,     "muse-glimmer"     },
+     { LLM_ARCH_OPENELM,          "openelm"          },
+     { LLM_ARCH_ARCTIC,           "arctic"           },
+     { LLM_ARCH_DEEPSEEK,         "deepseek"         },
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index d70f026..47a36c6 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -76,6 +76,7 @@ enum llm_arch {
+     LLM_ARCH_OLMO,
+     LLM_ARCH_OLMO2,
+     LLM_ARCH_OLMOE,
++    LLM_ARCH_MUSE_GLIMMER,
+     LLM_ARCH_OPENELM,
+     LLM_ARCH_ARCTIC,
+     LLM_ARCH_DEEPSEEK,
+diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
+index 76063f9..3256b6e 100644
+--- a/src/llama-model-saver.cpp
++++ b/src/llama-model-saver.cpp
+@@ -27,6 +27,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
+         case LLM_ARCH_APERTUS:
+         case LLM_ARCH_MIMO2:
+         case LLM_ARCH_STEP35:
++        case LLM_ARCH_MUSE_GLIMMER:
+         case LLM_ARCH_MELLUM:
+         case LLM_ARCH_LAGUNA:
+             return false;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index fa34791..910c393 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -171,6 +171,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_olmo2(params);
+         case LLM_ARCH_OLMOE:
+             return new llama_model_olmoe(params);
++        case LLM_ARCH_MUSE_GLIMMER:
++            return new llama_model_muse_glimmer(params);
+         case LLM_ARCH_OPENELM:
+             return new llama_model_openelm(params);
+         case LLM_ARCH_GPTNEOX:
+@@ -2605,6 +2607,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+         case LLM_ARCH_DEEPSEEK2OCR:
+         case LLM_ARCH_DEEPSEEK32:
+         case LLM_ARCH_DEEPSEEK4:
++        case LLM_ARCH_MUSE_GLIMMER:
+         case LLM_ARCH_PLM:
+         case LLM_ARCH_CHATGLM:
+         case LLM_ARCH_GRANITE:
+diff --git a/src/models/models.h b/src/models/models.h
+index 1051f9f..682cb38 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -1023,6 +1023,19 @@ struct llama_model_olmoe : public llama_model_base {
+ };
+ 
+ 
++struct llama_model_muse_glimmer : public llama_model_base {
++    llama_model_muse_glimmer(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++
+ struct llama_model_openelm : public llama_model_base {
+     llama_model_openelm(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+diff --git a/src/models/muse-glimmer.cpp b/src/models/muse-glimmer.cpp
+new file mode 100644
+index 0000000..0e94153
+--- /dev/null
++++ b/src/models/muse-glimmer.cpp
+@@ -0,0 +1,208 @@
++#include "models.h"
++
++void llama_model_muse_glimmer::load_arch_hparams(llama_model_loader & ml) {
++    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
++    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
++    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
++    ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale);
++
++    hparams.rope_freq_base_train_swa = hparams.rope_freq_base_train;
++    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
++
++    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
++    uint32_t swa_period = 4;
++    if (ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, swa_period, false)) {
++        hparams.set_swa_pattern(swa_period);
++    } else {
++        ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
++    }
++
++    switch (hparams.n_layer()) {
++        case 52: type = LLM_TYPE_30B; break;
++        default: type = LLM_TYPE_UNKNOWN;
++    }
++}
++
++void llama_model_muse_glimmer::load_arch_tensors(llama_model_loader &) {
++    LLAMA_LOAD_LOCALS;
++
++    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++
++    for (int i = 0; i < n_layer; ++i) {
++        auto & layer = layers[i];
++
++        // Pre/post-attention norms (Muse Glimmer's `weight + 1` applied at conversion time).
++        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
++        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
++
++        // Q/K/V/O projections.
++        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
++
++        // QK-norm. Weights are synthesized at conversion time to absorb `qk_scale_factor`.
++        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
++        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
++
++        // Attention output gate: sigmoid(gate) * attn_out before o_proj (same as afmoe).
++        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
++
++        // Pre/post-FFN norms (FFN_PRE_NORM is aliased to LLM_TENSOR_FFN_NORM).
++        layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), {n_embd}, 0);
++        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
++
++        // Dense FFN (unlike afmoe, no MoE branches).
++        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
++        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
++        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, 0);
++    }
++}
++
++llama_model_muse_glimmer::graph::graph(const llama_model & model, const llm_graph_params & params)
++    : llm_graph_context(params) {
++    const int64_t n_embd_head = hparams.n_embd_head_v();
++    GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
++
++    // Different to f_norm_rms_eps for post-attn / post-FFN norms
++    const float post_norm_eps = 1e-8f;
++
++    ggml_tensor * cur;
++    ggml_tensor * inpL;
++
++    inpL = build_inp_embd(model.tok_embd);
++    inpL = build_norm(inpL, nullptr, nullptr, LLM_NORM_RMS, -1);
++    cb(inpL, "embd_norm", -1);
++
++    ggml_tensor * inp_pos = build_inp_pos();
++    auto * inp_attn = build_attn_inp_kv_iswa();
++    ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    const float kq_scale = 1.0f / sqrtf(float(n_embd_head));
++
++    for (int il = 0; il < n_layer; ++il) {
++        // expose per-layer residual for speculative drafts (see LLM_KV_TARGET_LAYERS).
++        res->t_layer_inp[il] = inpL;
++
++        const float freq_base_l  = model.get_rope_freq_base (cparams, il);
++        const float freq_scale_l = model.get_rope_freq_scale(cparams, il);
++
++        ggml_tensor * inpSA = inpL;
++
++        // RoPE runs on the SWA layers, NoPE on full ones.
++        const bool use_rope = hparams.is_swa(il);
++
++        // pre-attention norm (weight+1 folded at conversion time)
++        cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
++        cb(cur, "attn_norm", il);
++
++        // self-attention: attention output gate around SDPA (afmoe.cpp:147-191)
++        {
++            ggml_tensor * attn_inp = cur;  // save input for gate computation
++
++            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
++                    n_embd_head, n_head, n_head_kv, il);
++
++            // gate = wqkv_gate @ attn_inp (from pre-attn hidden state)
++            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp);
++            cb(gate, "attn_gate_proj", il);
++
++            // QK-norm. attn_q_norm weight was synthesized at conversion to broadcast
++            // qk_scale_factor across head_dim; attn_k_norm is identity (ones).
++            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
++            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
++            cb(Qcur, "Qcur_normed", il);
++            cb(Kcur, "Kcur_normed", il);
++
++            if (use_rope) {
++                Qcur = ggml_rope_ext(
++                        ctx0, Qcur, inp_pos, nullptr,
++                        n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++                        ext_factor, attn_factor, beta_fast, beta_slow);
++                cb(Qcur, "Qcur_rope", il);
++
++                Kcur = ggml_rope_ext(
++                        ctx0, Kcur, inp_pos, nullptr,
++                        n_rot, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
++                        ext_factor, attn_factor, beta_fast, beta_slow);
++                cb(Kcur, "Kcur_rope", il);
++            }
++
++            // SDPA. wo is deferred; the gate goes between attn_out and o_proj.
++            cur = build_attn(inp_attn,
++                    NULL, NULL, NULL,
++                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
++            cb(cur, "attn_out", il);
++
++            gate = ggml_sigmoid(ctx0, gate);
++            cb(gate, "attn_gate_sig", il);
++            cur = ggml_mul(ctx0, cur, gate);
++            cb(cur, "attn_gated", il);
++
++            cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);
++            cb(cur, "attn_o_proj", il);
++        }
++
++        cur = ggml_rms_norm(ctx0, cur, post_norm_eps);
++        cur = ggml_mul(ctx0, cur, model.layers[il].attn_post_norm);
++        cb(cur, "attn_post_norm", il);
++
++        if (il == n_layer - 1 && inp_out_ids) {
++            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
++            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
++        }
++
++        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
++        cb(ffn_inp, "ffn_inp", il);
++
++        // pre-FFN norm
++        cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
++        cb(cur, "ffn_norm", il);
++
++        // SwiGLU dense FFN
++        cur = build_ffn(cur,
++                model.layers[il].ffn_up,   NULL, NULL,
++                model.layers[il].ffn_gate, NULL, NULL,
++                model.layers[il].ffn_down, NULL, NULL,
++                NULL,
++                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(cur, "ffn_out", il);
++
++        cur = ggml_rms_norm(ctx0, cur, post_norm_eps);
++        cur = ggml_mul(ctx0, cur, model.layers[il].ffn_post_norm);
++        cb(cur, "ffn_post_norm", il);
++
++        cur = ggml_add(ctx0, cur, ffn_inp);
++        cur = build_cvec(cur, il);
++        cb(cur, "l_out", il);
++
++        inpL = cur;
++    }
++
++    cur = inpL;
++
++    // final norm
++    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
++    cb(cur, "result_norm", -1);
++    res->t_embd = cur;
++
++    // lm_head, followed by output multiplier
++    cur = build_lora_mm(model.output, cur, model.output_s);
++    cur = ggml_scale(ctx0, cur, hparams.f_logit_scale);
++
++    // Final logit tanh softcap (from gemma3.cpp).
++    if (hparams.f_final_logit_softcapping) {
++        cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
++        cur = ggml_tanh(ctx0, cur);
++        cur = ggml_scale(ctx0, cur, hparams.f_final_logit_softcapping);
++    }
++
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++
++    ggml_build_forward_expand(gf, cur);
++}
++
++std::unique_ptr<llm_graph_context> llama_model_muse_glimmer::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(*this, params);
++}
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 4336e4e..b67004c 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -190,7 +190,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
+         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
+         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+-    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
++    } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_MUSE_GLIMMER) {
+         std::vector<uint32_t> pattern;
+         pattern.reserve(n_layer);
+         for (uint32_t il = 0; il < n_layer; il++) {
+diff --git a/tools/mtmd/CMakeLists.txt b/tools/mtmd/CMakeLists.txt
+index 15040e4..be866dc 100644
+--- a/tools/mtmd/CMakeLists.txt
++++ b/tools/mtmd/CMakeLists.txt
+@@ -41,6 +41,7 @@ add_library(mtmd
+             models/kimivl.cpp
+             models/kimik25.cpp
+             models/nemotron-v2-vl.cpp
++            models/muse-glimmer.cpp
+             models/llama4.cpp
+             models/llava.cpp
+             models/minicpmv.cpp
+diff --git a/tools/mtmd/clip-impl.h b/tools/mtmd/clip-impl.h
+index d42b382..3f770d4 100644
+--- a/tools/mtmd/clip-impl.h
++++ b/tools/mtmd/clip-impl.h
+@@ -408,6 +408,7 @@ enum projector_type {
+     PROJECTOR_TYPE_MINIMAX_M3,
+     PROJECTOR_TYPE_GRANITE4_VISION,
+     PROJECTOR_TYPE_MIMO_AUDIO,
++    PROJECTOR_TYPE_MUSE_GLIMMER,
+     PROJECTOR_TYPE_UNKNOWN,
+ };
+ 
+@@ -465,6 +466,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+     { PROJECTOR_TYPE_GRANITE4_VISION,   "granite4_vision"},
+     { PROJECTOR_TYPE_MIMO_AUDIO,        "mimo_audio"},
+     { PROJECTOR_TYPE_PARAKEET,          "parakeet"},
++    { PROJECTOR_TYPE_MUSE_GLIMMER,      "muse-glimmer"},
+ };
+ 
+ static projector_type clip_projector_type_from_string(const std::string & str) {
+diff --git a/tools/mtmd/clip-model.h b/tools/mtmd/clip-model.h
+index 8b9db51..23ff9b9 100644
+--- a/tools/mtmd/clip-model.h
++++ b/tools/mtmd/clip-model.h
+@@ -109,6 +109,11 @@ struct clip_hparams {
+     int32_t downsample_query_side;
+     int32_t downsample_window_side;
+ 
++    // Muse Glimmer vision (per-block sparse-window pattern, learned pos-emb, patch-temporal)
++    // NOTE: these perhaps shouldn't have the architecture prefix
++    int32_t muse_glimmer_patch_temporal = 0;
++    int32_t muse_glimmer_sparse_factor  = 0;
++
+     // audio
+     int32_t n_mel_bins = 0; // whisper preprocessor
+     int32_t proj_stack_factor = 0; // ultravox
+diff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index c187081..50bf4d2 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -928,6 +928,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const
+             {
+                 builder = std::make_unique<clip_graph_minimax_m3>(ctx, img);
+             } break;
++        case PROJECTOR_TYPE_MUSE_GLIMMER:
++            {
++                builder = std::make_unique<clip_graph_muse_glimmer>(ctx, img);
++            } break;
+         case PROJECTOR_TYPE_STEP3VL:
+             {
+                 builder = std::make_unique<clip_graph_step3vl>(ctx, img);
+@@ -1517,6 +1521,17 @@ struct clip_model_loader {
+                         hparams.set_limit_image_tokens(8, 576);
+                         hparams.set_warmup_n_tokens(16*16);
+                     } break;
++                case PROJECTOR_TYPE_MUSE_GLIMMER:
++                    {
++                        hparams.n_merge = 2; // pixel-shuffle downsample after the ViT
++                        hparams.image_resize_algo = RESIZE_ALGO_LANCZOS;
++                        hparams.rope_theta = 10000.0f;
++                        hparams.muse_glimmer_patch_temporal = 2;
++                        hparams.muse_glimmer_sparse_factor  = 4; // 3 sparse layers + 1 global, repeating
++                        get_u32(KEY_SPATIAL_MERGE_SIZE,  hparams.n_merge,             false);
++                        hparams.set_limit_image_tokens(1, 4096);
++                        hparams.set_warmup_n_tokens(32*32);
++                    } break;
+                 case PROJECTOR_TYPE_MIMOVL:
+                     {
+                         hparams.n_merge = 2; // spatial_merge_size
+@@ -2224,6 +2239,13 @@ struct clip_model_loader {
+                     model.mm_merger_fc2_w = get_tensor(string_format(TN_MM_MERGER_FC2, "weight"));
+                     model.mm_merger_fc2_b = get_tensor(string_format(TN_MM_MERGER_FC2, "bias"));
+                 } break;
++            case PROJECTOR_TYPE_MUSE_GLIMMER:
++                {
++                    // 3-linear MLP: fc -> erf-GELU -> proj -> erf-GELU -> vision_proj (into LLM residual dim)
++                    model.mm_0_w = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
++                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
++                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
++                } break;
+             case PROJECTOR_TYPE_STEP3VL:
+                 {
+                     model.mm_0_w     = get_tensor(string_format(TN_LLAVA_PROJ, 0, "weight"));
+@@ -3504,6 +3526,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
+         case PROJECTOR_TYPE_PADDLEOCR:
+         case PROJECTOR_TYPE_HUNYUANVL:
+         case PROJECTOR_TYPE_YOUTUVL:
++        case PROJECTOR_TYPE_MUSE_GLIMMER:
+             return (img->nx() / params.patch_size) / 2;
+         case PROJECTOR_TYPE_STEP3VL:
+             return img->nx() / (params.patch_size * params.n_merge);
+@@ -3529,6 +3552,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
+         case PROJECTOR_TYPE_PADDLEOCR:
+         case PROJECTOR_TYPE_HUNYUANVL:
+         case PROJECTOR_TYPE_YOUTUVL:
++        case PROJECTOR_TYPE_MUSE_GLIMMER:
+             return (img->ny() / params.patch_size) / 2;
+         case PROJECTOR_TYPE_STEP3VL:
+             return img->ny() / (params.patch_size * params.n_merge);
+@@ -3607,6 +3631,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
+         case PROJECTOR_TYPE_MINIMAX_M3:
+         case PROJECTOR_TYPE_GLM4V:
+         case PROJECTOR_TYPE_YOUTUVL:
++        case PROJECTOR_TYPE_MUSE_GLIMMER:
+             {
+                 // dynamic size (2 conv, so double patch size)
+                 int x_patch = img->nx() / (params.patch_size * 2);
+@@ -3933,6 +3958,70 @@ bool clip_image_batch_encode(clip_ctx * ctx, int n_threads, const clip_image_f32
+ 
+     // set input per projector
+     switch (ctx->model.proj_type) {
++        case PROJECTOR_TYPE_MUSE_GLIMMER:
++            {
++                const int grid_w = pos_w;            // image_size_width  / patch_size
++                const int grid_h = pos_h;            // image_size_height / patch_size
++                const int n_tok  = grid_w * grid_h;
++                const int pgrid  = (int) std::sqrt((double) ctx->model.position_embeddings->ne[1]); // 32
++                const int f      = hparams.n_merge;  // downsample 2
++
++                // pixel patchify runs inside the graph via build_inp() (ggml_conv_2d);
++                // pos-emb bilinear interp via resize_position_embeddings().
++
++                // --- sparse window grouping (pgrid x pgrid windows) ---
++                const int win = pgrid;
++                const int nwin_h = (grid_h + win - 1) / win;
++                const int nwin_w = (grid_w + win - 1) / win;
++                std::vector<int32_t> sp_perm; sp_perm.reserve(n_tok);
++                std::vector<int>     sp_slens;
++                for (int wy = 0; wy < nwin_h; wy++) {
++                    for (int wx = 0; wx < nwin_w; wx++) {
++                        int cnt = 0;
++                        for (int hh = 0; hh < win; hh++) {
++                            for (int ww = 0; ww < win; ww++) {
++                                const int gy = wy * win + hh;
++                                const int gx = wx * win + ww;
++                                if (gy < grid_h && gx < grid_w) { sp_perm.push_back(gy * grid_w + gx); cnt++; }
++                            }
++                        }
++                        if (cnt > 0) sp_slens.push_back(cnt);
++                    }
++                }
++                std::vector<int32_t> rpos_w(n_tok), rpos_h(n_tok), inv_perm(n_tok);
++                for (int i = 0; i < n_tok; i++) {
++                    const int orig = sp_perm[i];
++                    rpos_w[i] = (orig % grid_w) + 1; // 1-indexed
++                    rpos_h[i] = (orig / grid_w) + 1;
++                    inv_perm[orig] = i;
++                }
++                set_input_i32("muse_glimmer_sp_perm",  sp_perm);
++                set_input_i32("muse_glimmer_inv_perm", inv_perm);
++                set_input_i32("muse_glimmer_pos_w",    rpos_w);
++                set_input_i32("muse_glimmer_pos_h",    rpos_h);
++
++                // block-diagonal window mask (permuted order)
++                std::vector<float> sp_mask((size_t) n_tok * n_tok, -INFINITY);
++                {
++                    int off = 0;
++                    for (int s : sp_slens) {
++                        for (int a = 0; a < s; a++)
++                            for (int b = 0; b < s; b++)
++                                sp_mask[(size_t) (off + a) * n_tok + (off + b)] = 0.0f;
++                        off += s;
++                    }
++                }
++                set_input_f32("muse_glimmer_sp_mask", sp_mask);
++
++                // pixel-shuffle gather (original order): f*f spatial neighbours grouped
++                std::vector<int32_t> dsp; dsp.reserve(n_tok);
++                for (int oy = 0; oy < grid_h / f; oy++)
++                    for (int ox = 0; ox < grid_w / f; ox++)
++                        for (int ry = 0; ry < f; ry++)
++                            for (int rx = 0; rx < f; rx++)
++                                dsp.push_back((oy * f + ry) * grid_w + (ox * f + rx));
++                set_input_i32("muse_glimmer_ds_perm", dsp);
++            } break;
+         case PROJECTOR_TYPE_MINICPMV:
+             {
+                 // inspired from siglip:
+@@ -4985,6 +5074,8 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
+             return ctx->model.mm_model_mlp_3_w->ne[1];
+         case PROJECTOR_TYPE_MINIMAX_M3:
+             return ctx->model.mm_merger_fc2_b->ne[0];
++        case PROJECTOR_TYPE_MUSE_GLIMMER:
++            return ctx->model.mm_2_w->ne[1];
+         case PROJECTOR_TYPE_QWEN2VL:
+         case PROJECTOR_TYPE_QWEN25VL:
+         case PROJECTOR_TYPE_EXAONE4_5:
+diff --git a/tools/mtmd/models/models.h b/tools/mtmd/models/models.h
+index e54366a..51e840e 100644
+--- a/tools/mtmd/models/models.h
++++ b/tools/mtmd/models/models.h
+@@ -254,3 +254,8 @@ private:
+     ggml_tensor * build_newline_row(ggml_context * ctx0);
+     ggml_tensor * append_rowwise_newlines(ggml_context * ctx0, ggml_tensor * tile_output);
+ };
++
++struct clip_graph_muse_glimmer : clip_graph {
++    clip_graph_muse_glimmer(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
++    ggml_cgraph * build() override;
++};
+diff --git a/tools/mtmd/models/muse-glimmer.cpp b/tools/mtmd/models/muse-glimmer.cpp
+new file mode 100644
+index 0000000..b201536
+--- /dev/null
++++ b/tools/mtmd/models/muse-glimmer.cpp
+@@ -0,0 +1,88 @@
++#include "models.h"
++
++// MuseGlimmer vision encoder: 50-layer ViT with 2D RoPE, sparse block-diagonal
++// window attention (every 4th + last layer global), pixel-shuffle downsample, then
++// adapter MLP + LLM's vision_projection.
++//
++// Several quantities are precomputed on host and fed as named graph inputs (filled in
++// clip.cpp set_input, PROJECTOR_TYPE_MUSE_GLIMMER branch):
++//   muse_glimmer_pos_w/_h [n_tok] i32         : 1-indexed RoPE positions (sparse-permuted order)
++//   muse_glimmer_sp_perm  [n_tok] i32         : window grouping permutation (applied after ln_pre)
++//   muse_glimmer_inv_perm [n_tok] i32         : inverse of sp_perm (applied after blocks)
++//   muse_glimmer_ds_perm  [n_tok] i32         : pixel-shuffle gather (original order)
++//   muse_glimmer_sp_mask  [n_tok, n_tok] f32  : block-diagonal window mask (sparse layers)
++ggml_cgraph * clip_graph_muse_glimmer::build() {
++    const int ds = hparams.n_merge;              // downsample factor (2)
++    const int sf = hparams.muse_glimmer_sparse_factor;   // 4
++    const int n_tok     = n_patches;
++    const int n_out     = (n_patches_x / ds) * (n_patches_y / ds);
++    const float rope_base = hparams.rope_theta;  // 10000
++
++    auto inp_i32 = [&](const char * name, int64_t n) {
++        ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n);
++        ggml_set_name(t, name);
++        ggml_set_input(t);
++        return t;
++    };
++
++    ggml_tensor * pos_w    = inp_i32("muse_glimmer_pos_w",    n_tok);
++    ggml_tensor * pos_h    = inp_i32("muse_glimmer_pos_h",    n_tok);
++    ggml_tensor * sp_perm  = inp_i32("muse_glimmer_sp_perm",  n_tok);
++    ggml_tensor * inv_perm = inp_i32("muse_glimmer_inv_perm", n_tok);
++    ggml_tensor * ds_perm  = inp_i32("muse_glimmer_ds_perm",  n_tok);
++
++    ggml_tensor * sp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_tok, n_tok);
++    ggml_set_name(sp_mask, "muse_glimmer_sp_mask");
++    ggml_set_input(sp_mask);
++
++    // patchify via build_inp (conv2d over raw pixels) + bilinear-resized learned pos-emb
++    ggml_tensor * x = build_inp();                                                     // [n_embd, n_tok, 1]
++    x = ggml_add(ctx0, x, resize_position_embeddings(GGML_SCALE_MODE_BILINEAR));
++    cb(x, "after_posemb", -1);
++
++    // group patches into pgrid x pgrid windows (sparse attention order)
++    x = ggml_get_rows(ctx0, x, sp_perm);
++    cb(x, "after_sp_perm", -1);
++
++    // per-layer mask: sparse layers get sp_mask, global layers (every sf-th and last) get none
++    std::vector<ggml_tensor *> attn_mask_layers(n_layer);
++    for (int il = 0; il < n_layer; ++il) {
++        const bool is_global = (il == n_layer - 1) || ((il + 1) % sf == 0);
++        attn_mask_layers[il] = is_global ? nullptr : sp_mask;
++    }
++
++    // 2D RoPE: first half of head_dim uses width pos, second half uses height pos
++    auto add_pos = [&](ggml_tensor * cur, const clip_layer &) {
++        return build_rope_2d(ctx0, cur, pos_w, pos_h, rope_base, false);
++    };
++
++    build_vit_opts opts;
++    opts.attn_mask_layers = std::move(attn_mask_layers);
++
++    // pre_ln, per-layer transformer, post_ln (all inside build_vit); reference uses exact (erf) GELU
++    x = build_vit(x, n_tok, NORM_TYPE_NORMAL, FFN_GELU_ERF, nullptr, add_pos, opts);
++
++    // un-permute back to original grid order
++    x = ggml_get_rows(ctx0, x, inv_perm);
++    cb(x, "after_inv_perm", -1);
++
++    // pixel-shuffle downsample: gather f*f spatial neighbors then concat channel-outer.
++    // out[c*(ds*ds)+s, o] = x[ds_perm gathered][o*(ds*ds)+s, c]
++    x = ggml_get_rows(ctx0, x, ds_perm);                 // [n_embd, n_tok], grouped
++    x = ggml_reshape_3d(ctx0, x, n_embd, ds * ds, n_out);// [c, s, o]
++    x = ggml_permute(ctx0, x, 1, 0, 2, 3);               // [s, c, o]
++    x = ggml_cont(ctx0, x);
++    x = ggml_reshape_2d(ctx0, x, n_embd * ds * ds, n_out); // [6144, n_out]
++    cb(x, "encoder_out", -1);
++
++    // adapter (6144->4096->4096, exact GELU each) + LLM vision_projection (4096->6656)
++    x = build_mm(model.mm_0_w, x);
++    x = ggml_gelu_erf(ctx0, x);
++    x = build_mm(model.mm_1_w, x);
++    x = ggml_gelu_erf(ctx0, x);
++    x = build_mm(model.mm_2_w, x);                       // [6656, n_out]
++    cb(x, "projected", -1);
++
++    ggml_build_forward_expand(gf, x);
++    return gf;
++}
+diff --git a/tools/mtmd/mtmd-image.cpp b/tools/mtmd/mtmd-image.cpp
+index 10cfe52..e2eeed7 100644
+--- a/tools/mtmd/mtmd-image.cpp
++++ b/tools/mtmd/mtmd-image.cpp
+@@ -1611,3 +1611,65 @@ mtmd_image_preproc_out mtmd_image_preprocessor_granite::preprocess(const clip_im
+     }
+     return output;
+ }
++
++//
++// mtmd_image_preprocessor_muse_glimmer
++//
++
++// Replicates transformers' get_aspect_ratio_preserving_size
++static clip_image_size muse_glimmer_grid_size(int img_w, int img_h, int patch_hw, int max_tokens) {
++    double i_nph = (double) img_h / patch_hw;
++    double i_npw = (double) img_w / patch_hw;
++    const double ratio = i_nph > 0.0 ? i_npw / i_nph : 1.0;
++    if (i_nph * i_npw > (double) max_tokens) {
++        i_nph = std::sqrt((double) max_tokens / ratio);
++        i_npw = i_nph * ratio;
++    }
++    const int hs[2] = { (int) std::floor(i_nph), (int) std::ceil(i_nph) };
++    const int ws[2] = { (int) std::floor(i_npw), (int) std::ceil(i_npw) };
++    const double target_ar = (double) img_h / (double) img_w;
++    int    best_nph = -1;
++    int    best_npw = -1;
++    double best_d   = 0.0;
++    for (int a = 0; a < 2; ++a) {
++        for (int b = 0; b < 2; ++b) {
++            const int nph = hs[a];
++            const int npw = ws[b];
++            if (nph < 1 || npw < 1 || nph * npw > max_tokens) {
++                continue;
++            }
++            const double d = std::fabs((double) nph / (double) npw - target_ar);
++            const int n_tokens      = nph * npw;
++            const int best_n_tokens = best_nph * best_npw;
++            if (best_nph < 0 || d < best_d || (d == best_d && n_tokens > best_n_tokens)) {
++                best_nph = nph;
++                best_npw = npw;
++                best_d   = d;
++            }
++        }
++    }
++    if (best_nph < 0) { // no candidate fit under the cap: round and clamp
++        best_nph = std::max(1, (int) std::lround(i_nph));
++        best_npw = std::max(1, (int) std::lround(i_npw));
++    }
++    return clip_image_size{ best_npw * patch_hw, best_nph * patch_hw };
++}
++
++mtmd_image_preproc_out mtmd_image_preprocessor_muse_glimmer::preprocess(const clip_image_u8 & img) {
++    const int patch_hw   = hparams.patch_size * hparams.n_merge;
++    const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
++    GGML_ASSERT(patch_area > 0 && hparams.image_max_pixels > 0);
++    const int max_tokens = hparams.image_max_pixels / patch_area;
++
++    const clip_image_size original_size = img.get_size();
++    const clip_image_size target_size   = muse_glimmer_grid_size(
++        original_size.width, original_size.height, patch_hw, max_tokens);
++
++    // PIL resizes directly to (target_w, target_h) -- a stretch, no padding.
++    clip_image_u8 resized_image;
++    img_tool::resize(img, resized_image, target_size, hparams.image_resize_algo, PAD_NONE);
++
++    mtmd_image_preproc_out output;
++    output.append(hparams, resized_image, true);
++    return output;
++}
+diff --git a/tools/mtmd/mtmd-image.h b/tools/mtmd/mtmd-image.h
+index ecb203f..0669aa1 100644
+--- a/tools/mtmd/mtmd-image.h
++++ b/tools/mtmd/mtmd-image.h
+@@ -230,3 +230,9 @@ struct mtmd_image_preprocessor_granite : mtmd_image_preprocessor_llava_uhd {
+     mtmd_image_preprocessor_granite(const clip_ctx * ctx) : mtmd_image_preprocessor_llava_uhd(ctx) {}
+     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+ };
++
++// pick the patch grid closest to the input aspect ratio under the per-image token cap, stretch-resize.
++struct mtmd_image_preprocessor_muse_glimmer : mtmd_image_preprocessor {
++    mtmd_image_preprocessor_muse_glimmer(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
++    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
++};
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index d3899f5..050a782 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -470,6 +470,12 @@ struct mtmd_context {
+                     img_end = "]<]end of image[>[";
+                     image_preproc = std::make_unique<mtmd_image_preprocessor_dyn_size>(ctx_v);
+                 } break;
++            case PROJECTOR_TYPE_MUSE_GLIMMER:
++                {
++                    img_beg = "<|image_start|>";
++                    img_end = "<|image_end|>";
++                    image_preproc = std::make_unique<mtmd_image_preprocessor_muse_glimmer>(ctx_v);
++                } break;
+             case PROJECTOR_TYPE_YOUTUVL:
+                 {
+                     // <|vision_start|> ... (image embeddings) ... <|vision_end|>
