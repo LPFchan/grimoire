@@ -260,7 +260,17 @@ def _validated_history_conversation_id(user_hash, conversation_id):
     return conversation_id
 
 
-async def _record_response_stream(stream, user_hash, conversation_id, model_name, model_cfg, payload, gpu_index=None, record_history=True):
+async def _record_response_stream(
+    stream,
+    user_hash,
+    conversation_id,
+    model_name,
+    model_cfg,
+    payload,
+    gpu_index=None,
+    record_history=True,
+    record_usage=True,
+):
     captured = bytearray()
     usage_tail = bytearray()
     try:
@@ -293,7 +303,7 @@ async def _record_response_stream(stream, user_hash, conversation_id, model_name
         usage = _extract_usage(raw)
         if not usage:
             usage = _extract_usage(bytes(usage_tail))
-        if usage:
+        if usage and record_usage:
             usage_store.record(
                 user_hash,
                 model_name,
@@ -349,6 +359,7 @@ async def chat_completions(request: Request):
             user_hash=user_hash,
             conversation_id=conversation_id,
             history_conversation_id=history_conversation_id,
+            record_usage=request.headers.get("x-grimoire-cache-warm") != "1",
         )
     except HTTPException:
         raise

@@ -244,8 +244,48 @@ class DropInBlockerTests(unittest.TestCase):
 
                 manager.active = {"reasoning-a": FakeActive("reasoning-a")}
                 self.assertEqual(manager._compatible_active_entry("reasoning-b"), (None, None))
+
+                sharded = dict(configs["reasoning-b"], **{"gpu-ids": [0, 1]})
+                configs["reasoning-sharded"] = sharded
+                self.assertEqual(manager._compatible_active_entry("reasoning-sharded"), (None, None))
             finally:
                 mm_module.registry = old_registry
+
+    def test_explicit_request_only_template_kwargs_allow_alias_reuse(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file:
+            configs = {
+                "low": {
+                    "file": model_file.name,
+                    "chat-template-kwargs": {"reasoning_effort": "low"},
+                },
+                "high": {
+                    "file": model_file.name,
+                    "chat-template-kwargs": {"reasoning_effort": "high"},
+                },
+            }
+
+            class FakeRegistry:
+                def get(self, name):
+                    return configs.get(name)
+
+                def get_family_defaults(self, family):
+                    return {}
+
+                def get_fixed_gpu(self, name):
+                    return None
+
+            class FakeActive:
+                name = "low"
+                cfg = configs[name]
+
+                def is_running(self):
+                    return True
+
+            with patch.object(mm_module, "registry", FakeRegistry()):
+                manager = entrypoint.ModelManager(gpu_count=1)
+                active = FakeActive()
+                manager.active[active.name] = active
+                self.assertEqual(manager._compatible_active_entry("high"), ("low", active))
 
     def test_concurrent_cold_start_returns_the_same_healthy_backend(self):
         cfg = {"file": "model.gguf"}
@@ -864,6 +904,38 @@ class DropInBlockerTests(unittest.TestCase):
             entrypoint.usage_store = old_usage_store
             entrypoint.MAX_HISTORY_CAPTURE_BYTES = old_history_capture
             entrypoint.MAX_USAGE_CAPTURE_BYTES = old_usage_capture
+
+    def test_cache_warm_does_not_record_usage(self):
+        class FakeUsageStore:
+            def __init__(self):
+                self.records = []
+
+            def record(self, *args, **kwargs):
+                self.records.append((args, kwargs))
+
+        async def stream():
+            yield b'data: {"usage":{"prompt_tokens":30,"completion_tokens":0}}\n\n'
+
+        async def consume(async_iter):
+            return [chunk async for chunk in async_iter]
+
+        old_usage_store = entrypoint.usage_store
+        fake_usage = FakeUsageStore()
+        try:
+            entrypoint.usage_store = fake_usage
+            asyncio.run(consume(entrypoint._record_response_stream(
+                stream(),
+                user_hash="user",
+                conversation_id=None,
+                model_name="model",
+                model_cfg={"cost": {}},
+                payload={},
+                record_history=False,
+                record_usage=False,
+            )))
+            self.assertEqual(fake_usage.records, [])
+        finally:
+            entrypoint.usage_store = old_usage_store
 
     def test_history_delete_cascades_messages(self):
         with tempfile.TemporaryDirectory() as tmp:

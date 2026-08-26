@@ -75,7 +75,7 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 - Aliases that differ only by request-time `reasoning_effort` or Muse Glimmer `reasoning_strength` share one running llama-server process and KV cache.
 - Replica groups, fixed GPU placement, PFlash/drafter configurations, and unrelated command-equivalent aliases must remain separate.
 - The requested alias's chat-template defaults, plugins, usage attribution, and history attribution apply to each request even when another alias owns the shared process.
-- Each completed web UI turn carries its cache-routing ID in `x-grimoire-kv-conversation-id` and warms the final persisted branch for the next turn. This header stays separate from the legacy history-recording conversation ID. Aborted or empty turns are not warmed.
+- Each completed web UI turn carries its cache-routing ID in `x-grimoire-kv-conversation-id` and warms the final persisted branch for the next turn. Cache keys are scoped by running model and authenticated user, and the warm request uses the same context compaction as a real turn. This header stays separate from the legacy history-recording conversation ID; warm-only requests do not count toward usage. Aborted or empty turns are not warmed.
 - The production llama-server RAM prompt-cache allowance is 4 GiB per process.
 
 ## Pinned Upstream Repos

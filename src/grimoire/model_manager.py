@@ -733,14 +733,14 @@ class ModelManager:
         if direct is not None and direct.is_running():
             return model_name, direct
 
-        cfg = cfg or registry.get(model_name)
+        cfg = cfg or self.effective_config(model_name)
         if not cfg:
             return None, None
-        _, requested_template_kwargs = split_chat_template_kwargs(cfg.get("extra-args", []))
+        if cfg.get("gpu-ids") is not None:
+            return None, None
         get_family_defaults = getattr(registry, "get_family_defaults", lambda _family: {})
         family_defaults = get_family_defaults(cfg.get("family"))
-        _, family_template_kwargs = split_chat_template_kwargs(family_defaults.get("extra-args", []))
-        requested_template_kwargs = {**family_template_kwargs, **requested_template_kwargs}
+        requested_template_kwargs = configured_chat_template_kwargs(cfg, family_defaults)
         signature = runtime_command_signature(cfg)
         if signature is None:
             return None, None
@@ -748,12 +748,12 @@ class ModelManager:
             if not active.is_running():
                 continue
             active_cfg = active.cfg
-            _, active_template_kwargs = split_chat_template_kwargs(active_cfg.get("extra-args", []))
+            if active_cfg.get("gpu-ids") is not None:
+                continue
             active_family_defaults = get_family_defaults(active_cfg.get("family"))
-            _, active_family_template_kwargs = split_chat_template_kwargs(
-                active_family_defaults.get("extra-args", [])
+            active_template_kwargs = configured_chat_template_kwargs(
+                active_cfg, active_family_defaults
             )
-            active_template_kwargs = {**active_family_template_kwargs, **active_template_kwargs}
             if not any(
                 key in requested_template_kwargs or key in active_template_kwargs
                 for key in REQUEST_ONLY_TEMPLATE_KWARGS

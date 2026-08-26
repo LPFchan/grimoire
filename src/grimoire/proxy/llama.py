@@ -169,6 +169,7 @@ async def _proxy_chat(
     user_hash=None,
     conversation_id=None,
     history_conversation_id=None,
+    record_usage=True,
 ):
     """Proxy chat completions while keeping the upstream client open."""
     # Local imports avoid circular dependency with entrypoint.
@@ -202,6 +203,10 @@ async def _proxy_chat(
     url = f"http://127.0.0.1:{active.port}/v1/chat/completions"
     headers = {}
     validated_conversation_id = conversation_id if isinstance(conversation_id, str) else None
+    if validated_conversation_id:
+        validated_conversation_id = "\0".join(
+            (active.name, user_hash or "anonymous", validated_conversation_id)
+        )
 
     _save_hash: Optional[bytes] = None
 
@@ -402,6 +407,7 @@ async def _proxy_chat(
                     payload,
                     gpu_index=_telemetry_gpu_index(active),
                     record_history=upstream.status_code < 400,
+                    record_usage=record_usage,
                 )
             if non_streaming:
                 body_parts = []
@@ -420,13 +426,15 @@ async def _proxy_chat(
                 async for chunk in stream:
                     yield chunk
         finally:
-            await upstream.aclose()
-            # KV prefix cache: save slot by content hash (pflash path only)
-            if _save_hash and slot_url:
-                async with httpx.AsyncClient(timeout=5) as sc:
-                    await _save_kv(sc, slot_url, _save_hash, store, log)
-            if slot_guard is not None:
-                slot_guard.release()
+            try:
+                await upstream.aclose()
+                # KV prefix cache: save slot by content hash (pflash path only)
+                if _save_hash and slot_url:
+                    async with httpx.AsyncClient(timeout=5) as sc:
+                        await _save_kv(sc, slot_url, _save_hash, store, log)
+            finally:
+                if slot_guard is not None:
+                    slot_guard.release()
 
     resp_headers = {"x-request-id": requested_model}
     content_type = upstream.headers.get("content-type")

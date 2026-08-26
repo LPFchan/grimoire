@@ -152,6 +152,49 @@ class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request["chat_template_kwargs"], {"reasoning_strength": "high"})
         self.assertEqual(plugin_calls, [("muse-glimmer-30b-high", requested_cfg)])
 
+    async def test_conversation_cache_key_is_scoped_by_process_and_user(self):
+        active = _FakeActive()
+        active.prefill_config = None
+
+        class FakeStore:
+            def __init__(self):
+                self.saved = []
+                self.restored = []
+
+            async def save_conv(self, client, slot_url, conversation_id):
+                self.saved.append(conversation_id)
+
+            async def restore_conv(self, client, slot_url, conversation_id):
+                self.restored.append(conversation_id)
+
+        store = FakeStore()
+        payload = {
+            "model": active.name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": False,
+        }
+
+        with patch.object(llama_proxy, "_kv_store", return_value=store), \
+             patch.object(llama_proxy.plugin_manager, "before_request", side_effect=lambda p, *a: p), \
+             patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
+             patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient):
+            first = await llama_proxy._proxy_chat(
+                active.name, payload, active, user_hash="user-a", conversation_id="conversation"
+            )
+            async for _ in first.body_iterator:
+                pass
+            second = await llama_proxy._proxy_chat(
+                active.name, payload, active, user_hash="user-b", conversation_id="conversation"
+            )
+            async for _ in second.body_iterator:
+                pass
+
+        first_key = f"{active.name}\0user-a\0conversation"
+        second_key = f"{active.name}\0user-b\0conversation"
+        self.assertEqual(store.restored, [first_key, second_key])
+        self.assertEqual(store.saved, [first_key])
+
     def test_model_logit_bias_merges_cli_style_defaults(self):
         payload = {"logit_bias": {"262143": 1.0, "5": -2}}
         cfg = {"logit-bias": ["262143+5", "111038-inf", [7, 1.5]]}
