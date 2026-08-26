@@ -94,6 +94,12 @@ curl -X POST "$GRIMOIRE_ORIGIN/models/qwen/unpin" -H "Authorization: Bearer $GRI
 - Dynamic allocation: free GPU preferred, oldest non-pinned evicted when all busy
 - All models use `backend: "llama"` (Bee `llama-server` HTTP) — the legacy `backend: "dflash"` daemon path is retired
 
+### Prompt Cache Reuse
+
+Grimoire applies `reasoning_effort` and Muse Glimmer's `reasoning_strength` from model `--chat-template-kwargs` to each request. Model aliases that produce the same llama-server command share one running process, so changing reasoning level keeps the existing KV cache. Other template defaults are merged into one startup argument.
+
+The web UI pre-encodes the final conversation branch after each response, including reasoning and tool messages. This keeps the next user turn aligned with the serialized prompt already in the server cache. The production Compose profile reserves 4 GiB per llama-server process for its RAM prompt cache through `LLAMA_ARG_CACHE_RAM`.
+
 ### KV Cache Store (Content-Hash)
 
 Content-hash KV caching replaces the legacy snapshot daemon. On every decode, the gateway saves a content-addressed KV persist to RAM (tmpfs) with async disk mirroring. On the next request with the same system prompt prefix, the cached KV is restored directly — no daemon round-trip.

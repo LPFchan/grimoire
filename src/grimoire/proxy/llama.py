@@ -12,12 +12,13 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
+from grimoire.chat_template import apply_chat_template_kwargs
 from grimoire.proxy.client import get_proxy_client
 from grimoire.dflash.kv_cache_store import KVCacheStore
 from grimoire.dflash.prefill import materialize_blocks, maybe_compress
 from grimoire.plugins import plugin_manager
 from grimoire.prompt.generic import _prefix_cache_boundaries, _prompt_layout_from_messages
-from grimoire.registry import resolve_path
+from grimoire.registry import registry, resolve_path
 
 logger = logging.getLogger(__name__)
 
@@ -161,12 +162,21 @@ def _telemetry_gpu_index(active):
     return active.gpu if len(gpus) == 1 else None
 
 
-async def _proxy_chat(requested_model, payload, active, user_hash=None, conversation_id=None):
+async def _proxy_chat(
+    requested_model,
+    payload,
+    active,
+    user_hash=None,
+    conversation_id=None,
+    history_conversation_id=None,
+):
     """Proxy chat completions while keeping the upstream client open."""
     # Local imports avoid circular dependency with entrypoint.
     from grimoire.entrypoint import _record_response_stream
 
-    model_cfg = active.cfg
+    active_cfg = active.cfg
+    requested_name = registry.resolve(requested_model) or requested_model
+    model_cfg = active_cfg if requested_name == active.name else (registry.get(requested_name) or active_cfg)
 
     # Capture daemon and pcfg BEFORE first await to avoid race with eviction.
     # After start_model releases the lock, a concurrent request can evict this
@@ -184,7 +194,9 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
             so["include_usage"] = True
         else:
             payload["stream_options"] = {"include_usage": True}
-    payload = plugin_manager.before_request(payload, active.name, model_cfg)
+    family_defaults = registry.get_family_defaults(model_cfg.get("family"))
+    payload = apply_chat_template_kwargs(payload, model_cfg, family_defaults)
+    payload = plugin_manager.before_request(payload, requested_name, model_cfg)
     backend_model_id = await active.get_backend_model_id()
     payload["model"] = backend_model_id
     url = f"http://127.0.0.1:{active.port}/v1/chat/completions"
@@ -339,7 +351,7 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
         await slot_guard.acquire()
     try:
         payload = await plugin_manager.before_backend_request(
-            payload, active.name, model_cfg, backend_model_id, client, url, headers
+            payload, requested_name, model_cfg, backend_model_id, client, url, headers
         )
         payload = _apply_model_logit_bias(payload, model_cfg)
 
@@ -379,13 +391,13 @@ async def _proxy_chat(requested_model, payload, active, user_hash=None, conversa
     async def body_iter():
         try:
             stream = upstream.aiter_raw()
-            stream = plugin_manager.wrap_response_stream(stream, active.name, model_cfg)
+            stream = plugin_manager.wrap_response_stream(stream, requested_name, model_cfg)
             if user_hash:
                 stream = _record_response_stream(
                     stream,
                     user_hash,
-                    conversation_id,
-                    active.name,
+                    history_conversation_id,
+                    requested_name,
                     model_cfg,
                     payload,
                     gpu_index=_telemetry_gpu_index(active),

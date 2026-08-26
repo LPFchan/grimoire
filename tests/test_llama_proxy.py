@@ -101,6 +101,57 @@ class _FakeClient:
 
 
 class LlamaProxyPflashTests(unittest.IsolatedAsyncioTestCase):
+    def test_chat_template_defaults_merge_and_request_wins(self):
+        payload = {"chat_template_kwargs": {"reasoning_effort": "medium"}}
+        cfg = {
+            "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"low"}']
+        }
+        family = {
+            "extra-args": ["--chat-template-kwargs", '{"preserve_thinking":true}']
+        }
+
+        result = llama_proxy.apply_chat_template_kwargs(payload, cfg, family)
+
+        self.assertEqual(
+            result["chat_template_kwargs"],
+            {"preserve_thinking": True, "reasoning_effort": "medium"},
+        )
+
+    async def test_shared_process_uses_requested_alias_config(self):
+        active = _FakeActive()
+        active.name = "muse-glimmer-30b-low"
+        active.cfg = {"family": "muse", "ctx-size": 4096}
+        active.prefill_config.enabled = False
+        requested_cfg = {
+            "family": "muse",
+            "ctx-size": 8192,
+            "extra-args": ["--chat-template-kwargs", '{"reasoning_strength":"high"}'],
+        }
+        plugin_calls = []
+
+        def before_request(payload, model_name, model_cfg):
+            plugin_calls.append((model_name, model_cfg))
+            return payload
+
+        with patch.object(llama_proxy.registry, "resolve", return_value="muse-glimmer-30b-high"), \
+             patch.object(llama_proxy.registry, "get", return_value=requested_cfg), \
+             patch.object(llama_proxy.registry, "get_family_defaults", return_value={}), \
+             patch.object(llama_proxy.plugin_manager, "before_request", side_effect=before_request), \
+             patch.object(llama_proxy.plugin_manager, "before_backend_request", side_effect=lambda p, *a: p), \
+             patch.object(llama_proxy.plugin_manager, "wrap_response_stream", side_effect=lambda s, *a: s), \
+             patch.object(llama_proxy, "get_proxy_client", _FakeClient):
+            response = await llama_proxy._proxy_chat(
+                "muse-glimmer-30b-high",
+                {"messages": [{"role": "user", "content": "ping"}], "stream": False},
+                active,
+            )
+            async for _ in response.body_iterator:
+                pass
+
+        request = _FakeClient.instances[-1].requests[0][0]["json"]
+        self.assertEqual(request["chat_template_kwargs"], {"reasoning_strength": "high"})
+        self.assertEqual(plugin_calls, [("muse-glimmer-30b-high", requested_cfg)])
+
     def test_model_logit_bias_merges_cli_style_defaults(self):
         payload = {"logit_bias": {"262143": 1.0, "5": -2}}
         cfg = {"logit-bias": ["262143+5", "111038-inf", [7, 1.5]]}

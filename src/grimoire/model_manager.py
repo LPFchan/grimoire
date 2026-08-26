@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import ctypes
+import json
 import logging
 import math
 import os
@@ -17,6 +18,11 @@ from typing import Optional
 import httpx
 
 from grimoire import config
+from grimoire.chat_template import (
+    REQUEST_ONLY_TEMPLATE_KWARGS,
+    configured_chat_template_kwargs,
+    split_chat_template_kwargs,
+)
 from grimoire.dflash import PflashDaemon, PrefillConfig
 from grimoire.registry import (
     MODELS_DIR,
@@ -326,22 +332,42 @@ def build_cmd(cfg, port, alias=None):
             mtp_head = _resolve_config_path(cfg.get("mtp-head"))
             if mtp_head and os.path.exists(mtp_head):
                 cmd.extend(["-md", mtp_head])
-        # Remove spec-type from extra-args to avoid duplication
-        cfg["extra-args"] = [a for a in cfg.get("extra-args", []) if a != "--spec-type" and a not in ("nextn", "mtp", "dflash", "draft-mtp", "draft-nextn")]
+    model_extra_args, _ = split_chat_template_kwargs(cfg.get("extra-args", []))
+    if spec_type in ("nextn", "mtp"):
+        model_extra_args = [
+            arg for arg in model_extra_args
+            if arg != "--spec-type" and arg not in ("nextn", "mtp", "dflash", "draft-mtp", "draft-nextn")
+        ]
 
     for bias in cfg.get("logit-bias", []) or []:
         cmd.extend(["--logit-bias", str(bias)])
 
-    for arg in cfg.get("extra-args", []) or []:
+    for arg in model_extra_args:
         cmd.append(str(arg))
 
     family = cfg.get("family")
+    family_defaults = {}
     if family:
-        fd = registry.get_family_defaults(family)
-        for arg in fd.get("extra-args", []) or []:
+        family_defaults = registry.get_family_defaults(family)
+        family_extra_args, _ = split_chat_template_kwargs(family_defaults.get("extra-args", []))
+        for arg in family_extra_args:
             cmd.append(str(arg))
 
+    startup_template_kwargs = configured_chat_template_kwargs(cfg, family_defaults)
+    for key in REQUEST_ONLY_TEMPLATE_KWARGS:
+        startup_template_kwargs.pop(key, None)
+    if startup_template_kwargs:
+        cmd.extend(["--chat-template-kwargs", json.dumps(startup_template_kwargs, separators=(",", ":"))])
+
     return cmd
+
+
+def runtime_command_signature(cfg):
+    """Return the load-affecting llama-server command for alias reuse."""
+    try:
+        return tuple(build_cmd(copy.deepcopy(cfg), port=0, alias="__grimoire_runtime__"))
+    except (FileNotFoundError, KeyError, RuntimeError):
+        return None
 
 
 class ActiveModel:
@@ -702,6 +728,49 @@ class ModelManager:
             return sorted(self.gpu_mask)
         return list(range(self.gpu_count))
 
+    def _compatible_active_entry(self, model_name, cfg=None):
+        direct = self.active.get(model_name)
+        if direct is not None and direct.is_running():
+            return model_name, direct
+
+        cfg = cfg or registry.get(model_name)
+        if not cfg:
+            return None, None
+        _, requested_template_kwargs = split_chat_template_kwargs(cfg.get("extra-args", []))
+        get_family_defaults = getattr(registry, "get_family_defaults", lambda _family: {})
+        family_defaults = get_family_defaults(cfg.get("family"))
+        _, family_template_kwargs = split_chat_template_kwargs(family_defaults.get("extra-args", []))
+        requested_template_kwargs = {**family_template_kwargs, **requested_template_kwargs}
+        signature = runtime_command_signature(cfg)
+        if signature is None:
+            return None, None
+        for active_name, active in self.active.items():
+            if not active.is_running():
+                continue
+            active_cfg = active.cfg
+            _, active_template_kwargs = split_chat_template_kwargs(active_cfg.get("extra-args", []))
+            active_family_defaults = get_family_defaults(active_cfg.get("family"))
+            _, active_family_template_kwargs = split_chat_template_kwargs(
+                active_family_defaults.get("extra-args", [])
+            )
+            active_template_kwargs = {**active_family_template_kwargs, **active_template_kwargs}
+            if not any(
+                key in requested_template_kwargs or key in active_template_kwargs
+                for key in REQUEST_ONLY_TEMPLATE_KWARGS
+            ):
+                continue
+            if any(cfg.get(key) or active_cfg.get(key) for key in ("pflash", "drafter")):
+                continue
+            if (cfg.get("replica_peers") or []) != (active_cfg.get("replica_peers") or []):
+                continue
+            requested_gpu = self.effective_fixed_gpu(model_name)
+            active_gpu = self.effective_fixed_gpu(active_name)
+            if requested_gpu != active_gpu:
+                continue
+            if runtime_command_signature(active_cfg) == signature:
+                return active_name, active
+        return None, None
+
     def _build_route_table(self):
         """Map each running model -> its replica backends for the proxy workers.
 
@@ -736,7 +805,7 @@ class ModelManager:
         return [
             (name, active)
             for name, active in self.active.items()
-            if gpu in getattr(active, "gpus", [active.gpu])
+            if active.is_running() and gpu in getattr(active, "gpus", [active.gpu])
         ]
 
     def _allocate_explicit(self, model_name, cfg):
@@ -1010,14 +1079,19 @@ class ModelManager:
 
     async def _start_model_locked(self, model_name):
         """Locked lifecycle body shared by ordinary starts and runtime reconfiguration."""
-        if model_name in self.active and self.active[model_name].is_running():
-            return self.active[model_name]
-        if model_name in self.active:
+        existing_direct = self.active.get(model_name)
+        if existing_direct is not None:
+            if existing_direct.is_running():
+                return existing_direct
+            await asyncio.to_thread(existing_direct.stop)
             del self.active[model_name]
 
         cfg = self.effective_config(model_name)
         if not cfg:
             raise KeyError(f"Model '{model_name}' not found in registry")
+        _, existing = self._compatible_active_entry(model_name, cfg)
+        if existing is not None:
+            return existing
         valid, reason = registry.validate(model_name, gpu_count=self.gpu_count)
         if not valid:
             raise RuntimeError(reason)
@@ -1078,15 +1152,20 @@ class ModelManager:
         if not resolved_name:
             raise KeyError(f"Model '{model_name}' not found in registry")
         model_name = resolved_name
+        cfg = self.effective_config(model_name)
+        if not cfg:
+            raise KeyError(f"Model '{model_name}' not found in registry")
 
         # Fast path: an already-running model is the common case for proxied
         # traffic. Return it without taking the global lock so high-RPS requests
         # don't serialize through one async critical section. Safe in asyncio:
         # no await between the dict read and is_running(), so it's atomic; the
         # rare not-running case falls through to the locked start path.
-        existing = self.active.get(model_name)
-        if existing is not None and existing.is_running():
-            return existing
+        direct = self.active.get(model_name)
+        if direct is None or direct.is_running():
+            _, existing = self._compatible_active_entry(model_name, cfg)
+            if existing is not None:
+                return existing
 
         async with self._lock:
             if self.preset_lock is not None and not _preset_bypass and not self.preset_allows_manual_control:
@@ -1110,7 +1189,10 @@ class ModelManager:
 
     async def _replace_override_locked(self, model_name, override, *, reload_active, load_unloaded):
         previous = self._runtime_overrides.get(model_name)
-        active = self.get_active(model_name)
+        # Placement overrides belong to one registry entry. A compatible
+        # reasoning alias may share its process for inference, but changing this
+        # alias must never stop or re-key the sibling that owns that process.
+        active = self.active.get(model_name)
         self._pending_overrides[model_name] = override
 
         def commit_override():
@@ -1219,7 +1301,7 @@ class ModelManager:
             if old.gpu_ids is not None and gpu != old.gpu_ids[0]:
                 raise ValueError(f"gpu must equal the sharded placement primary GPU {old.gpu_ids[0]}")
             override = RuntimeModelOverride(old.gpu_ids, old.tensor_split, gpu)
-            active = self.get_active(model_name)
+            active = self.active.get(model_name)
             reload_active = active is not None and (active.gpu != gpu)
             active = await self._replace_override_locked(model_name, override, reload_active=reload_active, load_unloaded=False)
         return active, self.override_metadata(model_name)
@@ -1237,7 +1319,8 @@ class ModelManager:
 
     def get_status(self, model_name):
         """Return router-mode status for a registry entry."""
-        active = self.active.get(model_name)
+        model_name = registry.resolve(model_name) or model_name
+        _, active = self._compatible_active_entry(model_name)
         if not active:
             return config.MODEL_STATUS_UNLOADED
         return active.status
@@ -1251,21 +1334,20 @@ class ModelManager:
                     f"Preset '{self.preset_lock}' is active. "
                     f"Deactivate the preset before manually stopping models."
                 )
-            active = self.active.pop(model_name, None)
+            active_name, active = self._compatible_active_entry(model_name)
             if not active:
                 return False
+            self.active.pop(active_name, None)
             await asyncio.to_thread(active.stop)
-            logger.info(f"Stopped {model_name}")
+            logger.info(f"Stopped {active_name}")
             self._publish_routes()
             return True
 
     def get_active(self, model_name):
         """Get active model info."""
         model_name = registry.resolve(model_name) or model_name
-        active = self.active.get(model_name)
-        if active and active.is_running():
-            return active
-        return None
+        _, active = self._compatible_active_entry(model_name)
+        return active
 
     def list_active(self):
         """List all running active models."""

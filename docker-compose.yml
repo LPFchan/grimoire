@@ -42,7 +42,7 @@ services:
       - STRUCTURED_TOOL_FALLBACK=0
       - TOOL_STRUCTURED_PLAN_TIMEOUT_S=8
       - TOOL_STRUCTURED_PLAN_MAX_TOKENS=192
-      - LLAMA_ARG_CACHE_RAM=2048
+      - LLAMA_ARG_CACHE_RAM=4096
       - LD_LIBRARY_PATH=/opt/atomic:/opt/grimoire-llama-cpp/lib:/opt/grimoire-llama-cpp/lib64
       - GRIMOIRE_TURBOQUANT_LIB_DIR=/opt/atomic
     deploy:

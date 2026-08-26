@@ -269,11 +269,10 @@ async def get_v1_models(request: Request):
     require_api(request)
     manager = _get_manager()
     data = registry.list_metadata()
-    active_names = set(manager.list_active())
     for item in data:
         name = item["id"]
         cfg = registry.get(name) or {}
-        item["active"] = name in active_names
+        item["active"] = manager.get_active(name) is not None
         item["status"] = {"value": manager.get_status(name)}
         item["in_cache"] = True
         # llama backends carry `file`; dflash carries `target`.

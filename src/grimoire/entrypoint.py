@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from grimoire import config
+from grimoire.chat_template import apply_chat_template_kwargs
 from grimoire.auth import (
     require_api,
     require_admin,
@@ -243,6 +244,14 @@ def _history_conversation_id(request, payload):
     return None
 
 
+def _kv_conversation_id(request, history_conversation_id=None):
+    """Return the cache-routing ID without opting the web UI into legacy history recording."""
+    cache_id = request.headers.get("x-grimoire-kv-conversation-id")
+    if isinstance(cache_id, str) and cache_id:
+        return cache_id
+    return history_conversation_id
+
+
 def _validated_history_conversation_id(user_hash, conversation_id):
     if not conversation_id:
         return None
@@ -328,9 +337,19 @@ async def chat_completions(request: Request):
 
     try:
         active = await manager.start_model(model_name)
-        conversation_id = _history_conversation_id(request, payload)
-        conversation_id = _validated_history_conversation_id(user_hash, conversation_id)
-        return await _proxy_chat(requested_model, payload, active, user_hash=user_hash, conversation_id=conversation_id)
+        history_conversation_id = _history_conversation_id(request, payload)
+        history_conversation_id = _validated_history_conversation_id(
+            user_hash, history_conversation_id
+        )
+        conversation_id = _kv_conversation_id(request, history_conversation_id)
+        return await _proxy_chat(
+            requested_model,
+            payload,
+            active,
+            user_hash=user_hash,
+            conversation_id=conversation_id,
+            history_conversation_id=history_conversation_id,
+        )
     except HTTPException:
         raise
     except KeyError as e:
@@ -382,6 +401,12 @@ async def chat_responses(request: Request):
         headers = _backend_request_headers(request.headers)
 
         payload = copy.deepcopy(payload)
+        requested_cfg = registry.get(model_name) or active.cfg
+        payload = apply_chat_template_kwargs(
+            payload,
+            requested_cfg,
+            registry.get_family_defaults(requested_cfg.get("family")),
+        )
         payload["model"] = await active.get_backend_model_id()
         req = client.build_request(
             "POST",
@@ -435,6 +460,13 @@ async def proxy_v1(request: Request, path: str):
 
         if isinstance(payload, dict):
             payload = copy.deepcopy(payload)
+            if isinstance(payload.get("messages"), list):
+                requested_cfg = registry.get(model_name) or active.cfg
+                payload = apply_chat_template_kwargs(
+                    payload,
+                    requested_cfg,
+                    registry.get_family_defaults(requested_cfg.get("family")),
+                )
             payload["model"] = await active.get_backend_model_id()
             req = client.build_request(
                 request.method,

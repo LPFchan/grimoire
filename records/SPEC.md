@@ -3,7 +3,7 @@
 **Project:** Grimoire — Model serving gateway with DFlash/PFlash speculative decoding
 **Canonical repo:** `git@github.com:LPFchan/grimoire.git` (refactor branch)
 **Operator:** LPFchan
-**Last updated:** 2026-05-18
+**Last updated:** 2026-08-27
 
 ## Mission
 
@@ -70,6 +70,13 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 - End-state removes `/opt/dflash` entirely from served runtime image, startup environment, and runtime search path.
 - Any remaining `/opt/dflash` dependency before cutover is temporary migration debt, limited to pre-cutover preservation work.
 - The canonical non-PFlash llama path must be anchored on Bee libraries throughout the migration.
+
+### Contract E: Reasoning-Alias Prompt Cache Reuse
+- Aliases that differ only by request-time `reasoning_effort` or Muse Glimmer `reasoning_strength` share one running llama-server process and KV cache.
+- Replica groups, fixed GPU placement, PFlash/drafter configurations, and unrelated command-equivalent aliases must remain separate.
+- The requested alias's chat-template defaults, plugins, usage attribution, and history attribution apply to each request even when another alias owns the shared process.
+- Each completed web UI turn carries its cache-routing ID in `x-grimoire-kv-conversation-id` and warms the final persisted branch for the next turn. This header stays separate from the legacy history-recording conversation ID. Aborted or empty turns are not warmed.
+- The production llama-server RAM prompt-cache allowance is 4 GiB per process.
 
 ## Pinned Upstream Repos
 

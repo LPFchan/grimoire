@@ -109,6 +109,299 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("--spec-dflash-cross-ctx", cmd)
         self.assertEqual(cmd[cmd.index("--spec-dflash-cross-ctx") + 1], "1024")
 
+    def test_build_cmd_merges_template_kwargs_and_keeps_reasoning_per_request(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(
+            mm_module.registry,
+            "get_family_defaults",
+            return_value={
+                "extra-args": ["--chat-template-kwargs", '{"preserve_thinking":true}']
+            },
+        ):
+            cfg = {
+                "file": model_file.name,
+                "family": "qwen",
+                "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"low"}'],
+            }
+            original = json.loads(json.dumps(cfg))
+            cmd = entrypoint.build_cmd(cfg, port=8001)
+
+        self.assertEqual(cmd.count("--chat-template-kwargs"), 1)
+        kwargs = json.loads(cmd[cmd.index("--chat-template-kwargs") + 1])
+        self.assertEqual(kwargs, {"preserve_thinking": True})
+        self.assertEqual(cfg, original)
+
+    def test_start_model_reuses_command_equivalent_reasoning_alias(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file:
+            configs = {
+                "qwen-xhigh": {
+                    "file": model_file.name,
+                    "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"xhigh"}'],
+                },
+                "qwen-low": {
+                    "file": model_file.name,
+                    "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"low"}'],
+                },
+            }
+
+            class FakeRegistry:
+                def resolve(self, name):
+                    return name if name in configs else None
+
+                def get(self, name):
+                    value = configs.get(name)
+                    return json.loads(json.dumps(value)) if value else None
+
+                def get_family_defaults(self, family):
+                    return {}
+
+                def get_fixed_gpu(self, name):
+                    return None
+
+            class FakeActive:
+                name = "qwen-xhigh"
+                cfg = configs["qwen-xhigh"]
+                status = config.MODEL_STATUS_LOADED
+
+                def is_running(self):
+                    return True
+
+            old_registry = mm_module.registry
+            try:
+                mm_module.registry = FakeRegistry()
+                manager = entrypoint.ModelManager(gpu_count=1)
+                active = FakeActive()
+                manager.active[active.name] = active
+
+                reused = asyncio.run(manager.start_model("qwen-low"))
+
+                self.assertIs(reused, active)
+                self.assertIs(manager.get_active("qwen-low"), active)
+                self.assertEqual(manager.get_status("qwen-low"), config.MODEL_STATUS_LOADED)
+                self.assertEqual(list(manager.active), ["qwen-xhigh"])
+            finally:
+                mm_module.registry = old_registry
+
+    def test_runtime_signature_ignores_muse_reasoning_strength(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(
+            mm_module.registry, "get_family_defaults", return_value={}
+        ):
+            signatures = {
+                mm_module.runtime_command_signature(
+                    {
+                        "file": model_file.name,
+                        "extra-args": [
+                            "--chat-template-kwargs",
+                            json.dumps({"reasoning_strength": strength}),
+                        ],
+                    }
+                )
+                for strength in ("low", "medium", "high", "xhigh")
+            }
+
+        self.assertEqual(len(signatures), 1)
+
+    def test_command_equivalence_does_not_merge_unrelated_aliases_or_replicas(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file:
+            configs = {
+                "plain-a": {"file": model_file.name},
+                "plain-b": {"file": model_file.name},
+                "reasoning-a": {
+                    "file": model_file.name,
+                    "replica_peers": ["reasoning-a-copy"],
+                    "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"low"}'],
+                },
+                "reasoning-b": {
+                    "file": model_file.name,
+                    "replica_peers": ["reasoning-b-copy"],
+                    "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"high"}'],
+                },
+            }
+
+            class FakeRegistry:
+                def get(self, name):
+                    return configs.get(name)
+
+                def get_family_defaults(self, family):
+                    return {}
+
+                def get_fixed_gpu(self, name):
+                    return None
+
+            class FakeActive:
+                def __init__(self, name):
+                    self.name = name
+                    self.cfg = configs[name]
+
+                def is_running(self):
+                    return True
+
+            old_registry = mm_module.registry
+            try:
+                mm_module.registry = FakeRegistry()
+                manager = entrypoint.ModelManager(gpu_count=2)
+                manager.active["plain-a"] = FakeActive("plain-a")
+                self.assertEqual(manager._compatible_active_entry("plain-b"), (None, None))
+
+                manager.active = {"reasoning-a": FakeActive("reasoning-a")}
+                self.assertEqual(manager._compatible_active_entry("reasoning-b"), (None, None))
+            finally:
+                mm_module.registry = old_registry
+
+    def test_concurrent_cold_start_returns_the_same_healthy_backend(self):
+        cfg = {"file": "model.gguf"}
+
+        class FakeRegistry:
+            def resolve(self, name):
+                return name
+
+            def get(self, name):
+                return cfg
+
+            def get_family_defaults(self, family):
+                return {}
+
+            def get_fixed_gpu(self, name):
+                return None
+
+            def validate(self, name, gpu_count=None):
+                return True, "OK"
+
+        class FakeActive:
+            def __init__(self, name, cfg, port, gpu):
+                self.name = name
+                self.cfg = cfg
+                self.port = port
+                self.gpu = gpu.primary
+                self.gpus = gpu.device_ids
+                self.running = False
+                self.stop_calls = 0
+
+            def is_running(self):
+                return self.running
+
+            def stop(self):
+                self.stop_calls += 1
+                self.running = False
+
+        async def scenario():
+            manager = entrypoint.ModelManager(gpu_count=1)
+            started = asyncio.Event()
+            release = asyncio.Event()
+            launches = []
+
+            async def fake_start(active):
+                launches.append(active)
+                started.set()
+                await release.wait()
+                active.running = True
+
+            with patch.object(mm_module, "registry", FakeRegistry()), \
+                 patch.object(mm_module, "ActiveModel", FakeActive), \
+                 patch.object(
+                     manager,
+                     "_allocate_gpu",
+                     return_value=(mm_module.GpuPlacement((0,)), []),
+                 ), \
+                 patch.object(manager, "_find_available_port_excluding", return_value=8001), \
+                 patch.object(manager, "_start_active_model", side_effect=fake_start):
+                first = asyncio.create_task(manager.start_model("model"))
+                await started.wait()
+                second = asyncio.create_task(manager.start_model("model"))
+                await asyncio.sleep(0)
+                release.set()
+                results = await asyncio.gather(first, second)
+
+            return results, launches
+
+        results, launches = asyncio.run(scenario())
+        self.assertIs(results[0], results[1])
+        self.assertTrue(results[0].is_running())
+        self.assertEqual(results[0].stop_calls, 0)
+        self.assertEqual(len(launches), 1)
+
+    def test_webui_cache_id_does_not_enable_legacy_history_recording(self):
+        request = FakeRequest(headers={"x-grimoire-kv-conversation-id": "conv-cache"})
+        payload = {"messages": []}
+
+        history_id = entrypoint._history_conversation_id(request, payload)
+
+        self.assertIsNone(history_id)
+        self.assertEqual(entrypoint._kv_conversation_id(request, history_id), "conv-cache")
+
+    def test_legacy_history_id_still_doubles_as_cache_id(self):
+        request = FakeRequest()
+        payload = {"conversation_id": "conv-history"}
+
+        history_id = entrypoint._history_conversation_id(request, payload)
+
+        self.assertEqual(history_id, "conv-history")
+        self.assertEqual(entrypoint._kv_conversation_id(request, history_id), "conv-history")
+
+    def test_pinning_shared_alias_does_not_stop_process_owner(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file:
+            configs = {
+                "reasoning-base": {
+                    "file": model_file.name,
+                    "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"high"}'],
+                },
+                "reasoning-low": {
+                    "file": model_file.name,
+                    "extra-args": ["--chat-template-kwargs", '{"reasoning_effort":"low"}'],
+                },
+            }
+
+            class FakeRegistry:
+                def resolve(self, name):
+                    return name if name in configs else None
+
+                def get(self, name):
+                    return configs.get(name)
+
+                def get_family_defaults(self, family):
+                    return {}
+
+                def get_fixed_gpu(self, name):
+                    return None
+
+                def is_fixed(self, name):
+                    return False
+
+            class FakeActive:
+                name = "reasoning-base"
+                cfg = configs[name]
+                gpu = 0
+                gpus = (0,)
+                status = config.MODEL_STATUS_LOADED
+
+                def __init__(self):
+                    self.running = True
+                    self.stop_calls = 0
+
+                def is_running(self):
+                    return self.running
+
+                def stop(self):
+                    self.stop_calls += 1
+                    self.running = False
+
+            with patch.object(mm_module, "registry", FakeRegistry()):
+                manager = entrypoint.ModelManager(gpu_count=2)
+                owner = FakeActive()
+                manager.active[owner.name] = owner
+                self.assertIs(manager.get_active("reasoning-low"), owner)
+
+                active, metadata = asyncio.run(manager.pin_model("reasoning-low", 1))
+
+                self.assertIsNone(active)
+                self.assertIsNone(metadata["gpu"])
+                self.assertEqual(metadata["pinned_gpu"], 1)
+                self.assertEqual(owner.stop_calls, 0)
+                self.assertTrue(owner.is_running())
+                self.assertEqual(list(manager.active), ["reasoning-base"])
+
+                owner.running = False
+                self.assertEqual(manager._incumbents_on(0), [])
+
     def test_proxy_headers_strip_credentials_and_hop_by_hop_headers(self):
         headers = entrypoint._backend_request_headers({
             "authorization": "Bearer secret",
