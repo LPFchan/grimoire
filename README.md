@@ -77,6 +77,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 - The first `gpu-ids` member is the primary physical GPU reported by the backward-compatible `gpu` field. llama.cpp defaults to layer splitting; `extra-args` may set `--tensor-split` proportions in the same visible-device order.
 - `gpu-ids` is initially incompatible with `cpu-only`, `vram-budget-mib`, PFlash, park/unpark, and native DFlash models
 - `fixed` — alias → GPU ID (pinned, never evicted); for a model with `gpu-ids`, the fixed ID must equal the first member
+- `predict` — maximum generated tokens passed to llama-server; `-1` means no separate output cap, so generation is limited by the model context and stop conditions
 
 Temporary runtime controls are available through admin-authenticated POST requests. They live only in manager memory, never change the registry or preset state, and clear on restart:
 

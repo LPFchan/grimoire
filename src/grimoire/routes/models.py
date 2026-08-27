@@ -193,8 +193,18 @@ def _validate_model_config(data: dict, gpu_count=None) -> None:
                   "image-min-tokens", "image-max-tokens", "vram-budget-mib"):
         val = data.get(field)
         # bool is an int subclass; reject it so `true` isn't read as 1.
-        if val is not None and (isinstance(val, bool) or not isinstance(val, int) or val <= 0):
-            raise HTTPException(status_code=400, detail=f"'{field}' must be a positive integer")
+        if val is not None:
+            if isinstance(val, bool) or not isinstance(val, int):
+                message = "'predict' must be -1 or a positive integer" if field == "predict" else f"'{field}' must be a positive integer"
+                raise HTTPException(status_code=400, detail=message)
+            if field == "predict":
+                invalid_value = val != -1 and val <= 0
+                message = "'predict' must be -1 or a positive integer"
+            else:
+                invalid_value = val <= 0
+                message = f"'{field}' must be a positive integer"
+            if invalid_value:
+                raise HTTPException(status_code=400, detail=message)
     for field in ("cache-type-k", "cache-type-v"):
         val = data.get(field)
         if val is not None and val not in ("q8_0", "q4_0", "turbo4", "f16"):

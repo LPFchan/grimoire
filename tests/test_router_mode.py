@@ -175,6 +175,89 @@ class RouterModeContractTests(unittest.TestCase):
         response = self.client.post("/models/load", json={}, headers=self.auth)
         self.assertEqual(response.status_code, 400)
 
+    def test_registry_predict_accepts_unlimited_sentinel_and_positive_values(self):
+        class FakeRegistry:
+            def __init__(self):
+                self.added = None
+
+            def get_fixed_gpu(self, _name):
+                return None
+
+            def add(self, name, data):
+                self.added = (name, data)
+                return data
+
+            def validate(self, _name, gpu_count=None):
+                return True, "OK"
+
+        for value in (-1, 1, 16384):
+            fake_registry = FakeRegistry()
+            with patch.object(models_routes, "registry", fake_registry):
+                response = self.client.put(
+                    "/registry/model/output-limit-validation",
+                    json={"file": "model.gguf", "predict": value},
+                    headers=self.auth,
+                )
+            self.assertEqual(response.status_code, 201, value)
+            self.assertEqual(fake_registry.added[1]["predict"], value)
+
+    def test_registry_predict_rejects_non_positive_and_non_integer_values(self):
+        for value in (0, -2, True, 1.0, "1"):
+            class FakeRegistry:
+                added = False
+
+                def get_fixed_gpu(self, _name):
+                    return None
+
+                def add(self, _name, _data):
+                    self.added = True
+                    return {}
+
+                def validate(self, _name, gpu_count=None):
+                    return True, "OK"
+
+            fake_registry = FakeRegistry()
+            with patch.object(models_routes, "registry", fake_registry):
+                response = self.client.put(
+                    "/registry/model/output-limit-validation",
+                    json={"file": "model.gguf", "predict": value},
+                    headers=self.auth,
+                )
+            self.assertEqual(response.status_code, 400, value)
+            self.assertIn("predict", response.json()["detail"])
+            self.assertFalse(fake_registry.added, value)
+
+    def test_registry_other_integer_fields_remain_positive_only(self):
+        fields = (
+            "ctx-size", "parallel", "n-gpu-layers", "image-min-tokens",
+            "image-max-tokens", "vram-budget-mib",
+        )
+        for field in fields:
+            for value in (-1, 0):
+                class FakeRegistry:
+                    added = False
+
+                    def get_fixed_gpu(self, _name):
+                        return None
+
+                    def add(self, _name, _data):
+                        self.added = True
+                        return {}
+
+                    def validate(self, _name, gpu_count=None):
+                        return True, "OK"
+
+                fake_registry = FakeRegistry()
+                with patch.object(models_routes, "registry", fake_registry):
+                    response = self.client.put(
+                        "/registry/model/output-limit-validation",
+                        json={"file": "model.gguf", field: value},
+                        headers=self.auth,
+                    )
+                self.assertEqual(response.status_code, 400, (field, value))
+                self.assertIn(field, response.json()["detail"])
+                self.assertFalse(fake_registry.added, (field, value))
+
     def test_models_unload_calls_stop_with_payload_model(self):
         called = {}
 
