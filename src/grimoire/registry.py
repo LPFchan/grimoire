@@ -12,6 +12,7 @@ from threading import RLock
 from typing import Optional
 
 from grimoire import config
+from grimoire.chat_template import configured_reasoning_capability
 
 logger = logging.getLogger(__name__)
 
@@ -624,6 +625,16 @@ class ModelRegistry:
         cfg = self.get(model_name)
         if not cfg:
             return None
+        capabilities = cfg.get("capabilities", ["completion"])
+        if isinstance(capabilities, (list, tuple, set)):
+            capability_names = {
+                value.lower()
+                for value in capabilities
+                if isinstance(value, str)
+            }
+        else:
+            capability_names = set()
+        family_defaults = self.get_family_defaults(cfg.get("family"))
         return {
             "id": model_name,
             "object": "model",
@@ -632,7 +643,12 @@ class ModelRegistry:
             "context": cfg.get("ctx-size"),
             "output": cfg.get("predict"),
             "family": cfg.get("family"),
-            "capabilities": cfg.get("capabilities", ["completion"]),
+            "capabilities": capabilities,
+            "input_modalities": [
+                "text",
+                "image",
+            ] if {"multimodal", "vision"} & capability_names else ["text"],
+            "reasoning": configured_reasoning_capability(cfg, family_defaults),
             "cost": cfg.get("cost", {"input": 0, "output": 0}),
             "backend": _get_backend(cfg),
             "pinned_gpu": self.get_fixed_gpu(model_name),

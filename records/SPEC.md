@@ -78,6 +78,17 @@ These decisions were locked before Phase 1 and are not subject to renegotiation 
 - Each completed web UI turn carries its cache-routing ID in `x-grimoire-kv-conversation-id` and warms the final persisted branch for the next turn. Cache keys are scoped by running model and authenticated user, and the warm request uses the same context compaction as a real turn. This header stays separate from the legacy history-recording conversation ID; warm-only requests do not count toward usage. Aborted or empty turns are not warmed.
 - The production llama-server RAM prompt-cache allowance is 4 GiB per process.
 
+### Contract F: Public Capability Metadata
+- `GET /v1/models` preserves the registry's `capabilities` field and adds
+  `input_modalities`: `["text", "image"]` for multimodal/vision aliases and
+  `["text"]` for other aliases.
+- Reasoning aliases advertise their configured native request-only level in
+  `reasoning.supported_efforts`, `reasoning.default_effort`,
+  `reasoning.default_enabled`, and `reasoning.mandatory`. An alias without a
+  reasoning kwarg advertises `reasoning.supported: false`.
+- Malformed or conflicting reasoning kwargs produce an empty reasoning object;
+  the gateway does not infer a level from an alias name or from another model.
+
 ## Pinned Upstream Repos
 
 | Repo | URL | SHA |

@@ -181,6 +181,11 @@ Legacy import (`GRIMOIRE_LEGACY_STATS_PATH=/path/to/token-stats.json`) is idempo
 
 Forked llama.cpp SvelteKit webui at `https://chat.lost.plus/` (submodule at `webui/`). Router-mode API: `GET /props`, `GET /v1/models`, `POST /models/load`, `POST /models/unload`.
 
+`GET /v1/models` includes registry capabilities plus `input_modalities` and
+the configured native reasoning advertisement. Multimodal aliases advertise
+`["text", "image"]`; aliases without a configured reasoning kwarg advertise
+reasoning as unsupported. Native alias levels are kept verbatim.
+
 `GRIMOIRE_WEBUI_DIR` overrides asset path.
 
 ### Server-Side History

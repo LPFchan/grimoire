@@ -116,6 +116,17 @@ class RouterModeContractTests(unittest.TestCase):
                 entrypoint.MODEL_STATUS_FAILED,
             })
 
+    def test_v1_models_includes_registry_capability_metadata(self):
+        response = self.client.get("/v1/models", headers=self.auth)
+        self.assertEqual(response.status_code, 200)
+        for entry in response.json()["data"]:
+            self.assertIn("input_modalities", entry)
+            capabilities = entry.get("capabilities", [])
+            expected = ["text", "image"] if {"multimodal", "vision"} & set(capabilities) else ["text"]
+            self.assertEqual(entry["input_modalities"], expected)
+            self.assertIn("reasoning", entry)
+            self.assertIsInstance(entry["reasoning"], dict)
+
     def test_v1_models_marks_active_model_as_loaded(self):
         registry_aliases = entrypoint.registry.list_all()
         if not registry_aliases:
