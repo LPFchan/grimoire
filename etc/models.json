@@ -293,10 +293,824 @@
         "--ubatch-size",
         "4096"
       ]
+    },
+    "eastself-bprime-ck3500-eos": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck3500-eos-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 4096,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck3500-eos-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-03T19:08:39.193419+00:00"
+    },
+    "eastself-bprime-ck3250-regen": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck3250-regen-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck3250-regen-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-04T05:31:42.357871+00:00"
+    },
+    "eastself-bprime-ck1250-nr025": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck1250-nr025-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck1250-nr025-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-04T10:56:42.218102+00:00"
+    },
+    "eastself-bprime-ck9250": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck9250-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck9250-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-05T05:50:59.767053+00:00"
+    },
+    "eastself-bprime-ck1750-outputfix": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck1750-outputfix-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck1750-outputfix-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-05T16:57:02.837667+00:00"
+    },
+    "eastself-bprime-ck9000-outputfix": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck9000-outputfix-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck9000-outputfix-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-06T09:47:57.795927+00:00"
+    },
+    "eastself-bprime-ck7750-guarded": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck7750-guarded-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck7750-guarded-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-07T09:30:40.475619+00:00"
+    },
+    "eastself-bprime-ck9250-midpoint": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck9250-midpoint-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck9250-midpoint-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-08T13:27:22.690315+00:00"
+    },
+    "eastself-bprime-ck17972-final": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck17972-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck17972-final-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-09T10:01:24.656476+00:00"
+    },
+    "eastself-bprime-ck1000-thinned": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck1000-thinned-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck1000-thinned-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-11T07:45:29.076930+00:00"
+    },
+    "eastself-bprime-ck500-thinned": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck500-thinned-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck500-thinned-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-11T12:41:39.943987+00:00"
+    },
+    "eastself-bprime-ck250-dec4": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck250-dec4-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck250-dec4-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-11T15:11:50.947357+00:00"
+    },
+    "eastself-bprime-ck1500-dec4": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck1500-dec4-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck1500-dec4-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-11T21:43:32.230440+00:00"
+    },
+    "eastself-bprime-ck1750-dec4": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck1750-dec4-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck1750-dec4-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-11T23:08:24.687518+00:00"
+    },
+    "eastself-bprime-ck750-120k": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck750-120k-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck750-120k-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-13T11:22:30.893697+00:00"
+    },
+    "eastself-bprime-ck2000-120k": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck2000-120k-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck2000-120k-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-13T19:32:07.590047+00:00"
+    },
+    "eastself-bprime-ck3749-120k-final": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-ck3749-120k-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-ck3749-120k-final-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-14T06:37:00.671320+00:00"
+    },
+    "eastself-gemma4-12b-experiment-lora": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-experiment-lora-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-gemma4-12b-experiment-lora-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-15T03:43:14.525959+00:00"
+    },
+    "eastself-gemma4-12b-dec20260718-v2": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-dec20260718-v2-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-gemma4-12b-dec20260718-v2-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-19T08:36:31.088696+00:00"
+    },
+    "eastself-bprime-dec20260718": {
+      "file": "gguf/gemma-4-31B_q4_0-it-eastself-bprime-dec20260718-tokenizer.gguf",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-bprime-dec20260718-lora-tokenrep.gguf"
+      ],
+      "added": "2026-07-19T19:15:24.606224+00:00",
+      "mmproj": "gguf/gemma4-mmproj-BF16.gguf"
+    },
+    "muse-glimmer-30b-low": {
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "cache_read": 0.1,
+        "input": 0.33,
+        "output": 3.25
+      },
+      "ctx-size": 131072,
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_strength\":\"low\"}"
+      ],
+      "family": "muse",
+      "file": "gguf/muse-glimmer-30B-kquant-17gb.gguf",
+      "image-max-tokens": 4096,
+      "image-min-tokens": 512,
+      "mmproj": "gguf/mmproj-kquant.gguf",
+      "n-gpu-layers": 999,
+      "parallel": 1,
+      "predict": -1
+    },
+    "muse-glimmer-30b-medium": {
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "cache_read": 0.1,
+        "input": 0.33,
+        "output": 3.25
+      },
+      "ctx-size": 131072,
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_strength\":\"medium\"}"
+      ],
+      "family": "muse",
+      "file": "gguf/muse-glimmer-30B-kquant-17gb.gguf",
+      "image-max-tokens": 4096,
+      "image-min-tokens": 512,
+      "mmproj": "gguf/mmproj-kquant.gguf",
+      "n-gpu-layers": 999,
+      "parallel": 1,
+      "predict": -1
+    },
+    "muse-glimmer-30b-high": {
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "cache_read": 0.1,
+        "input": 0.33,
+        "output": 3.25
+      },
+      "ctx-size": 131072,
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_strength\":\"high\"}"
+      ],
+      "family": "muse",
+      "file": "gguf/muse-glimmer-30B-kquant-17gb.gguf",
+      "image-max-tokens": 4096,
+      "image-min-tokens": 512,
+      "mmproj": "gguf/mmproj-kquant.gguf",
+      "n-gpu-layers": 999,
+      "parallel": 1,
+      "predict": -1
+    },
+    "muse-glimmer-30b-xhigh": {
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "cache_read": 0.1,
+        "input": 0.33,
+        "output": 3.25
+      },
+      "ctx-size": 131072,
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_strength\":\"xhigh\"}"
+      ],
+      "family": "muse",
+      "file": "gguf/muse-glimmer-30B-kquant-17gb.gguf",
+      "image-max-tokens": 4096,
+      "image-min-tokens": 512,
+      "mmproj": "gguf/mmproj-kquant.gguf",
+      "n-gpu-layers": 999,
+      "parallel": 1,
+      "predict": -1
+    },
+    "qwen3.8-27B": {
+      "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-BF16.gguf",
+      "ctx-size": 200000,
+      "added": "2026-08-27T04:02:46.144859+00:00",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": []
+    },
+    "qwen3.8-27B-low": {
+      "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 200000,
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"low\"}"
+      ],
+      "added": "2026-08-27T04:02:46.158157+00:00"
+    },
+    "qwen3.8-27B-medium": {
+      "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 200000,
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"medium\"}"
+      ],
+      "added": "2026-08-27T04:02:46.170775+00:00"
+    },
+    "qwen3.8-27B-xhigh": {
+      "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 200000,
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": [
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"xhigh\"}"
+      ],
+      "added": "2026-08-27T04:02:46.186967+00:00"
+    },
+    "gemma-4-12b-it-qat-q4_0": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [],
+      "added": "2026-08-27T04:07:38.596447+00:00"
+    },
+    "eastself-gemma4-12b-sft-final": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf"
+      ],
+      "added": "2026-08-27T04:07:38.612493+00:00"
+    },
+    "eastself-gemma4-12b-rl06-comparator": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [],
+      "added": "2026-08-27T04:07:38.623155+00:00"
+    },
+    "eastself-gemma4-12b-rft-marie-bilingual-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-rft-marie-bilingual-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.637026+00:00"
+    },
+    "eastself-gemma4-12b-rft-marie-diagnostic-step1-v2": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-rft-marie-diagnostic-step1-v2-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.650491+00:00"
+    },
+    "eastself-gemma4-12b-rft-marie-memory-positive-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-rft-marie-memory-positive-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.664937+00:00"
+    },
+    "eastself-gemma4-12b-rft-stage0-source-memory-v5-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-rft-stage0-source-memory-v5-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.679657+00:00"
+    },
+    "eastself-gemma4-12b-dpo-stage0-v1-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-dpo-stage0-v1-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.694599+00:00"
+    },
+    "eastself-gemma4-12b-distributional-reward-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-distributional-reward-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.710027+00:00"
+    },
+    "eastself-gemma4-12b-online-reward-k5-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-online-reward-k5-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-27T04:07:38.724990+00:00"
     }
   },
   "fixed": {
-    "eastself-reranker-0.6B-g1": 1
+    "eastself-embedder-0.6B": 0,
+    "eastself-reranker-0.6B": 0
   },
   "family_defaults": {
     "qwen": {
