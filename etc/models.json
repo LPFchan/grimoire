@@ -775,8 +775,6 @@
       "mmproj": "gguf/mmproj-BF16.gguf",
       "ctx-size": 200000,
       "added": "2026-08-27T04:02:46.144859+00:00",
-      "speculative-type": "mtp",
-      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",
@@ -799,8 +797,6 @@
     "qwen3.8-27B-low": {
       "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
-      "speculative-type": "mtp",
-      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",
@@ -828,8 +824,6 @@
     "qwen3.8-27B-medium": {
       "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
-      "speculative-type": "mtp",
-      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",
@@ -857,8 +851,6 @@
     "qwen3.8-27B-xhigh": {
       "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
-      "speculative-type": "mtp",
-      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",

@@ -4,24 +4,13 @@
 
 Single Bee binary (`Anbeeld/beellama.cpp`) serves DFlash (`--spec-type dflash`), PFlash (via standalone `pflash_daemon`), and normal traffic. Content-hash KV caching provides cross-conversation sysprompt reuse. Legacy `backend:dflash` daemon retired. See git history for the completed migration (Phases 1-7).
 
-## Atomic CUDA FA V2 (active)
+## CUDA Flash-Attention Scratch (deployed baseline)
 
-Source of truth: `records/research/RSH-20260523-001-cuda-vmm-pool-oom-agentic-crash.md` §Patch V2 Authoritative Plan. Target: `AtomicBot-ai/atomic-llama-cpp-turboquant` @ `0a635dcd92ba66c75fccfef91c3e106f4668f367`. Goal: remove K/V f16 FA scratch from the VMM pool in a way that is safe under CUDA graph capture/replay and under concurrent target/MTP host-thread submission, so `GGML_CUDA_GRAPHS=ON` can be re-enabled and MTP/NextN can stay active without VMM `cuMemCreate` OOM aborts.
+The May Atomic V2 work was retired when Grimoire migrated to the current TheTom engine fork. The current build ports scoped CUDA flash-attention K/V scratch allocation to the pinned engine and keeps CUDA graphs off. Qwen3.8-27B keeps its BF16 vision projector and 200k turbo4 KV cache, but does not load the MTP head: the head's measured 2.7 GiB cost left too little room for real long-context tool use.
 
-Phases (dependency order; each closes with a `LOG-*` commit):
+The evidence, incident audit, synthetic boundaries, and real OpenCode compaction soak are recorded in `records/research/RSH-20260828-001-qwen38-long-context-crash.md`.
 
-| Phase | Scope | Sections | Files |
-| --- | --- | --- | --- |
-| V2-1 | Foundational state + lock | §1, §8 | `common.cuh` |
-| V2-2 | Sizing helper | §2 | `fattn.cuh`, `fattn.cu`, `fattn-common.cuh` |
-| V2-3 | Destructor explicit teardown + retired-list drain | §6, §3 step 1 | `ggml-cuda.cu`, `common.cuh` |
-| V2-4 | Compute path: reservation, borrower, recoverable failure, step 5 invalidation | §3, §4, §5 | `ggml-cuda.cu`, `fattn-common.cuh` |
-| V2-5 | Stream-slot predictor + `graph_optimize` lock | §7, §8 | `ggml-cuda.cu` |
-| V2-6 | Debug instrumentation: failure-injection hook, sizing-vs-actual drift assert, predictor drift assert | Validation Requirements | `common.cuh`, `fattn.cu`, `ggml-cuda.cu` |
-
-**Phases V2-1 through V2-6 complete 2026-05-25.** Shipped 2026-05-26 as the Dockerfile default for `grimoire:local` (stacked with `0004-pool-flush-on-oom.patch`). The shipping decision, bench data, upstream survey, and V2-era follow-ups all live in `records/research/RSH-20260526-003-v2-on-shipping-decision.md`. Live deployment pending a `docker compose up -d --build --force-recreate grimoire`.
-
-V3 (adaptive scratch lifetime + recoverable VMM pool + capture-failure self-heal) designed in `records/research/RSH-20260526-002-v3-adaptive-fa-scratch.md` and **deferred** per the RSH-20260526-003 verdict.
+A graph-safe reusable scratch reservation remains optional future work. Revisit it only if CUDA-graph or MTP throughput becomes more valuable than the currently verified long-agent-context headroom.
 
 ## Backlog (Future Interest)
 
