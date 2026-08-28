@@ -770,33 +770,11 @@
       "parallel": 1,
       "predict": -1
     },
-    "qwen3.8-27B": {
-      "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
-      "mmproj": "gguf/mmproj-BF16.gguf",
-      "ctx-size": 200000,
-      "added": "2026-08-27T04:02:46.144859+00:00",
-      "family": "qwen",
-      "capabilities": [
-        "completion",
-        "multimodal"
-      ],
-      "cost": {
-        "input": 0.33,
-        "output": 3.25,
-        "cache_read": 0.1
-      },
-      "predict": -1,
-      "parallel": 1,
-      "n-gpu-layers": 999,
-      "image-min-tokens": 1024,
-      "image-max-tokens": 1024,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4",
-      "extra-args": []
-    },
     "qwen3.8-27B-low": {
       "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",
@@ -807,7 +785,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 200000,
+      "ctx-size": 131072,
       "predict": -1,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -824,6 +802,8 @@
     "qwen3.8-27B-medium": {
       "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",
@@ -834,7 +814,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 200000,
+      "ctx-size": 131072,
       "predict": -1,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -851,6 +831,8 @@
     "qwen3.8-27B-xhigh": {
       "file": "gguf/Qwen3.8-27B-Q4_K_M.gguf",
       "mmproj": "gguf/mmproj-BF16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/mtp-Qwen3.8-27B-Q4_0.gguf",
       "family": "qwen",
       "capabilities": [
         "completion",
@@ -861,7 +843,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 200000,
+      "ctx-size": 131072,
       "predict": -1,
       "parallel": 1,
       "n-gpu-layers": 999,

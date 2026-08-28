@@ -6,11 +6,11 @@ Single Bee binary (`Anbeeld/beellama.cpp`) serves DFlash (`--spec-type dflash`),
 
 ## CUDA Flash-Attention Scratch (deployed baseline)
 
-The May Atomic V2 work was retired when Grimoire migrated to the current TheTom engine fork. The current build ports scoped CUDA flash-attention K/V scratch allocation to the pinned engine and keeps CUDA graphs off. Qwen3.8-27B keeps its BF16 vision projector and 200k turbo4 KV cache, but does not load the MTP head: the head's measured 2.7 GiB cost left too little room for real long-context tool use.
+The May Atomic V2 work was retired when Grimoire migrated to the current TheTom engine fork. The current build ports scoped CUDA flash-attention K/V scratch allocation to the pinned engine and keeps CUDA graphs off. Qwen3.8-27B reasoning aliases use the BF16 vision projector, MTP head, and a 131,072-token context. This is the largest tested configuration that preserves enough working memory for repeated near-limit multimodal requests and a real OpenCode compaction cycle.
 
 The evidence, incident audit, synthetic boundaries, and real OpenCode compaction soak are recorded in `records/research/RSH-20260828-001-qwen38-long-context-crash.md`.
 
-A graph-safe reusable scratch reservation remains optional future work. Revisit it only if CUDA-graph or MTP throughput becomes more valuable than the currently verified long-agent-context headroom.
+A graph-safe reusable scratch reservation remains optional future work. Revisit it only if CUDA-graph throughput becomes more valuable than the currently verified long-agent-context headroom.
 
 ## Backlog (Future Interest)
 
