@@ -6,9 +6,9 @@ Single Bee binary (`Anbeeld/beellama.cpp`) serves DFlash (`--spec-type dflash`),
 
 ## CUDA Flash-Attention Scratch (deployed baseline)
 
-The May Atomic V2 work was retired when Grimoire migrated to the current TheTom engine fork. The current build ports scoped CUDA flash-attention K/V scratch allocation to the pinned engine and keeps CUDA graphs off. Qwen3.8-27B reasoning aliases use a 190,000-token context, a physical prompt batch of 128, the BF16 vision projector on GPU, the MTP head on GPU, and symmetric turbo4 K/V. This configuration preserves fast GPU image preprocessing while retaining tested long-context headroom on one RTX 3090.
+The May Atomic V2 work was retired when Grimoire migrated to the current TheTom engine fork. The current build ports scoped CUDA flash-attention K/V scratch allocation to the pinned engine and keeps CUDA graphs off. Qwen3.8-27B reasoning aliases use a 237,568-token context, a physical prompt batch of 128, the BF16 vision projector on CPU, the MTP head on GPU, and symmetric turbo4 K/V. This configuration maximizes the repeatedly tested long-context boundary on one RTX 3090 while retaining vision and MTP.
 
-The incident audit and OpenCode soak are recorded in `records/research/RSH-20260828-001-qwen38-long-context-crash.md`. The GPU-projector boundary tests are recorded in `records/research/RSH-20260829-001-qwen38-gpu-mmproj-190k.md`.
+The incident audit and OpenCode soak are recorded in `records/research/RSH-20260828-001-qwen38-long-context-crash.md`. The GPU-projector boundary tests are recorded in `records/research/RSH-20260829-001-qwen38-gpu-mmproj-190k.md`. The CPU-projector maximum boundary is recorded in `records/research/RSH-20260829-002-qwen38-cpu-mmproj-237k.md`.
 
 A graph-safe reusable scratch reservation remains optional future work. Revisit it only if CUDA-graph throughput becomes more valuable than the currently verified long-agent-context headroom.
 
