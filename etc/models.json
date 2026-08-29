@@ -808,7 +808,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 200000,
+      "ctx-size": 190000,
       "predict": -1,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -817,7 +817,8 @@
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4",
       "extra-args": [
-        "--no-mmproj-offload",
+        "--ubatch-size",
+        "128",
         "--chat-template-kwargs",
         "{\"reasoning_effort\":\"low\"}"
       ],
@@ -838,7 +839,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 200000,
+      "ctx-size": 190000,
       "predict": -1,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -847,7 +848,8 @@
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4",
       "extra-args": [
-        "--no-mmproj-offload",
+        "--ubatch-size",
+        "128",
         "--chat-template-kwargs",
         "{\"reasoning_effort\":\"medium\"}"
       ],
@@ -868,7 +870,7 @@
         "output": 3.25,
         "cache_read": 0.1
       },
-      "ctx-size": 200000,
+      "ctx-size": 190000,
       "predict": -1,
       "parallel": 1,
       "n-gpu-layers": 999,
@@ -877,7 +879,8 @@
       "cache-type-k": "turbo4",
       "cache-type-v": "turbo4",
       "extra-args": [
-        "--no-mmproj-offload",
+        "--ubatch-size",
+        "128",
         "--chat-template-kwargs",
         "{\"reasoning_effort\":\"xhigh\"}"
       ],
