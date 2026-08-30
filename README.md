@@ -190,12 +190,32 @@ its origin or the browser will not release the response. Set it to
 
 ### Telemetry storage
 
-`state/telemetry.sqlite3` keeps raw samples every 5s plus a per-minute rollup
-(`system_rollup`, storing sum and count). Windows an hour or wider read the
-rollup; shorter windows read raw. The dashboard only draws 60 points, so this
-costs no visible resolution and takes the lifetime window from ~15s of scanning
-to under a second. Payloads are built on a worker thread and cached for a
-fraction of one bin, so `/stats` can never stall the chat event loop.
+`state/telemetry.sqlite3` keeps raw samples every 5s plus a tiered rollup
+(`system_rollup`, storing sum and count per bucket) at 60s and 3600s. Each query
+reads the coarsest tier whose buckets divide its bins evenly, falling back
+through finer tiers and finally raw samples for the newest stretch not yet
+folded up. The dashboard only draws 60 points, so this costs no visible
+resolution — and because bins and buckets nest, the aggregate reproduces the raw
+averages exactly.
+
+Payloads are built on a worker thread and cached for a fraction of one bin, so
+`/stats` can never stall the chat event loop.
+
+Full render, 15 series, on a 1.3 GB / 18.3M row database:
+
+| Window | Tier | Time |
+| --- | --- | --- |
+| 5m, 15m | raw | ~5 ms |
+| 1h, 6h, 24h | 60s | 4–11 ms |
+| 7d | 60s | 45 ms |
+| 30d | 3600s | 9 ms |
+| all | 3600s | 18 ms (was 15,310 ms) |
+
+7d stays on the per-minute tier deliberately: its bins are 2.8 hours, which the
+hourly bucket does not divide evenly, so using it would smear values across bin
+edges. The lifetime window has no natural alignment at all, so the endpoint
+widens it until its bins are a whole number of hours — the graph starts slightly
+before the first sample, and in exchange stays exact.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |

@@ -1,6 +1,7 @@
 """Dashboard and stats route handlers (/stats/*)."""
 
 import asyncio
+import math
 import time
 from datetime import datetime, timezone
 from threading import Lock
@@ -9,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from grimoire.auth import require_api, require_admin
 from grimoire.config import DASHBOARD_WINDOWS_S, DASHBOARD_BINS
-from grimoire.telemetry import telemetry_store
+from grimoire.telemetry import ROLLUP_TIERS, telemetry_store
 from grimoire.usage import usage_store
 
 router = APIRouter()
@@ -52,6 +53,21 @@ def _cache_put(key, payload, ttl):
                 del _cache[stale]
 
 
+def _snap_lifetime_start(ts_from, ts_to, bins):
+    """Widen the lifetime window until its bins are a whole number of buckets.
+
+    Every fixed window already divides evenly by the rollup bucket, so its bins
+    and buckets nest and the aggregate is exact. The lifetime window starts at
+    whenever the first sample happened to land, so it divides evenly by nothing —
+    buckets straddle bin edges and values drift by a couple of percent of full
+    scale. Rounding the bin width up to a whole bucket restores exactness; the
+    cost is that the graph starts a little before the first sample.
+    """
+    coarsest = ROLLUP_TIERS[-1]
+    bin_width = math.ceil((ts_to - ts_from) / bins / coarsest) * coarsest
+    return ts_to - bin_width * bins
+
+
 def _get_manager():
     from grimoire.entrypoint import manager
     return manager
@@ -81,6 +97,7 @@ def _build_dashboard_payload(user_hash, window):
         ts_from = min(candidates) if candidates else now_ts - DASHBOARD_WINDOWS_S["1h"]
         if ts_from >= now_ts:
             ts_from = now_ts - DASHBOARD_WINDOWS_S["1h"]
+        ts_from = _snap_lifetime_start(ts_from, now_ts, DASHBOARD_BINS)
         window_label = "all"
     else:
         seconds = DASHBOARD_WINDOWS_S.get(window)

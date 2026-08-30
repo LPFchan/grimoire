@@ -42,12 +42,23 @@ SAMPLE_INTERVAL_S = float(os.environ.get("GRIMOIRE_TELEMETRY_INTERVAL_S", "5"))
 RETENTION_DAYS = int(os.environ.get("GRIMOIRE_TELEMETRY_RETENTION_DAYS", "0"))
 DEFAULT_BINS = 60
 
-# Rollup bucket width. 60s over 60 bins means any window of an hour or more is
-# served from the rollup.
-ROLLUP_BUCKET_S = 60
-# Rows of raw samples folded per backfill pass, so the first run against a large
-# existing database makes progress without holding the write lock for minutes.
-ROLLUP_BACKFILL_CHUNK_S = 6 * 3600
+# Rollup tiers, finest first. Each tier is built from the one before it, so the
+# hourly tier costs almost nothing to maintain once the per-minute tier exists.
+# Two tiers cover the whole window range: per-minute nests exactly into every
+# window from 1h to 7d, and hourly makes 30d and the lifetime view cheap.
+ROLLUP_TIERS = (60, 3600)
+ROLLUP_BUCKET_S = ROLLUP_TIERS[0]
+
+# Buckets folded per backfill pass, per tier. Expressed in buckets rather than
+# seconds so a coarse tier takes correspondingly larger strides: the first run
+# against a large existing database makes progress without holding the write
+# lock for minutes.
+ROLLUP_CHUNK_BUCKETS = 360
+
+# A tier is only used when its buckets nest exactly into the requested bins, or
+# failing that when a bin holds at least this many buckets — so a bucket
+# straddling a bin edge can never move more than a small fraction of a bin.
+MIN_BUCKETS_PER_BIN = 8
 
 CPU_HWMON_NAMES = ("k10temp", "coretemp", "zenpower")
 CPU_HWMON_LABELS = ("Tctl", "Tdie", "Package id 0", "Tccd1")
@@ -101,22 +112,24 @@ class TelemetryStore:
                 CREATE INDEX IF NOT EXISTS idx_samples_metric_ts
                     ON system_samples(metric, gpu_index, ts);
 
-                -- Per-minute aggregate serving every window wider than an hour.
+                -- Tiered aggregate serving every window wider than its bucket.
                 -- Sum and count rather than an average so bins of any width can
-                -- be recombined without weighting error.
+                -- be recombined without weighting error, and so a coarse tier
+                -- can be built by summing a finer one.
                 CREATE TABLE IF NOT EXISTS system_rollup (
+                    bucket_s INTEGER NOT NULL,
                     metric TEXT NOT NULL,
                     gpu_index INTEGER NOT NULL,
                     bucket_ts INTEGER NOT NULL,
                     sum_value REAL NOT NULL,
                     sample_count INTEGER NOT NULL,
-                    PRIMARY KEY (metric, gpu_index, bucket_ts)
+                    PRIMARY KEY (bucket_s, metric, gpu_index, bucket_ts)
                 ) WITHOUT ROWID;
 
-                -- Single-row watermark: raw samples strictly below this have
-                -- already been folded into system_rollup.
+                -- Per-tier watermark: everything strictly below it has already
+                -- been folded into that tier.
                 CREATE TABLE IF NOT EXISTS rollup_state (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    bucket_s INTEGER PRIMARY KEY,
                     rolled_through_ts INTEGER NOT NULL
                 );
                 """
@@ -147,57 +160,101 @@ class TelemetryStore:
             conn.execute("DELETE FROM system_samples WHERE ts < ?", (cutoff,))
 
     @staticmethod
-    def _rolled_through(conn):
-        """Bucket-aligned timestamp below which every raw sample is rolled up."""
-        row = conn.execute("SELECT rolled_through_ts FROM rollup_state WHERE id = 1").fetchone()
+    def _rolled_through(conn, bucket_s=ROLLUP_BUCKET_S):
+        """Timestamp below which everything has been folded into `bucket_s`."""
+        row = conn.execute(
+            "SELECT rolled_through_ts FROM rollup_state WHERE bucket_s = ?", (bucket_s,)
+        ).fetchone()
         return int(row["rolled_through_ts"]) if row else None
 
-    def roll_up(self, now_ts=None):
-        """Fold one chunk of raw samples into the per-minute rollup.
+    def _roll_tier(self, conn, bucket_s, source_bucket_s, now):
+        """Fold one chunk into `bucket_s`. Returns True if that tier has more left.
 
-        Returns True while there is more history left to fold, so a backfill can
-        drive this in a loop without any single pass holding the write lock for
+        `source_bucket_s` is None for the finest tier, which reads raw samples;
+        coarser tiers read the tier below, which is both cheaper and exact,
+        because summing sums and counts composes.
+        """
+        # Only fold buckets that can no longer receive data. A derived tier is
+        # additionally capped by its source: aggregating a bucket the source has
+        # not finished writing would bake in a partial value.
+        limit = int(now // bucket_s) * bucket_s
+        if source_bucket_s is not None:
+            source_watermark = self._rolled_through(conn, source_bucket_s)
+            if source_watermark is None:
+                return False
+            limit = min(limit, int(source_watermark // bucket_s) * bucket_s)
+
+        start = self._rolled_through(conn, bucket_s)
+        if start is None:
+            if source_bucket_s is None:
+                row = conn.execute("SELECT MIN(ts) AS t FROM system_samples").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT MIN(bucket_ts) AS t FROM system_rollup WHERE bucket_s = ?",
+                    (source_bucket_s,),
+                ).fetchone()
+            if not row or row["t"] is None:
+                return False
+            start = int(row["t"]) // bucket_s * bucket_s
+
+        end = min(start + bucket_s * ROLLUP_CHUNK_BUCKETS, limit)
+        if end <= start:
+            return False
+
+        if source_bucket_s is None:
+            conn.execute(
+                """
+                INSERT INTO system_rollup (bucket_s, metric, gpu_index, bucket_ts, sum_value, sample_count)
+                SELECT ?, metric, gpu_index, (ts / ?) * ?, SUM(value), COUNT(*)
+                FROM system_samples
+                WHERE ts >= ? AND ts < ?
+                GROUP BY metric, gpu_index, (ts / ?) * ?
+                ON CONFLICT (bucket_s, metric, gpu_index, bucket_ts) DO UPDATE SET
+                    sum_value = excluded.sum_value,
+                    sample_count = excluded.sample_count
+                """,
+                (bucket_s, bucket_s, bucket_s, start, end, bucket_s, bucket_s),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO system_rollup (bucket_s, metric, gpu_index, bucket_ts, sum_value, sample_count)
+                SELECT ?, metric, gpu_index, (bucket_ts / ?) * ?, SUM(sum_value), SUM(sample_count)
+                FROM system_rollup
+                WHERE bucket_s = ? AND bucket_ts >= ? AND bucket_ts < ?
+                GROUP BY metric, gpu_index, (bucket_ts / ?) * ?
+                ON CONFLICT (bucket_s, metric, gpu_index, bucket_ts) DO UPDATE SET
+                    sum_value = excluded.sum_value,
+                    sample_count = excluded.sample_count
+                """,
+                (bucket_s, bucket_s, bucket_s, source_bucket_s, start, end, bucket_s, bucket_s),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO rollup_state (bucket_s, rolled_through_ts) VALUES (?, ?)
+            ON CONFLICT (bucket_s) DO UPDATE SET rolled_through_ts = excluded.rolled_through_ts
+            """,
+            (bucket_s, end),
+        )
+        return end < limit
+
+    def roll_up(self, now_ts=None):
+        """Advance every rollup tier by one chunk.
+
+        Returns True while any tier has history left to fold, so a backfill can
+        drive this in a loop without a single pass holding the write lock for
         long. Chunk boundaries are bucket-aligned, which makes re-running a chunk
         after a crash idempotent rather than double-counting.
         """
         now = time.time() if now_ts is None else now_ts
-        # Only fold buckets that can no longer receive samples.
-        complete_through = int(now // ROLLUP_BUCKET_S) * ROLLUP_BUCKET_S
-
+        more = False
         with self._lock, self._connect() as conn:
-            start = self._rolled_through(conn)
-            if start is None:
-                row = conn.execute("SELECT MIN(ts) AS t FROM system_samples").fetchone()
-                if not row or row["t"] is None:
-                    return False
-                start = int(row["t"]) // ROLLUP_BUCKET_S * ROLLUP_BUCKET_S
-
-            end = min(start + ROLLUP_BACKFILL_CHUNK_S, complete_through)
-            if end <= start:
-                return False
-
-            conn.execute(
-                """
-                INSERT INTO system_rollup (metric, gpu_index, bucket_ts, sum_value, sample_count)
-                SELECT metric, gpu_index, (ts / ?) * ?, SUM(value), COUNT(*)
-                FROM system_samples
-                WHERE ts >= ? AND ts < ?
-                GROUP BY metric, gpu_index, (ts / ?) * ?
-                ON CONFLICT (metric, gpu_index, bucket_ts) DO UPDATE SET
-                    sum_value = excluded.sum_value,
-                    sample_count = excluded.sample_count
-                """,
-                (ROLLUP_BUCKET_S, ROLLUP_BUCKET_S, start, end, ROLLUP_BUCKET_S, ROLLUP_BUCKET_S),
-            )
-            conn.execute(
-                """
-                INSERT INTO rollup_state (id, rolled_through_ts) VALUES (1, ?)
-                ON CONFLICT (id) DO UPDATE SET rolled_through_ts = excluded.rolled_through_ts
-                """,
-                (end,),
-            )
-
-        return end < complete_through
+            for i, bucket_s in enumerate(ROLLUP_TIERS):
+                source = ROLLUP_TIERS[i - 1] if i else None
+                if self._roll_tier(conn, bucket_s, source, now):
+                    more = True
+        return more
 
     def latest(self, metric, gpu_index):
         with self._lock, self._connect() as conn:
@@ -223,7 +280,7 @@ class TelemetryStore:
         ).fetchall()
 
     @staticmethod
-    def _rollup_bins(conn, metric, gpu_index, ts_from, ts_to, origin, width):
+    def _rollup_bins(conn, bucket_s, metric, gpu_index, ts_from, ts_to, origin, width):
         return conn.execute(
             """
             SELECT
@@ -231,28 +288,50 @@ class TelemetryStore:
                 SUM(sum_value) AS sum_value,
                 SUM(sample_count) AS sample_count
             FROM system_rollup
-            WHERE metric=? AND gpu_index=? AND bucket_ts >= ? AND bucket_ts < ?
+            WHERE bucket_s=? AND metric=? AND gpu_index=? AND bucket_ts >= ? AND bucket_ts < ?
             GROUP BY bin
             """,
-            (origin, width, metric, gpu_index, ts_from, ts_to),
+            (origin, width, bucket_s, metric, gpu_index, ts_from, ts_to),
         ).fetchall()
+
+    @staticmethod
+    def _usable_tiers(width):
+        """Tiers safe to read at this bin width, coarsest first.
+
+        A tier is safe either way it can be safe. If its buckets divide the bin
+        width exactly, bins and buckets nest and the aggregate reproduces the raw
+        average. Failing that, it is still safe when a bin holds many buckets, so
+        a bucket straddling a bin edge moves only a small fraction of the bin.
+
+        The coarsest safe tier wins, not the most exact one. Both rules matter in
+        practice: at 7d a bin is 2.8 hours, so the hourly tier neither nests nor
+        holds enough buckets and the per-minute tier is used; at 30d a bin is
+        exactly 12 hours and nests; the lifetime window divides evenly by nothing
+        at all and rides on the bucket-count rule.
+        """
+        usable = [
+            t for t in ROLLUP_TIERS
+            if (t <= width and width % t == 0) or t * MIN_BUCKETS_PER_BIN <= width
+        ]
+        return sorted(usable, reverse=True)
 
     def binned_avg(self, metric, gpu_index, ts_from, ts_to, bins):
         """Average per bin over [ts_from, ts_to). Returns list of length `bins`,
         with None for empty bins.
 
-        Bins at least one rollup bucket wide are served from the aggregate, which
-        is what keeps long windows cheap. The window is split at the rollup
-        watermark so a partially backfilled database still reads correctly: older
-        than the watermark comes from the aggregate, newer from raw samples.
+        The window is served from the coarsest aggregate tier whose buckets fit
+        the bins, falling back through finer tiers and finally raw samples for
+        the newest stretch that has not been folded up yet. That is what keeps
+        long windows cheap and lets a partially backfilled database still read
+        correctly.
 
-        On the aggregate path the bin origin is snapped down to a bucket
-        boundary. Without that, a bucket straddling a bin edge is credited
-        wholesale to one side, which at the 1h window (bins exactly one bucket
-        wide) moved values by as much as 17%. Snapped, every standard window has
-        a bin width that is a whole number of buckets, so bins and buckets nest
-        exactly and the averages are the same ones the raw rows would give. The
-        cost is that the plotted range can start up to one bucket early.
+        The bin origin is snapped down to a bucket boundary. Without that, a
+        bucket straddling a bin edge is credited wholesale to one side, which at
+        the 1h window (bins exactly one bucket wide) moved values by as much as
+        17%. Snapped, every standard window has a bin width that is a whole
+        number of buckets, so bins and buckets nest exactly and the averages are
+        the same ones the raw rows would give. The cost is that the plotted range
+        can start up to one bucket early.
         """
         if ts_to <= ts_from or bins <= 0:
             return []
@@ -268,19 +347,33 @@ class TelemetryStore:
                     sums[b] += float(r["sum_value"])
                     counts[b] += int(r["sample_count"])
 
+        tiers = self._usable_tiers(width)
+
         with self._lock, self._connect() as conn:
-            if width >= ROLLUP_BUCKET_S:
-                # Align bins to bucket boundaries; the watermark already is one.
-                origin = int(ts_from // ROLLUP_BUCKET_S) * ROLLUP_BUCKET_S
-                watermark = self._rolled_through(conn)
-                split = origin if watermark is None else max(origin, min(ts_to, watermark))
-                if split > origin:
+            if tiers:
+                # Align bins to the coarsest bucket in play, so bins nest with
+                # every tier used. Watermarks are already bucket-aligned.
+                origin = int(ts_from // tiers[0]) * tiers[0]
+                cursor = origin
+                # Walk coarse to fine. A coarse tier's watermark never runs ahead
+                # of a finer one's, so each pass extends the covered range; raw
+                # samples cover whatever is left at the newest end.
+                for bucket_s in tiers:
+                    watermark = self._rolled_through(conn, bucket_s)
+                    if watermark is None:
+                        continue
+                    segment_end = min(ts_to, watermark)
+                    if segment_end > cursor:
+                        accumulate(
+                            self._rollup_bins(
+                                conn, bucket_s, metric, gpu_index,
+                                cursor, segment_end, origin, width,
+                            )
+                        )
+                        cursor = segment_end
+                if cursor < ts_to:
                     accumulate(
-                        self._rollup_bins(conn, metric, gpu_index, origin, split, origin, width)
-                    )
-                if split < ts_to:
-                    accumulate(
-                        self._raw_bins(conn, metric, gpu_index, split, ts_to, origin, width)
+                        self._raw_bins(conn, metric, gpu_index, cursor, ts_to, origin, width)
                     )
             else:
                 accumulate(
