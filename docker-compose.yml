@@ -36,6 +36,8 @@ services:
           mode: 1777
     environment:
       - GRIMOIRE_API_KEY=${GRIMOIRE_API_KEY}
+      # Browser origins allowed to call /stats cross-site (dash.lost.plus).
+      - GRIMOIRE_CORS_ORIGINS=${GRIMOIRE_CORS_ORIGINS:-}
       - TURBO_AUTO_ASYMMETRIC=0
       - STRUCTURED_COT=0
       - STRUCTURED_TOOL=0
@@ -52,3 +54,18 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # The dashboard, lifted out of the chat webui into its own site. Static files
+  # only — it reads everything from the gateway's /stats endpoints in the
+  # browser, so it holds no state and can restart freely. See dash/README.md.
+  dash:
+    build:
+      context: ./dash
+      args:
+        VITE_API_BASE: ${DASH_API_BASE:-https://chat.lost.plus}
+    image: grimoire-dash:local
+    container_name: grimoire-dash
+    restart: unless-stopped
+    mem_limit: 128m
+    ports:
+      - "9002:80"

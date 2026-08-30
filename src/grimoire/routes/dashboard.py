@@ -1,6 +1,9 @@
 """Dashboard and stats route handlers (/stats/*)."""
 
+import asyncio
+import time
 from datetime import datetime, timezone
+from threading import Lock
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -10,6 +13,43 @@ from grimoire.telemetry import telemetry_store
 from grimoire.usage import usage_store
 
 router = APIRouter()
+
+# Assembling a dashboard payload is a dozen-plus SQLite queries. That work must
+# never run on the event loop — this process also serves chat, and a slow scan
+# here stalls every in-flight model request behind it. Everything below hops to a
+# worker thread, and repeat calls inside one bin's worth of time are served from
+# a small cache: the page polls once a second, but a point on a 24h graph cannot
+# meaningfully change that fast.
+_CACHE_MIN_TTL_S = 1.0
+_CACHE_MAX_TTL_S = 30.0
+
+_cache = {}
+_cache_lock = Lock()
+
+
+def _cache_ttl(ts_from, ts_to, bins):
+    """Hold a payload for a fraction of one bin, clamped to sane bounds."""
+    bin_width = max(0.0, (ts_to - ts_from) / max(bins, 1))
+    return min(max(bin_width / 4.0, _CACHE_MIN_TTL_S), _CACHE_MAX_TTL_S)
+
+
+def _cache_get(key):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and entry[0] > time.monotonic():
+            return entry[1]
+        if entry:
+            del _cache[key]
+    return None
+
+
+def _cache_put(key, payload, ttl):
+    with _cache_lock:
+        _cache[key] = (time.monotonic() + ttl, payload)
+        if len(_cache) > 64:
+            now = time.monotonic()
+            for stale in [k for k, v in _cache.items() if v[0] <= now]:
+                del _cache[stale]
 
 
 def _get_manager():
@@ -21,26 +61,18 @@ def _get_manager():
 async def get_stats(request: Request):
     """Return per-key token and equivalent-cost usage totals."""
     _, user_hash = require_api(request)
-    return usage_store.summary(user_hash=user_hash)
+    return await asyncio.to_thread(usage_store.summary, user_hash=user_hash)
 
 
 @router.get("/stats/global")
 async def get_global_stats(request: Request):
     """Return global token and equivalent-cost usage totals."""
     require_admin(request)
-    return usage_store.summary()
+    return await asyncio.to_thread(usage_store.summary)
 
 
-@router.get("/stats/dashboard")
-async def get_dashboard_stats(request: Request):
-    """Combined token/cost + system telemetry time series for the dashboard.
-
-    Query params:
-        window: one of "5m","15m","1h","6h","24h","7d","30d","all" (default "1h")
-    """
-    _, user_hash = require_api(request)
-    window = (request.query_params.get("window") or "1h").lower()
-
+def _build_dashboard_payload(user_hash, window):
+    """Gather one dashboard payload. Blocking — always call from a worker thread."""
     now_ts = datetime.now(timezone.utc).timestamp()
     if window in {"all", "lifetime"}:
         earliest = usage_store.earliest_event_ts(user_hash=user_hash)
@@ -141,6 +173,26 @@ async def get_dashboard_stats(request: Request):
     }
 
 
+@router.get("/stats/dashboard")
+async def get_dashboard_stats(request: Request):
+    """Combined token/cost + system telemetry time series for the dashboard.
+
+    Query params:
+        window: one of "5m","15m","1h","6h","24h","7d","30d","all" (default "1h")
+    """
+    _, user_hash = require_api(request)
+    window = (request.query_params.get("window") or "1h").lower()
+
+    key = (user_hash, window)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    payload = await asyncio.to_thread(_build_dashboard_payload, user_hash, window)
+    _cache_put(key, payload, _cache_ttl(payload["from"], payload["to"], payload["bins"]))
+    return payload
+
+
 @router.put("/stats/card-order")
 async def save_card_order(request: Request):
     """Save the user's dashboard card arrangement."""
@@ -150,7 +202,7 @@ async def save_card_order(request: Request):
         card_order = body.get("card_order", [])
         if not isinstance(card_order, list):
             raise HTTPException(status_code=400, detail="card_order must be a list of strings")
-        usage_store.save_card_arrangement(user_hash, card_order)
+        await asyncio.to_thread(usage_store.save_card_arrangement, user_hash, card_order)
         return {"status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

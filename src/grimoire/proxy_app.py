@@ -18,6 +18,7 @@ import os
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
@@ -35,6 +36,23 @@ MANAGER_URL = os.environ.get("GRIMOIRE_MANAGER_URL", "http://127.0.0.1:9000").rs
 STATELESS_SUFFIXES = {"embeddings", "rerank", "reranking"}
 
 app = FastAPI(title="Grimoire Proxy", version="0.1.0")
+
+# The proxy workers own the public port, so cross-origin permission belongs here
+# rather than on the manager app. Only the read-only stats verbs the standalone
+# dashboard needs are opened up. Credentials stay off: dash.lost.plus
+# authenticates with a bearer token, never the gw_session cookie, so the browser
+# must not be told to attach cookies to these requests.
+if config.CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=config.CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "PUT", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        max_age=86400,
+    )
+    logger.info("CORS enabled for origins: %s", ", ".join(config.CORS_ORIGINS))
+
 _routes = RouteTableReader()
 _rr: dict[str, int] = {}
 

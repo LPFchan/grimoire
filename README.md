@@ -178,9 +178,40 @@ HTTPS-only, rejects private hosts, atomic writes, size-limited.
 
 Legacy import (`GRIMOIRE_LEGACY_STATS_PATH=/path/to/token-stats.json`) is idempotent. Appended to `/var/lib/grimoire/usage.sqlite3`.
 
+## Dashboard
+
+Its own site at `https://dash.lost.plus/`, built from `dash/` (see `dash/README.md`).
+Static files; it reads `GET /stats/dashboard` and `PUT /stats/card-order` from the
+browser and holds no state. Runs as the `dash` compose service on host port 9002.
+
+Because it is on a different host from the API, `GRIMOIRE_CORS_ORIGINS` must name
+its origin or the browser will not release the response. Set it to
+`https://dash.lost.plus`; never `*` — `/stats` serves private usage and cost data.
+
+### Telemetry storage
+
+`state/telemetry.sqlite3` keeps raw samples every 5s plus a per-minute rollup
+(`system_rollup`, storing sum and count). Windows an hour or wider read the
+rollup; shorter windows read raw. The dashboard only draws 60 points, so this
+costs no visible resolution and takes the lifetime window from ~15s of scanning
+to under a second. Payloads are built on a worker thread and cached for a
+fraction of one bin, so `/stats` can never stall the chat event loop.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GRIMOIRE_TELEMETRY_INTERVAL_S` | `5` | Sampling interval |
+| `GRIMOIRE_TELEMETRY_RETENTION_DAYS` | `0` (keep all) | Prunes **raw** samples only; rollups are never pruned, so lifetime graphs survive |
+| `GRIMOIRE_CORS_ORIGINS` | empty | Comma-separated browser origins allowed to read `/stats` cross-site |
+
+First start after adding the rollup backfills it in chunks (~21s for a 1.3 GB,
+18M-row database) while the sampler keeps running.
+
 ## Chat UI
 
 Forked llama.cpp SvelteKit webui at `https://chat.lost.plus/` (submodule at `webui/`). Router-mode API: `GET /props`, `GET /v1/models`, `POST /models/load`, `POST /models/unload`.
+
+The dashboard used to live here as `src/routes/dashboard/`. It moved to its own
+site (see above) to keep this fork closer to upstream — DEC-20260830-001.
 
 `GET /v1/models` includes registry capabilities plus `input_modalities` and
 the configured native reasoning advertisement. Multimodal aliases advertise

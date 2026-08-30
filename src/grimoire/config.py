@@ -43,6 +43,19 @@ API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
 ADMIN_TOKEN = os.environ.get("GRIMOIRE_ADMIN_TOKEN") or API_KEY
 COOKIE_NAME = "gw_session"
 
+
+def _env_origins(name):
+    """Parse a comma-separated browser-origin allowlist into a clean list."""
+    raw = os.environ.get(name, "")
+    return [origin.strip().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
+
+# Browser origins permitted to call the gateway from a different site, e.g.
+# https://dash.lost.plus for the standalone dashboard. Empty (the default) means
+# same-origin only, so the chat webui is unaffected. Never set this to "*": the
+# gateway serves per-key usage and cost data. See DEC-20260830-001.
+CORS_ORIGINS = _env_origins("GRIMOIRE_CORS_ORIGINS")
+
 # Tuning
 DEFAULT_STARTUP_TIMEOUT = _env_int("GRIMOIRE_STARTUP_TIMEOUT", 600)
 MAX_HISTORY_CAPTURE_BYTES = _env_int("GRIMOIRE_HISTORY_CAPTURE_BYTES", 2 * 1024 * 1024)
