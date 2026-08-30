@@ -200,7 +200,7 @@ fraction of one bin, so `/stats` can never stall the chat event loop.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `GRIMOIRE_TELEMETRY_INTERVAL_S` | `5` | Sampling interval |
-| `GRIMOIRE_TELEMETRY_RETENTION_DAYS` | `0` (keep all) | Prunes **raw** samples only; rollups are never pruned, so lifetime graphs survive |
+| `GRIMOIRE_TELEMETRY_RETENTION_DAYS` | `0` (keep all); set to `30` in the fleet | Prunes **raw** samples only; rollups are never pruned, so lifetime graphs survive. Pruning is clamped to the rollup watermark, so it can never drop an unfolded sample |
 | `GRIMOIRE_CORS_ORIGINS` | empty | Comma-separated browser origins allowed to read `/stats` cross-site |
 
 First start after adding the rollup backfills it in chunks (~21s for a 1.3 GB,

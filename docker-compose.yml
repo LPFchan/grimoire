@@ -38,6 +38,9 @@ services:
       - GRIMOIRE_API_KEY=${GRIMOIRE_API_KEY}
       # Browser origins allowed to call /stats cross-site (dash.lost.plus).
       - GRIMOIRE_CORS_ORIGINS=${GRIMOIRE_CORS_ORIGINS:-}
+      # Prunes raw 5s samples only; the per-minute rollup is never pruned, so
+      # lifetime graphs survive. 0 keeps everything.
+      - GRIMOIRE_TELEMETRY_RETENTION_DAYS=${GRIMOIRE_TELEMETRY_RETENTION_DAYS:-0}
       - TURBO_AUTO_ASYMMETRIC=0
       - STRUCTURED_COT=0
       - STRUCTURED_TOOL=0
