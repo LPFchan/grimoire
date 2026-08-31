@@ -623,98 +623,6 @@
       ],
       "added": "2026-07-15T03:43:14.525959+00:00"
     },
-    "eastself-gemma4-12b-boundary-pilot-sft-final": {
-      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
-      "capabilities": [
-        "completion"
-      ],
-      "ctx-size": 120000,
-      "predict": 16384,
-      "parallel": 1,
-      "n-gpu-layers": 999,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4",
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "family": "gemma4",
-      "extra-args": [
-        "--lora",
-        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf"
-      ],
-      "added": "2026-08-29T06:16:27.976526+00:00"
-    },
-    "eastself-gemma4-12b-tier1-stronger-canary-v1-round1": {
-      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
-      "capabilities": [
-        "completion"
-      ],
-      "ctx-size": 120000,
-      "predict": 16384,
-      "parallel": 1,
-      "n-gpu-layers": 999,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4",
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "family": "gemma4",
-      "extra-args": [
-        "--lora-scaled",
-        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-stronger-canary-v1-round1-lora.gguf:1.0"
-      ],
-      "added": "2026-08-30T01:24:12.581325+00:00"
-    },
-    "eastself-gemma4-12b-tier1-stronger-canary-v1-round2": {
-      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
-      "capabilities": [
-        "completion"
-      ],
-      "ctx-size": 120000,
-      "predict": 16384,
-      "parallel": 1,
-      "n-gpu-layers": 999,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4",
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "family": "gemma4",
-      "extra-args": [
-        "--lora-scaled",
-        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-stronger-canary-v1-round2-lora.gguf:1.0"
-      ],
-      "added": "2026-08-30T08:19:22.542960+00:00"
-    },
-    "eastself-gemma4-12b-tier1-stronger-canary-v1-round3": {
-      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
-      "capabilities": [
-        "completion"
-      ],
-      "ctx-size": 120000,
-      "predict": 16384,
-      "parallel": 1,
-      "n-gpu-layers": 999,
-      "cache-type-k": "turbo4",
-      "cache-type-v": "turbo4",
-      "cost": {
-        "input": 0.14,
-        "output": 0.4,
-        "cache_read": 0.04
-      },
-      "family": "gemma4",
-      "extra-args": [
-        "--lora-scaled",
-        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-stronger-canary-v1-round3-lora.gguf:1.0"
-      ],
-      "added": "2026-08-30T17:51:36.096494+00:00"
-    },
     "eastself-gemma4-12b-dec20260718-v2": {
       "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-dec20260718-v2-tokenizer.gguf",
       "capabilities": [
@@ -1181,6 +1089,167 @@
         "/models/gguf/eastself-gemma4-12b-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-online-reward-k5-step1-lora.gguf:1.0"
       ],
       "added": "2026-08-27T04:07:38.724990+00:00"
+    },
+    "eastself-gemma4-12b-boundary-pilot-sft-final": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf"
+      ],
+      "added": "2026-08-29T06:16:27.976526+00:00"
+    },
+    "eastself-gemma4-12b-tier1-online-canary-v1-step1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-online-canary-v1-step1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-29T16:05:16.062669+00:00"
+    },
+    "eastself-gemma4-12b-tier1-stronger-canary-v1-round1": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-stronger-canary-v1-round1-lora.gguf:1.0"
+      ],
+      "added": "2026-08-30T01:24:12.581325+00:00"
+    },
+    "eastself-gemma4-12b-tier1-stronger-canary-v1-round2": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-stronger-canary-v1-round2-lora.gguf:1.0"
+      ],
+      "added": "2026-08-30T08:19:22.542960+00:00"
+    },
+    "eastself-gemma4-12b-tier1-stronger-canary-v1-round3": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-stronger-canary-v1-round3-lora.gguf:1.0"
+      ],
+      "added": "2026-08-30T17:51:36.096494+00:00"
+    },
+    "eastself-gemma4-12b-tier1-dose-v1-control": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-dose-v1-control-lora.gguf:1.0"
+      ],
+      "added": "2026-08-31T11:22:37.516757+00:00"
+    },
+    "eastself-gemma4-12b-tier1-dose-v1-stronger": {
+      "file": "gguf/gemma-4-12b-it-qat-q4_0-eastself-gemma4-12b-boundary-pilot-sft-final-tokenizer.gguf",
+      "capabilities": [
+        "completion"
+      ],
+      "ctx-size": 120000,
+      "predict": 16384,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "cost": {
+        "input": 0.14,
+        "output": 0.4,
+        "cache_read": 0.04
+      },
+      "family": "gemma4",
+      "extra-args": [
+        "--lora-scaled",
+        "/models/gguf/eastself-gemma4-12b-boundary-pilot-sft-final-lora-tokenrep.gguf:1.0,/models/gguf/eastself-gemma4-12b-tier1-dose-v1-stronger-lora.gguf:1.0"
+      ],
+      "added": "2026-08-31T11:22:37.579559+00:00"
     }
   },
   "fixed": {
