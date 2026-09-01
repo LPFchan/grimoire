@@ -212,8 +212,17 @@
 		}
 
 		if (lo === hi) {
-			lo -= 1;
-			hi += 1;
+			// A flat series still needs a range to divide by. With an absolute
+			// axis the floor is meaningful, so grow upward and leave it alone —
+			// expanding both ways would push an all-zero window back to the
+			// middle of the card, which is what made idle token counts look
+			// like activity.
+			if (scale) {
+				hi = lo + 1;
+			} else {
+				lo -= 1;
+				hi += 1;
+			}
 		}
 		const dx = values.length > 1 ? width / (values.length - 1) : 0;
 		let lastY = height;
