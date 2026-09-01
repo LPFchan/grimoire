@@ -9,6 +9,7 @@ from threading import Lock
 from fastapi import APIRouter, HTTPException, Request
 
 from grimoire.auth import require_api, require_admin
+from grimoire import limits
 from grimoire.config import DASHBOARD_WINDOWS_S, DASHBOARD_BINS
 from grimoire.telemetry import ROLLUP_TIERS, telemetry_store
 from grimoire.usage import usage_store
@@ -111,11 +112,29 @@ def _build_dashboard_payload(user_hash, window):
     summary = usage_store.summary(user_hash=user_hash)
     lifetime = summary.get("total", {})
 
+    def _scale(metric, gpu_index):
+        """Absolute axis for a metric, or None to let the chart find its own."""
+        observed = None
+        if limits.needs_observed_max(metric):
+            peaks = [
+                telemetry_store.observed_max(peer, gpu_index)
+                for peer in limits.peer_metrics(metric)
+            ]
+            peaks = [p for p in peaks if p is not None]
+            observed = max(peaks) if peaks else None
+        return limits.scale_for(metric, gpu_index, observed)
+
     def _system(metric, gpu_index):
         return {
             "current": telemetry_store.latest(metric, gpu_index),
             "series": telemetry_store.binned_avg(metric, gpu_index, ts_from, now_ts, bins),
+            "scale": _scale(metric, gpu_index),
         }
+
+    # Token counts and costs accumulate across the window, so they always start
+    # at zero and climb. Anchoring the floor stops an all-zero idle window being
+    # drawn as a filled block; the ceiling has to follow the data.
+    from_zero = {"min": 0, "max": None}
 
     # Only GPUs the host actually has. This used to be {0, 1, *range(count)},
     # which pinned two cards into the response no matter what was installed — so
@@ -146,10 +165,12 @@ def _build_dashboard_payload(user_hash, window):
             "input": {
                 "current": usage["total_input_tokens"],
                 "series": _cumulative(usage["input_tokens_series"]),
+                "scale": from_zero,
             },
             "output": {
                 "current": usage["total_output_tokens"],
                 "series": _cumulative(usage["output_tokens_series"]),
+                "scale": from_zero,
             },
         },
         "cache": {
@@ -157,10 +178,12 @@ def _build_dashboard_payload(user_hash, window):
                 "tokens": {
                     "current": usage["total_cache_read_input_tokens"],
                     "series": _cumulative(usage["cache_read_input_tokens_series"]),
+                    "scale": from_zero,
                 },
                 "cost": {
                     "current": usage["total_cache_read_input_cost"],
                     "series": _cumulative(usage["cache_read_input_cost_series"]),
+                    "scale": from_zero,
                 },
             },
             "lifetime_tokens": int(lifetime.get("cache_read_input_tokens") or 0),

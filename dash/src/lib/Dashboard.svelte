@@ -1,9 +1,16 @@
 <script lang="ts">
 	import { apiFetch } from './api';
 
+	type Scale = {
+		min: number;
+		/** null means "anchor the floor, let the top follow the data". */
+		max: number | null;
+	};
+
 	type Series = {
 		current: number | null;
 		series: Array<number | null>;
+		scale?: Scale | null;
 	};
 
 	type DashboardResponse = {
@@ -56,6 +63,7 @@
 		title: string;
 		value: string;
 		series: Array<number | null> | undefined;
+		scale?: Scale | null;
 		accent: string;
 		formatFn: (n: number) => string;
 	};
@@ -179,7 +187,8 @@
 	function buildSparkline(
 		raw: Array<number | null> | undefined,
 		width: number,
-		height: number
+		height: number,
+		scale?: Scale | null
 	): Sparkline {
 		const values = raw ?? [];
 		if (values.length === 0) return { line: '', area: '', lo: 0, hi: 1 };
@@ -194,6 +203,14 @@
 			lo = 0;
 			hi = 1;
 		}
+
+		// An absolute axis from the server wins. A null max still pins the floor,
+		// which is what stops an all-zero window drawing as a filled block.
+		if (scale) {
+			lo = scale.min;
+			hi = scale.max ?? Math.max(hi, scale.min);
+		}
+
 		if (lo === hi) {
 			lo -= 1;
 			hi += 1;
@@ -205,7 +222,9 @@
 			const v = values[i];
 			const x = i * dx;
 			const isNum = v != null && Number.isFinite(v);
-			const y = isNum ? height - ((v as number - lo) / (hi - lo)) * height : lastY;
+			const y = isNum
+				? Math.min(height, Math.max(0, height - (((v as number) - lo) / (hi - lo)) * height))
+				: lastY;
 			line += i === 0 ? `M${x.toFixed(2)},${y.toFixed(2)}` : ` L${x.toFixed(2)},${y.toFixed(2)}`;
 			if (isNum) lastY = y;
 		}
@@ -255,35 +274,35 @@
 
 	function buildCardDefs(d: DashboardResponse): CardDef[] {
 		const cards: CardDef[] = [
-			{ key: 'input_tokens', title: 'Input tokens', value: fmtTokens(d.tokens.input.current), series: d.tokens.input.series, accent: 'oklch(0.72 0.16 252)', formatFn: fmtTokens },
-			{ key: 'output_tokens', title: 'Output tokens', value: fmtTokens(d.tokens.output.current), series: d.tokens.output.series, accent: 'oklch(0.74 0.16 152)', formatFn: fmtTokens },
+			{ key: 'input_tokens', title: 'Input tokens', value: fmtTokens(d.tokens.input.current), series: d.tokens.input.series, scale: d.tokens.input.scale, accent: 'oklch(0.72 0.16 252)', formatFn: fmtTokens },
+			{ key: 'output_tokens', title: 'Output tokens', value: fmtTokens(d.tokens.output.current), series: d.tokens.output.series, scale: d.tokens.output.scale, accent: 'oklch(0.74 0.16 152)', formatFn: fmtTokens },
 		];
 
 		if (d.cache) {
-			cards.push({ key: 'cache_read_tokens', title: 'Cache read tokens', value: fmtTokens(d.cache.read.tokens.current), series: d.cache.read.tokens.series, accent: 'oklch(0.76 0.18 42)', formatFn: fmtTokens });
-			cards.push({ key: 'cache_read_cost', title: 'Cache read cost', value: fmtCost(d.cache.read.cost.current), series: d.cache.read.cost.series, accent: 'oklch(0.80 0.17 80)', formatFn: fmtCost });
+			cards.push({ key: 'cache_read_tokens', title: 'Cache read tokens', value: fmtTokens(d.cache.read.tokens.current), series: d.cache.read.tokens.series, scale: d.cache.read.tokens.scale, accent: 'oklch(0.76 0.18 42)', formatFn: fmtTokens });
+			cards.push({ key: 'cache_read_cost', title: 'Cache read cost', value: fmtCost(d.cache.read.cost.current), series: d.cache.read.cost.series, scale: d.cache.read.cost.scale, accent: 'oklch(0.80 0.17 80)', formatFn: fmtCost });
 		}
 
 		cards.push(
-			{ key: 'cpu_temp', title: 'CPU temp', value: fmtTemp(d.cpu.temp.current), series: d.cpu.temp.series, accent: 'oklch(0.72 0.16 320)', formatFn: fmtTemp },
-			{ key: 'cpu_power', title: 'CPU power', value: fmtPower(d.cpu.power.current), series: d.cpu.power.series, accent: 'oklch(0.75 0.18 120)', formatFn: fmtPower },
+			{ key: 'cpu_temp', title: 'CPU temp', value: fmtTemp(d.cpu.temp.current), series: d.cpu.temp.series, scale: d.cpu.temp.scale, accent: 'oklch(0.72 0.16 320)', formatFn: fmtTemp },
+			{ key: 'cpu_power', title: 'CPU power', value: fmtPower(d.cpu.power.current), series: d.cpu.power.series, scale: d.cpu.power.scale, accent: 'oklch(0.75 0.18 120)', formatFn: fmtPower },
 		);
 
 		for (const gpu of d.gpus) {
 			cards.push(
-				{ key: `gpu${gpu.index}_temp`, title: `GPU${gpu.index} temp`, value: fmtTemp(gpu.temp.current), series: gpu.temp.series, accent: 'oklch(0.72 0.18 30)', formatFn: fmtTemp },
-				{ key: `gpu${gpu.index}_power`, title: `GPU${gpu.index} power`, value: fmtPower(gpu.power.current), series: gpu.power.series, accent: 'oklch(0.78 0.16 80)', formatFn: fmtPower },
-				{ key: `gpu${gpu.index}_vram`, title: `GPU${gpu.index} VRAM`, value: fmtVram(gpu.vram.current), series: gpu.vram.series, accent: 'oklch(0.65 0.18 270)', formatFn: fmtVram },
-				{ key: `gpu${gpu.index}_tps`, title: `GPU${gpu.index} t/s`, value: fmtTps(gpu.tokens_per_sec.current), series: gpu.tokens_per_sec.series, accent: 'oklch(0.70 0.16 60)', formatFn: fmtTps },
+				{ key: `gpu${gpu.index}_temp`, title: `GPU${gpu.index} temp`, value: fmtTemp(gpu.temp.current), series: gpu.temp.series, scale: gpu.temp.scale, accent: 'oklch(0.72 0.18 30)', formatFn: fmtTemp },
+				{ key: `gpu${gpu.index}_power`, title: `GPU${gpu.index} power`, value: fmtPower(gpu.power.current), series: gpu.power.series, scale: gpu.power.scale, accent: 'oklch(0.78 0.16 80)', formatFn: fmtPower },
+				{ key: `gpu${gpu.index}_vram`, title: `GPU${gpu.index} VRAM`, value: fmtVram(gpu.vram.current), series: gpu.vram.series, scale: gpu.vram.scale, accent: 'oklch(0.65 0.18 270)', formatFn: fmtVram },
+				{ key: `gpu${gpu.index}_tps`, title: `GPU${gpu.index} t/s`, value: fmtTps(gpu.tokens_per_sec.current), series: gpu.tokens_per_sec.series, scale: gpu.tokens_per_sec.scale, accent: 'oklch(0.70 0.16 60)', formatFn: fmtTps },
 			);
 		}
 
 		cards.push(
-			{ key: 'system_ram', title: 'System RAM', value: fmtRam(d.ram.system.current), series: d.ram.system.series, accent: 'oklch(0.72 0.17 200)', formatFn: fmtRam },
-			{ key: 'grimoire_ram', title: 'Grimoire RAM', value: fmtRam(d.ram.container.current), series: d.ram.container.series, accent: 'oklch(0.74 0.16 222)', formatFn: fmtRam },
-			{ key: 'disk_usage', title: 'Disk usage', value: fmtPct(d.disk.current), series: d.disk.series, accent: 'oklch(0.70 0.15 160)', formatFn: fmtPct },
-			{ key: 'fan1', title: 'Fan 1', value: fmtRpm(d.fans.fan1.current), series: d.fans.fan1.series, accent: 'oklch(0.68 0.16 190)', formatFn: fmtRpm },
-			{ key: 'fan2', title: 'Fan 2', value: fmtRpm(d.fans.fan2.current), series: d.fans.fan2.series, accent: 'oklch(0.68 0.14 250)', formatFn: fmtRpm },
+			{ key: 'system_ram', title: 'System RAM', value: fmtRam(d.ram.system.current), series: d.ram.system.series, scale: d.ram.system.scale, accent: 'oklch(0.72 0.17 200)', formatFn: fmtRam },
+			{ key: 'grimoire_ram', title: 'Grimoire RAM', value: fmtRam(d.ram.container.current), series: d.ram.container.series, scale: d.ram.container.scale, accent: 'oklch(0.74 0.16 222)', formatFn: fmtRam },
+			{ key: 'disk_usage', title: 'Disk usage', value: fmtPct(d.disk.current), series: d.disk.series, scale: d.disk.scale, accent: 'oklch(0.70 0.15 160)', formatFn: fmtPct },
+			{ key: 'fan1', title: 'Fan 1', value: fmtRpm(d.fans.fan1.current), series: d.fans.fan1.series, scale: d.fans.fan1.scale, accent: 'oklch(0.68 0.16 190)', formatFn: fmtRpm },
+			{ key: 'fan2', title: 'Fan 2', value: fmtRpm(d.fans.fan2.current), series: d.fans.fan2.series, scale: d.fans.fan2.scale, accent: 'oklch(0.68 0.14 250)', formatFn: fmtRpm },
 		);
 
 		return cards;
@@ -409,7 +428,7 @@
 		role="list"
 	>
 		{#snippet statCard(card: CardDef)}
-			{@const spark = buildSparkline(card.series, SPARK_W, SPARK_H)}
+			{@const spark = buildSparkline(card.series, SPARK_W, SPARK_H, card.scale)}
 			{@const values = card.series ?? []}
 			{@const hov = hoverState[card.key]}
 			<div
@@ -445,7 +464,7 @@
 						<path d={spark.line} fill="none" stroke="currentColor" stroke-width="1.5" />
 					{/if}
 					{#if hov != null}
-						{@const dotY = SPARK_H - ((hov.value - spark.lo) / (spark.hi - spark.lo)) * SPARK_H}
+						{@const dotY = Math.min(SPARK_H, Math.max(0, SPARK_H - ((hov.value - spark.lo) / (spark.hi - spark.lo)) * SPARK_H))}
 						<line
 							x1={hov.x} y1="0"
 							x2={hov.x} y2={SPARK_H}

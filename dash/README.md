@@ -55,6 +55,30 @@ nginx serving `dist/` on host port 9002 and proxying `/stats/` to
 `npm run dev` serves only the static page; `/stats` requests will 404 without the
 nginx in front, so use `docker compose up dash` to exercise the real thing.
 
+## Chart scales
+
+Sparklines use absolute axes, supplied per series by the gateway as a
+`scale: {min, max}` alongside the data. A `null` max means "pin the floor, let
+the top follow the data".
+
+Nothing is hard-coded for one machine. Ceilings come from the hardware wherever
+it will state one — `nvidia-smi` for GPU power limit, VRAM and max operating
+temperature, `/proc/meminfo` for installed RAM, the cgroup for this container's
+own memory ceiling. Where no limit is discoverable (CPU temperature and package
+power, fan speed) the ceiling is derived from the highest value this host has
+actually been observed reaching, rounded up to a legible step, with a minimum
+span so an idle machine does not get an absurdly tight axis. See
+`src/grimoire/limits.py`.
+
+Two things keep a floating ceiling on purpose: GPU throughput, which depends
+entirely on which model is loaded, and the token and cost series, which
+accumulate across the window. Both still get a floor of zero — without it, an
+idle window has no range at all and used to be drawn as a filled block at half
+height, which reads as data rather than as nothing.
+
+Temperature axes start at 20 °C rather than zero, since nothing here ever
+approaches freezing and a zero-based axis would waste half of every card.
+
 ## Polling
 
 The page refetches no faster than a quarter of one bin, capped at 30 seconds, and

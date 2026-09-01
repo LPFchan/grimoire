@@ -382,6 +382,31 @@ class TelemetryStore:
 
         return [sums[i] / counts[i] if counts[i] else None for i in range(bins)]
 
+    def observed_max(self, metric, gpu_index):
+        """Highest value this host has been seen to reach for a metric.
+
+        Used to derive a chart ceiling for sensors whose hardware will not state
+        a limit — CPU temperature and package power, and fan speed. Prefers raw
+        samples, which hold true instantaneous peaks; falls back to the
+        per-minute tier when retention has pruned the raw rows away, accepting
+        that a one-minute mean understates a brief spike.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(value) AS v FROM system_samples WHERE metric=? AND gpu_index=?",
+                (metric, gpu_index),
+            ).fetchone()
+            if row and row["v"] is not None:
+                return float(row["v"])
+            row = conn.execute(
+                """
+                SELECT MAX(sum_value / sample_count) AS v FROM system_rollup
+                WHERE bucket_s=? AND metric=? AND gpu_index=? AND sample_count > 0
+                """,
+                (ROLLUP_TIERS[0], metric, gpu_index),
+            ).fetchone()
+        return float(row["v"]) if row and row["v"] is not None else None
+
     def earliest_ts(self):
         """Oldest timestamp still represented, in raw samples or in the rollup."""
         with self._lock, self._connect() as conn:

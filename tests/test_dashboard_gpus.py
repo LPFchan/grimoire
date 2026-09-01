@@ -24,6 +24,9 @@ def payload(monkeypatch):
         def latest(self, metric, gpu_index):
             return 1.0
 
+        def observed_max(self, metric, gpu_index):
+            return 50.0
+
         def binned_avg(self, metric, gpu_index, ts_from, ts_to, bins):
             return [1.0] * bins
 
