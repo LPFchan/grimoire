@@ -184,9 +184,10 @@ Its own site at `https://dash.lost.plus/`, built from `dash/` (see `dash/README.
 Static files; it reads `GET /stats/dashboard` and `PUT /stats/card-order` from the
 browser and holds no state. Runs as the `dash` compose service on host port 9002.
 
-Because it is on a different host from the API, `GRIMOIRE_CORS_ORIGINS` must name
-its origin or the browser will not release the response. Set it to
-`https://dash.lost.plus`; never `*` — `/stats` serves private usage and cost data.
+It does not ask for an API key: its nginx proxies `/stats/` to the gateway and
+attaches the key server-side, so the browser never holds a credential. That makes
+the hostname itself the only gate — anyone who can reach it reads your usage and
+cost figures. `GRIMOIRE_CORS_ORIGINS` is no longer needed for the dashboard.
 
 ### Telemetry storage
 

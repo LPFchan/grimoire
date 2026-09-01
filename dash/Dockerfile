@@ -1,7 +1,8 @@
 # dash.lost.plus — the Grimoire dashboard as its own static site.
 #
 # It holds no data of its own: every number on screen comes from the Grimoire
-# gateway's /stats endpoints, fetched from the browser. See dash/README.md.
+# gateway's /stats endpoints, which nginx proxies here so the page is
+# same-origin and the API key never reaches the browser. See dash/README.md.
 
 FROM node:22-bookworm-slim AS build
 
@@ -12,16 +13,19 @@ RUN npm ci --no-audit --no-fund
 
 COPY . .
 
-# Baked in at build time as the default gateway; overridable per-browser from
-# the sign-in screen.
-ARG VITE_API_BASE=https://chat.lost.plus
-ENV VITE_API_BASE=${VITE_API_BASE}
 RUN npm run build
 
 
 FROM nginx:1.27-alpine AS runtime
 
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+# Rendered at container start by the base image's envsubst entrypoint, so the
+# API key is supplied as an environment variable rather than baked into a layer.
+# The filter is essential: without it envsubst would also eat nginx's own $uri,
+# $host and friends.
+COPY nginx.conf.template /etc/nginx/templates/default.conf.template
+ENV NGINX_ENVSUBST_FILTER="^(GRIMOIRE_API_KEY|GRIMOIRE_GATEWAY_URL)$"
+ENV GRIMOIRE_GATEWAY_URL="http://grimoire:9001"
+
 COPY security-headers.conf /etc/nginx/security-headers.conf
 COPY --from=build /src/dist /usr/share/nginx/html
 

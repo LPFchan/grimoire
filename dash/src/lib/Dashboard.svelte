@@ -1,10 +1,5 @@
 <script lang="ts">
-	import { apiFetch, UnauthorizedError } from './api';
-
-	let { onUnauthorized, onSignOut }: {
-		onUnauthorized: () => void;
-		onSignOut: () => void;
-	} = $props();
+	import { apiFetch } from './api';
 
 	type Series = {
 		current: number | null;
@@ -84,10 +79,6 @@
 			}
 			error = null;
 		} catch (e) {
-			if (e instanceof UnauthorizedError) {
-				onUnauthorized();
-				return;
-			}
 			error = e instanceof Error ? e.message : String(e);
 		} finally {
 			loading = false;
@@ -379,14 +370,6 @@
 					</button>
 				{/each}
 			</div>
-
-			<button
-				type="button"
-				class="rounded-md border px-3 py-1 text-sm text-muted-foreground transition hover:text-foreground"
-				onclick={onSignOut}
-			>
-				Sign out
-			</button>
 		</div>
 	</header>
 

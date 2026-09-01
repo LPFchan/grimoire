@@ -9,8 +9,8 @@ needed to live there — it shares no components with chat.
 
 ## What it is
 
-A static site. No server, no database, no state of its own. Every number comes
-from the Grimoire gateway's `/stats` endpoints, fetched from the browser:
+A static site plus a thin nginx proxy. No database, no state of its own. Every
+number comes from the Grimoire gateway's `/stats` endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
@@ -21,21 +21,24 @@ That is the entire contract with Grimoire. The telemetry itself cannot move
 here: it comes from `nvidia-smi`, `/sys/class/hwmon` and the powercap mount, all
 of which only exist inside the gateway container on the grimoire host.
 
-## Signing in
+## Authentication
 
-Because the site is on a different host from the API, the gateway's `gw_session`
-cookie does not apply — it is `SameSite=Lax` and scoped to the chat host. The
-sign-in screen takes your Grimoire API key, keeps it in `localStorage`, and sends
-it as a bearer token.
+There is none, by design — you do not sign in.
 
-Two things have to line up for that to work:
+nginx proxies `/stats/` through to the gateway and attaches the API key on the
+way, from `GRIMOIRE_API_KEY` in the container's environment. So the page makes
+ordinary same-origin requests, the browser never holds a credential, and there is
+nothing to type. Neither the served HTML nor the JS bundle contains the key.
 
-1. The gateway must name this origin in `GRIMOIRE_CORS_ORIGINS`, or the browser
-   refuses to hand over the response. Set it to `https://dash.lost.plus`; never
-   to `*`, since these endpoints serve private usage and cost figures.
-2. `VITE_API_BASE` must point at the gateway. It is baked in at build time
-   (default `https://chat.lost.plus`) and can be overridden per browser from the
-   "Using a different gateway?" field on the sign-in screen.
+**The consequence is that the site itself is the only gate.** Anyone who can
+reach it can read your token counts, your spend, and your GPU telemetry. There is
+no second check behind it. Whatever fronts this hostname — a Cloudflare Access
+policy, a private network, or nothing at all — is exactly the protection the data
+has.
+
+Because the requests are now same-origin, `GRIMOIRE_CORS_ORIGINS` is no longer
+needed for the dashboard. The gateway still supports it for any other browser
+app, but it can be left empty.
 
 ## Running it
 
@@ -46,7 +49,11 @@ npm run build               # static output in dist/
 ```
 
 In the fleet it runs as the `dash` service in the repo's `docker-compose.yml`,
-nginx serving `dist/` on host port 9002.
+nginx serving `dist/` on host port 9002 and proxying `/stats/` to
+`http://grimoire:9001` over the shared compose network.
+
+`npm run dev` serves only the static page; `/stats` requests will 404 without the
+nginx in front, so use `docker compose up dash` to exercise the real thing.
 
 ## Polling
 
