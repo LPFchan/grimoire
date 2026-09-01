@@ -130,6 +130,37 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(kwargs, {"preserve_thinking": True})
         self.assertEqual(cfg, original)
 
+    def test_build_cmd_uses_family_chat_template_with_model_override(self):
+        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, \
+             tempfile.NamedTemporaryFile(suffix=".jinja") as family_template, \
+             tempfile.NamedTemporaryFile(suffix=".jinja") as model_template, \
+             patch.object(
+                 mm_module.registry,
+                 "get_family_defaults",
+                 return_value={"chat-template-file": family_template.name},
+             ):
+            inherited = entrypoint.build_cmd(
+                {"file": model_file.name, "family": "gemma4"},
+                port=8001,
+            )
+            overridden = entrypoint.build_cmd(
+                {
+                    "file": model_file.name,
+                    "family": "gemma4",
+                    "chat-template-file": model_template.name,
+                },
+                port=8001,
+            )
+
+        self.assertEqual(
+            inherited[inherited.index("--chat-template-file") + 1],
+            family_template.name,
+        )
+        self.assertEqual(
+            overridden[overridden.index("--chat-template-file") + 1],
+            model_template.name,
+        )
+
     def test_start_model_reuses_command_equivalent_reasoning_alias(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file:
             configs = {

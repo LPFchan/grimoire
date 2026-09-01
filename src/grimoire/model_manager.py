@@ -310,8 +310,15 @@ def build_cmd(cfg, port, alias=None):
             raise FileNotFoundError(f"MMProj file not found at {mmproj_path}")
         cmd.extend(["--mmproj", mmproj_path])
 
-    if cfg.get("chat-template-file"):
-        template_path = _resolve_config_path(cfg["chat-template-file"], base_dir="/")
+    family = cfg.get("family")
+    family_defaults = registry.get_family_defaults(family) if family else {}
+
+    if "chat-template-file" in cfg:
+        chat_template_file = cfg.get("chat-template-file")
+    else:
+        chat_template_file = family_defaults.get("chat-template-file")
+    if chat_template_file:
+        template_path = _resolve_config_path(chat_template_file, base_dir="/")
         if not os.path.exists(template_path):
             raise FileNotFoundError(f"Chat template file not found at {template_path}")
         cmd.extend(["--chat-template-file", template_path])
@@ -345,10 +352,7 @@ def build_cmd(cfg, port, alias=None):
     for arg in model_extra_args:
         cmd.append(str(arg))
 
-    family = cfg.get("family")
-    family_defaults = {}
     if family:
-        family_defaults = registry.get_family_defaults(family)
         family_extra_args, _ = split_chat_template_kwargs(family_defaults.get("extra-args", []))
         for arg in family_extra_args:
             cmd.append(str(arg))

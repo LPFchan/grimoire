@@ -1353,6 +1353,9 @@
     "eastself-reranker-0.6B": 0
   },
   "family_defaults": {
+    "gemma4": {
+      "chat-template-file": "/templates/gemma-4-31B-it-chat_template.jinja"
+    },
     "qwen": {
       "extra-args": [
         "--chat-template-kwargs",
