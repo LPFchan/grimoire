@@ -866,18 +866,6 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(captured["env"].get("LD_PRELOAD"), mm_module.config.PFLASH_SHIM_PATH)
         self.assertEqual(captured["env"].get("PFLASH_SHIM_FIFO_BASE"), "/tmp/pflash_shim.pflash-park-qwen3.6-27B")
 
-    def test_pflash_shim_listener_uses_fifo_open_pattern_compatible_with_python_client(self):
-        shim = (ROOT / "src" / "grimoire" / "dflash" / "pflash_shim.c").read_text()
-        self.assertIn('static char ctl_path[256] = "/tmp/pflash_shim.ctl";', shim)
-        self.assertIn('static char ack_path[256] = "/tmp/pflash_shim.ack";', shim)
-        self.assertIn('const char *base = getenv("PFLASH_SHIM_FIFO_BASE");', shim)
-        self.assertIn('snprintf(ctl_path, sizeof(ctl_path), "%s.ctl", base);', shim)
-        self.assertIn('snprintf(ack_path, sizeof(ack_path), "%s.ack", base);', shim)
-        self.assertIn('cf = open(ctl_path, O_RDWR);', shim)
-        self.assertIn('af = open(ack_path, O_WRONLY);', shim)
-        self.assertIn('close(af);', shim)
-        self.assertNotIn('af = open(ack_path, O_WRONLY | O_NONBLOCK);', shim)
-
     def test_llama_proxy_scopes_slot_files_and_serializes_slot_zero_per_model(self):
         llama_proxy = (ROOT / "src" / "grimoire" / "proxy" / "llama.py").read_text()
         self.assertIn('lock = getattr(active, "_pflash_slot_lock", None)', llama_proxy)
@@ -1121,14 +1109,6 @@ class DropInBlockerTests(unittest.TestCase):
             finally:
                 registry_mod.MODELS_DIR = old_models_dir
                 config.PFLASH_SHIM_PATH = old_shim
-
-    def test_pflash_build_stage_builds_only_pflash_daemon(self):
-        dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertNotIn("-DDFLASH27B_TESTS=ON", dockerfile)
-        self.assertIn("--target pflash_daemon", dockerfile)
-        self.assertNotIn("test_dflash", dockerfile)
-        self.assertIn("/opt/pflash/pflash_daemon", dockerfile)
-        self.assertIn("/opt/pflash/pflash_shim.so", dockerfile)
 
     def test_preserved_dflash_binaries_and_lib_dir_are_individually_configurable(self):
         config_src = (ROOT / "src" / "grimoire" / "config.py").read_text()

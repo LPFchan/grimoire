@@ -159,40 +159,6 @@ fi; \
 
 
 # =============================================================================
-# DFlash build stage: Compile the DFlash speculative decoding daemon
-# =============================================================================
-
-FROM ${CUDA_BASE} AS pflash-build
-
-WORKDIR /app
-
-COPY src/grimoire/pflash/ /app/pflash/
-
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates cmake build-essential && rm -rf /var/lib/apt/lists/*
-
-RUN --mount=type=cache,target=/root/.ccache \
-    --mount=type=cache,target=/app/.cache/pflash-build \
-    set -eux; \
-    cmake -B /app/.cache/pflash-build/build -S /app/pflash \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_ARCHITECTURES=86 \
-        -DPFLASH_FA_ALL_QUANTS=ON \
-        -DPFLASH_ENABLE_BSA=ON; \
-    cmake --build /app/.cache/pflash-build/build \
-        --target pflash_daemon --parallel "$(nproc)"; \
-    mkdir -p /opt/pflash; \
-    cp /app/.cache/pflash-build/build/pflash_daemon /opt/pflash/pflash_daemon; \
-    ccache --clear -q 2>/dev/null || rm -rf /root/.ccache/* 2>/dev/null; \
-    find /app/.cache/pflash-build/build -name "libggml*.so*" -exec cp {} /opt/pflash/ \; 2>/dev/null || true; \
-    ls -la /opt/pflash/
-
-# Compile the park/unpark LD_PRELOAD shim
-COPY src/grimoire/dflash/pflash_shim.c /app/pflash_shim.c
-RUN gcc -shared -o /opt/pflash/pflash_shim.so -fPIC -I/usr/local/cuda/include \
-    /app/pflash_shim.c -lcuda -ldl -Wall -Wextra 2>&1
-
-
-# =============================================================================
 # WebUI stage: Build the forked llama.cpp SvelteKit chat UI
 # =============================================================================
 
@@ -245,9 +211,6 @@ WORKDIR /app
 
 # Copy compiled llama-server
 COPY --from=build /opt/grimoire-llama-cpp /opt/grimoire-llama-cpp
-
-# Copy compiled pflash daemon
-COPY --from=pflash-build /opt/pflash /opt/pflash
 
 # Purge legacy directory name from older images
 RUN rm -rf /opt/model-a-llama-cpp
