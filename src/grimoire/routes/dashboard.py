@@ -117,8 +117,11 @@ def _build_dashboard_payload(user_hash, window):
             "series": telemetry_store.binned_avg(metric, gpu_index, ts_from, now_ts, bins),
         }
 
+    # Only GPUs the host actually has. This used to be {0, 1, *range(count)},
+    # which pinned two cards into the response no matter what was installed — so
+    # a machine with one GPU still drew a full set of GPU1 tiles, filled with
+    # whatever that index last reported, however long ago that was.
     manager = _get_manager()
-    gpu_indexes = sorted({0, 1, *range(manager.gpu_count)})
     gpus = [
         {
             "index": idx,
@@ -127,7 +130,7 @@ def _build_dashboard_payload(user_hash, window):
             "vram": _system("gpu_vram", idx),
             "tokens_per_sec": _system("gpu_tokens_per_sec", idx),
         }
-        for idx in gpu_indexes
+        for idx in range(manager.gpu_count)
     ]
 
     def _cumulative(series):
