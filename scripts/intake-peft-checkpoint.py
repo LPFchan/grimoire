@@ -133,7 +133,13 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("/home/yeowool/models/gguf"))
     parser.add_argument("--artifact-stem", help="output stem; defaults to model alias or checkpoint directory name")
     parser.add_argument("--adapter-gguf", type=Path, help="explicit output adapter GGUF path")
-    parser.add_argument("--tokenizer-gguf", type=Path, help="explicit tokenizer-aligned base GGUF path")
+    tokenizer_output = parser.add_mutually_exclusive_group()
+    tokenizer_output.add_argument("--tokenizer-gguf", type=Path, help="explicit tokenizer-aligned base GGUF output path")
+    tokenizer_output.add_argument(
+        "--shared-tokenizer-gguf",
+        type=Path,
+        help="existing verified tokenizer-aligned base GGUF shared by compatible checkpoints",
+    )
     parser.add_argument("--manifest", type=Path, help="explicit provenance manifest path")
     parser.add_argument("--model-alias", help="optional Grimoire registry model alias")
     parser.add_argument("--ctx-size", type=int, help="ctx-size to write when --update-registry is used")
@@ -159,7 +165,11 @@ def main() -> None:
     tokenizer_json = checkpoint / "tokenizer.json"
     adapter_model = checkpoint / "adapter_model.safetensors"
     adapter_gguf = (args.adapter_gguf or output_dir / f"{artifact_stem}-lora-tokenrep.gguf").resolve()
-    tokenizer_gguf = (args.tokenizer_gguf or output_dir / f"{base_gguf.stem}-{artifact_stem}-tokenizer.gguf").resolve()
+    shared_tokenizer_gguf = args.shared_tokenizer_gguf.resolve() if args.shared_tokenizer_gguf else None
+    tokenizer_gguf = (
+        shared_tokenizer_gguf
+        or (args.tokenizer_gguf or output_dir / f"{base_gguf.stem}-{artifact_stem}-tokenizer.gguf").resolve()
+    )
     manifest = (args.manifest or output_dir / f"{artifact_stem}.intake.json").resolve()
 
     _require_dir(checkpoint, "checkpoint directory")
@@ -167,6 +177,8 @@ def main() -> None:
     _require_file(tokenizer_json, "checkpoint tokenizer")
     _require_file(adapter_model, "adapter weights")
     _require_file(base_gguf, "base GGUF")
+    if shared_tokenizer_gguf:
+        _require_file(shared_tokenizer_gguf, "shared tokenizer GGUF")
     if args.base_hf:
         _require_dir(args.base_hf, "base HF directory")
         _require_file(args.base_hf / "config.json", "base HF config")
@@ -176,7 +188,10 @@ def main() -> None:
 
     if not output_dir.exists() and not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
-    for output in (adapter_gguf, tokenizer_gguf):
+    outputs = [adapter_gguf]
+    if shared_tokenizer_gguf is None:
+        outputs.append(tokenizer_gguf)
+    for output in outputs:
         if output.exists() and not (args.force or args.reuse_existing or args.dry_run):
             raise SystemExit(f"output exists; pass --reuse-existing or --force: {output}")
 
@@ -198,22 +213,24 @@ def main() -> None:
         converter_cmd.extend(["--base", _to_container_path(args.base_hf, args.host_models_dir, args.container_models_dir)])
     converter_cmd.append(container_checkpoint)
 
-    tokenizer_cmd = [
-        sys.executable,
-        str(REPO_ROOT / "scripts/write-gguf-tokenizer-from-hf.py"),
-        "--input",
-        str(base_gguf),
-        "--output",
-        str(tokenizer_gguf),
-        "--tokenizer-json",
-        str(tokenizer_json),
-        "--adapter-config",
-        str(adapter_config),
-    ]
-    if args.force:
-        tokenizer_cmd.append("--force")
-    if args.dry_run:
-        tokenizer_cmd.append("--dry-run")
+    tokenizer_cmd: list[str] | None = None
+    if shared_tokenizer_gguf is None:
+        tokenizer_cmd = [
+            sys.executable,
+            str(REPO_ROOT / "scripts/write-gguf-tokenizer-from-hf.py"),
+            "--input",
+            str(base_gguf),
+            "--output",
+            str(tokenizer_gguf),
+            "--tokenizer-json",
+            str(tokenizer_json),
+            "--adapter-config",
+            str(adapter_config),
+        ]
+        if args.force:
+            tokenizer_cmd.append("--force")
+        if args.dry_run:
+            tokenizer_cmd.append("--dry-run")
 
     print(f"checkpoint: {checkpoint}")
     print(f"base_gguf: {base_gguf}")
@@ -228,9 +245,12 @@ def main() -> None:
     else:
         _run(converter_cmd, dry_run=args.dry_run)
 
-    if args.skip_tokenizer or (tokenizer_gguf.exists() and args.reuse_existing):
+    if shared_tokenizer_gguf:
+        print(f"reuse shared tokenizer GGUF: {tokenizer_gguf}")
+    elif args.skip_tokenizer or (tokenizer_gguf.exists() and args.reuse_existing):
         print(f"reuse tokenizer GGUF: {tokenizer_gguf}")
     else:
+        assert tokenizer_cmd is not None
         _run(tokenizer_cmd, dry_run=False)
 
     registry_config: dict[str, Any] | None = None
@@ -258,6 +278,7 @@ def main() -> None:
         "artifact_stem": artifact_stem,
         "adapter_gguf": str(adapter_gguf),
         "tokenizer_gguf": str(tokenizer_gguf),
+        "shared_tokenizer_gguf": shared_tokenizer_gguf is not None,
         "token_summary": token_summary,
         "hashes": {
             "adapter_config": _maybe_sha256(adapter_config, dry_run=args.dry_run),
