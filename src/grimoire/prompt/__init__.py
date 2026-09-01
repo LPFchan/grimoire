@@ -1,6 +1,6 @@
 """Grimoire prompt rendering — shared helpers for chat template tokenization."""
 
-from grimoire.config import DFLASH_PROTECTED_TOOLS
+from grimoire.config import PROTECTED_TOOLS
 
 
 def _tool_name_from_message(msg, tool_call_names=None):

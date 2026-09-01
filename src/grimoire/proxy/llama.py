@@ -14,8 +14,7 @@ from fastapi.responses import StreamingResponse
 from grimoire import config
 from grimoire.chat_template import apply_chat_template_kwargs
 from grimoire.proxy.client import get_proxy_client
-from grimoire.dflash.kv_cache_store import KVCacheStore
-from grimoire.dflash.prefill import materialize_blocks, maybe_compress
+from grimoire.cache import KVCacheStore
 from grimoire.plugins import plugin_manager
 from grimoire.prompt.generic import _prefix_cache_boundaries, _prompt_layout_from_messages
 from grimoire.registry import registry, resolve_path
@@ -24,10 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 def _slot_lock(active):
-    lock = getattr(active, "_pflash_slot_lock", None)
+    lock = getattr(active, "_kv_slot_lock", None)
     if lock is None:
         lock = asyncio.Lock()
-        setattr(active, "_pflash_slot_lock", lock)
+        setattr(active, "_kv_slot_lock", lock)
     return lock
 
 
@@ -179,13 +178,6 @@ async def _proxy_chat(
     requested_name = registry.resolve(requested_model) or requested_model
     model_cfg = active_cfg if requested_name == active.name else (registry.get(requested_name) or active_cfg)
 
-    # Capture daemon and pcfg BEFORE first await to avoid race with eviction.
-    # After start_model releases the lock, a concurrent request can evict this
-    # model from its GPU, setting pflash_daemon=None and prefill_config=None
-    # on the same ActiveModel object. Reading them before the first yield
-    # (await below) closes the race window.
-    daemon = getattr(active, 'pflash_daemon', None)
-    pcfg = getattr(active, 'prefill_config', None)
     log = logging.getLogger(__name__)
 
     payload = copy.deepcopy(payload)
@@ -208,149 +200,12 @@ async def _proxy_chat(
             (active.name, user_hash or "anonymous", validated_conversation_id)
         )
 
-    _save_hash: Optional[bytes] = None
-
-    log.warning(f"pflash-proxy: daemon={daemon} running={daemon.is_running() if daemon else 'N/A'} pcfg={pcfg}")
-
     store = _kv_store(active)
-
-    if pcfg and pcfg.enabled:
-        try:
-            tokenizer = active.get_tokenizer()
-            messages = payload.get("messages", [])
-            prompt_ids, prompt_blocks = _prompt_layout_from_messages(
-                tokenizer, messages, add_generation_prompt=True,
-                model_cfg=model_cfg, active=active,
-            )
-            _save_hash = store.hash_prefix(prompt_ids)
-            if len(prompt_ids) >= pcfg.threshold:
-                if not daemon or not daemon.is_running():
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            f"pflash compression required for {active.name} "
-                            f"(prompt={len(prompt_ids)} >= threshold={pcfg.threshold}) "
-                            "but pflash daemon is not running. Check that the drafter model "
-                            "file exists and the daemon started at model load time."
-                        ),
-                    )
-
-                is_warm = store.lookup(_save_hash) is not None
-
-                if not is_warm:
-                    # ── COLD TURN: park + full compress + unpark ────────────
-                    park_ok = False
-                    if model_cfg.get("park-unpark"):
-                        try:
-                            park_ok = await asyncio.to_thread(active._park_llama)
-                            if park_ok:
-                                log.warning("pflash park: llama parked")
-                        except Exception as e:
-                            log.warning(f"pflash park: failed ({e}) — continuing without park")
-
-                    try:
-                        compressed_ids, fired, blocks = await maybe_compress(
-                            prompt_ids, daemon, pcfg, blocks=prompt_blocks,
-                        )
-                    except Exception as e:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=f"pflash compression failed for {active.name}: {e}",
-                        )
-                    finally:
-                        if park_ok:
-                            try:
-                                if await asyncio.to_thread(active._unpark_llama):
-                                    log.warning("pflash park: llama unparked")
-                            except Exception as e:
-                                log.warning(f"pflash park: unpark failed ({e})")
-
-                else:
-                    # ── WARM TURN: skip park, only compress delta blocks ────
-                    log.warning(f"pflash warm: KV cache exists for {validated_conversation_id}")
-                    try:
-                        compressed_ids, fired, blocks = await maybe_compress(
-                            prompt_ids, daemon, pcfg, blocks=prompt_blocks,
-                        )
-                    except Exception as e:
-                        raise HTTPException(
-                            status_code=503,
-                            detail=f"pflash compression failed for {active.name}: {e}",
-                        )
-
-                log.warning(f"pflash debug: fired={fired} orig={len(prompt_ids)} compressed={len(compressed_ids)}")
-                if not fired:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"pflash compression required for {active.name} "
-                            f"(prompt={len(prompt_ids)} >= threshold={pcfg.threshold}) "
-                            "but compression declined: no compressible blocks found. "
-                            "The prompt is too long for uncompressed serving. "
-                            "Reduce prompt size or adjust prefill-threshold/keep-ratio/tail-budget."
-                        ),
-                    )
-
-                if fired:
-                    msg_groups: dict[int, dict] = {}
-                    for block in blocks:
-                        if block.kind == "generation_prompt":
-                            continue
-                        key = block.message_start
-                        if key not in msg_groups:
-                            msg_groups[key] = {
-                                "role": block.role,
-                                "token_ids": [],
-                                "metadata": {},
-                                "has_tool_calls": False,
-                                "has_reasoning": False,
-                                "tool_calls": [],
-                            }
-                        msg_groups[key]["token_ids"].extend(
-                            compressed_ids[block.start:block.end]
-                        )
-                        meta = block.metadata or {}
-                        if meta.get("reasoning"):
-                            msg_groups[key]["has_reasoning"] = True
-                        if block.kind == "tool_call":
-                            msg_groups[key]["has_tool_calls"] = True
-                            tool_name = meta.get("tool_name")
-                            if tool_name:
-                                msg_groups[key]["tool_calls"].append({
-                                    "name": tool_name,
-                                })
-                        msg_groups[key]["metadata"].update(meta)
-                    new_messages = []
-                    for key in sorted(msg_groups):
-                        m = msg_groups[key]
-                        text = tokenizer.decode(m["token_ids"])
-                        entry: dict = {"role": m["role"], "content": text}
-                        for md_key in ("reasoning_content", "tool_call_id",
-                                       "tool_names", "message_indexes"):
-                            if md_key in m["metadata"]:
-                                entry[md_key] = m["metadata"][md_key]
-                        if m["has_reasoning"]:
-                            entry["reasoning_content"] = text
-                        if m["has_tool_calls"]:
-                            entry["tool_calls"] = m["tool_calls"]
-                        new_messages.append(entry)
-                    log.warning(f"pflash debug: messages {len(payload['messages'])} -> {len(new_messages)}")
-                    payload["messages"] = new_messages
-                    _save_hash = store.hash_prefix(prompt_ids)
-                    log.warning(f"pflash kv: will save with hash {_save_hash.hex()[:16]}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(
-                status_code=503,
-                detail=f"pflash compression setup failed for {active.name}: {e}",
-            )
 
     client = get_proxy_client()
     slot_guard = None
     slot_url = None
-    pflash_slots_enabled = bool(pcfg and pcfg.enabled)
-    needs_slot_guard = pflash_slots_enabled or validated_conversation_id is not None
+    needs_slot_guard = validated_conversation_id is not None
     if needs_slot_guard:
         slot_guard = _slot_lock(active)
         await slot_guard.acquire()
@@ -367,10 +222,7 @@ async def _proxy_chat(
             # its configured parallel slots.
             slot_url = f"http://127.0.0.1:{active.port}/slots/0"
             prev_conv = getattr(active, "_current_conv_id", None)
-            if _save_hash is not None:
-                # pflash path: restore by compressed content hash
-                await _try_restore_kv(client, slot_url, None, store, log, override_hash=_save_hash)
-            elif validated_conversation_id and validated_conversation_id != prev_conv:
+            if validated_conversation_id and validated_conversation_id != prev_conv:
                 # Same-model conversation switch: save old to tmpfs, restore target.
                 if prev_conv:
                     await store.save_conv(client, slot_url, prev_conv)
@@ -428,10 +280,6 @@ async def _proxy_chat(
         finally:
             try:
                 await upstream.aclose()
-                # KV prefix cache: save slot by content hash (pflash path only)
-                if _save_hash and slot_url:
-                    async with httpx.AsyncClient(timeout=5) as sc:
-                        await _save_kv(sc, slot_url, _save_hash, store, log)
             finally:
                 if slot_guard is not None:
                     slot_guard.release()

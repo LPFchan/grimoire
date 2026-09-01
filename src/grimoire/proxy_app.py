@@ -3,7 +3,7 @@
 Run under `uvicorn --workers N`. Owns the public port. For the stateless encoder
 endpoints (/v1/embeddings, /v1/rerank) it resolves the target model from the
 shared route table and round-robins across its replica backends (data
-parallelism across GPUs). Everything else — chat (stateful: KV slots, pflash,
+parallelism across GPUs). Everything else — chat (stateful: KV slots,
 history), the Responses API, and all admin/management routes — is forwarded to
 the single manager process, which owns model lifecycle.
 

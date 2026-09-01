@@ -97,24 +97,6 @@ class DropInBlockerTests(unittest.TestCase):
             cmd = entrypoint.build_cmd({"file": model_file.name}, port=8001)
         self.assertEqual(cmd[cmd.index("--host") + 1], "127.0.0.1")
 
-    def test_build_cmd_emits_native_dflash_canary_flags(self):
-        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, tempfile.NamedTemporaryFile(suffix=".gguf") as draft_file:
-            cmd = entrypoint.build_cmd(
-                {
-                    "file": model_file.name,
-                    "draft": draft_file.name,
-                    "speculative-type": "dflash",
-                    "spec-dflash-cross-ctx": 1024,
-                },
-                port=8001,
-            )
-        self.assertIn("--spec-type", cmd)
-        self.assertEqual(cmd[cmd.index("--spec-type") + 1], "dflash")
-        self.assertIn("--spec-draft-model", cmd)
-        self.assertEqual(cmd[cmd.index("--spec-draft-model") + 1], draft_file.name)
-        self.assertIn("--spec-dflash-cross-ctx", cmd)
-        self.assertEqual(cmd[cmd.index("--spec-dflash-cross-ctx") + 1], "1024")
-
     def test_build_cmd_merges_template_kwargs_and_keeps_reasoning_per_request(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(
             mm_module.registry,
@@ -814,61 +796,9 @@ class DropInBlockerTests(unittest.TestCase):
         finally:
             mm_module.registry = old_registry
 
-    def test_normal_llama_start_keeps_opt_dflash_out_of_library_path(self):
-        captured = {}
-
-        class FakeProc:
-            pid = 12345
-
-            def poll(self):
-                return None
-
-        def fake_popen(cmd, env=None, preexec_fn=None):
-            captured["cmd"] = cmd
-            captured["env"] = dict(env or {})
-            captured["preexec_fn"] = preexec_fn
-            return FakeProc()
-
-        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(mm_module.subprocess, "Popen", side_effect=fake_popen):
-            active = mm_module.ActiveModel("qwen-3.6-27B", {"file": model_file.name}, port=8001, gpu=0)
-            active._start_llama()
-
-        ld_library_path = captured["env"].get("LD_LIBRARY_PATH", "")
-        self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
-        self.assertNotIn(mm_module.config.PFLASH_HOME, ld_library_path)
-        self.assertNotIn("LD_PRELOAD", captured["env"])
-
-    def test_park_model_still_uses_shim_without_global_opt_dflash_path(self):
-        captured = {}
-
-        class FakeProc:
-            pid = 12345
-
-            def poll(self):
-                return None
-
-        def fake_popen(cmd, env=None, preexec_fn=None):
-            captured["env"] = dict(env or {})
-            return FakeProc()
-
-        with tempfile.NamedTemporaryFile(suffix=".gguf") as model_file, patch.object(mm_module.subprocess, "Popen", side_effect=fake_popen):
-            active = mm_module.ActiveModel(
-                "pflash-park-qwen3.6-27B",
-                {"file": model_file.name, "park-unpark": True},
-                port=8001,
-                gpu=0,
-            )
-            active._start_llama()
-
-        ld_library_path = captured["env"].get("LD_LIBRARY_PATH", "")
-        self.assertIn(mm_module.config.TURBOQUANT_LIB_DIR, ld_library_path)
-        self.assertNotIn(mm_module.config.PFLASH_HOME, ld_library_path)
-        self.assertEqual(captured["env"].get("LD_PRELOAD"), mm_module.config.PFLASH_SHIM_PATH)
-        self.assertEqual(captured["env"].get("PFLASH_SHIM_FIFO_BASE"), "/tmp/pflash_shim.pflash-park-qwen3.6-27B")
-
     def test_llama_proxy_scopes_slot_files_and_serializes_slot_zero_per_model(self):
         llama_proxy = (ROOT / "src" / "grimoire" / "proxy" / "llama.py").read_text()
-        self.assertIn('lock = getattr(active, "_pflash_slot_lock", None)', llama_proxy)
+        self.assertIn('lock = getattr(active, "_kv_slot_lock", None)', llama_proxy)
         self.assertIn('await slot_guard.acquire()', llama_proxy)
         self.assertIn('slot_guard.release()', llama_proxy)
         self.assertIn('store.kv_filename(hash_bytes)', llama_proxy)
@@ -1039,87 +969,5 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertEqual(config["file"], "gguf/derived.gguf")
         self.assertEqual(config["mmproj"], "gguf/gemma4-mmproj-BF16.gguf")
         self.assertEqual(config["capabilities"], ["completion", "multimodal"])
-    def test_llama_side_pflash_startup_fails_closed_when_daemon_boot_fails(self):
-        class FakeRegistry:
-            def resolve(self, name):
-                return name
-
-            def get(self, name):
-                return {
-                    "file": "target.gguf",
-                    "pflash": True,
-                    "drafter": "drafter.gguf",
-                }
-
-            def validate(self, name, gpu_count=None):
-                return True, "OK"
-
-            def get_fixed_gpu(self, name):
-                return None
-
-            def is_fixed(self, name):
-                return False
-
-        old_registry = mm_module.registry
-        try:
-            mm_module.registry = FakeRegistry()
-            manager = entrypoint.ModelManager(gpu_count=1)
-            with patch.object(mm_module, "resolve_path", side_effect=lambda cfg, key: f"/tmp/{key}.gguf"), \
-                 patch.object(mm_module.ActiveModel, "_start_pflash_daemon", side_effect=RuntimeError("daemon boom")), \
-                 patch.object(mm_module.ActiveModel, "start") as start_backend:
-                with self.assertRaises(RuntimeError) as cm:
-                    asyncio.run(manager.start_model("pflash-qwen3.6-27B"))
-            self.assertIn("daemon boom", str(cm.exception))
-            self.assertFalse(start_backend.called)
-            self.assertEqual(manager.active, {})
-        finally:
-            mm_module.registry = old_registry
-
-    def test_llama_registry_validation_requires_pflash_drafter_and_park_shim(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            state_path = Path(tmp) / "models.json"
-            model_path = Path(tmp) / "target.gguf"
-            model_path.write_text("x")
-            registry = ModelRegistry(path=str(state_path), seed_path=None)
-            registry.add(
-                "pflash-test",
-                {
-                    "file": model_path.name,
-                    "pflash": True,
-                    "drafter": "missing-drafter.gguf",
-                },
-            )
-
-            import grimoire.registry as registry_mod
-            old_models_dir = registry_mod.MODELS_DIR
-            old_shim = config.PFLASH_SHIM_PATH
-            try:
-                registry_mod.MODELS_DIR = tmp
-                valid, reason = registry.validate("pflash-test")
-                self.assertFalse(valid)
-                self.assertIn("PFlash drafter", reason)
-
-                drafter = Path(tmp) / "drafter.gguf"
-                drafter.write_text("x")
-                registry.update("pflash-test", {"drafter": drafter.name, "park-unpark": True})
-                config.PFLASH_SHIM_PATH = str(Path(tmp) / "missing-shim.so")
-                valid, reason = registry.validate("pflash-test")
-                self.assertFalse(valid)
-                self.assertIn("park-unpark shim", reason)
-            finally:
-                registry_mod.MODELS_DIR = old_models_dir
-                config.PFLASH_SHIM_PATH = old_shim
-
-    def test_preserved_dflash_binaries_and_lib_dir_are_individually_configurable(self):
-        config_src = (ROOT / "src" / "grimoire" / "config.py").read_text()
-        daemon_src = (ROOT / "src" / "grimoire" / "dflash" / "daemon.py").read_text()
-
-        self.assertIn('PFLASH_LIB_DIR = os.environ.get("GRIMOIRE_PFLASH_LIB_DIR", PFLASH_HOME)', config_src)
-        self.assertIn('PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(PFLASH_HOME, "pflash_daemon"))', config_src)
-        self.assertIn('PFLASH_SHIM_PATH = os.environ.get("GRIMOIRE_PFLASH_SHIM_PATH", os.path.join(PFLASH_HOME, "pflash_shim.so"))', config_src)
-        self.assertIn('config.PFLASH_DAEMON_BIN', daemon_src)
-        self.assertIn('config.PFLASH_LIB_DIR', daemon_src)
-
-
 if __name__ == "__main__":
     unittest.main()

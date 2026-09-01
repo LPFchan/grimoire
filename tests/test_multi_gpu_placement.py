@@ -128,9 +128,6 @@ class PlacementTests(unittest.TestCase):
                 for field, value in (
                     ("cpu-only", True),
                     ("vram-budget-mib", 1),
-                    ("pflash", True),
-                    ("park-unpark", True),
-                    ("speculative-type", "dflash"),
                 ):
                     cfg = {"file": "model.gguf", "gpu-ids": [0, 1], field: value}
                     registry._data["models"]["model"] = cfg

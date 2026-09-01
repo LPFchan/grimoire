@@ -1,7 +1,7 @@
 """Generic prompt layout, block building, and tokenization dispatcher."""
 
 from grimoire import config
-from grimoire.dflash.prefill import PromptBlock
+from grimoire.cache import PromptBlock
 from grimoire.prompt import _tool_name_from_message
 from grimoire.prompt.qwen import (
     _encode_qwen_prompt_blocks,
@@ -77,7 +77,7 @@ def _generic_prompt_blocks(messages, tokenizer, prompt_ids, add_generation_promp
                 kind=kind,
                 message_start=index,
                 message_end=index + 1,
-                protected=tool_name in config.DFLASH_PROTECTED_TOOLS,
+                protected=tool_name in config.PROTECTED_TOOLS,
                 metadata=metadata,
             )
         )

@@ -245,12 +245,6 @@ def _validate_model_config(data: dict, gpu_count=None) -> None:
             incompatible.append("cpu-only")
         if data.get("vram-budget-mib") is not None:
             incompatible.append("vram-budget-mib")
-        if data.get("pflash"):
-            incompatible.append("pflash")
-        if data.get("park-unpark"):
-            incompatible.append("park-unpark")
-        if data.get("speculative-type") == "dflash":
-            incompatible.append("speculative-type=dflash")
         if incompatible:
             raise HTTPException(
                 status_code=400,
@@ -265,12 +259,6 @@ def _validate_model_config(data: dict, gpu_count=None) -> None:
     if spec_type == "mtp":
         if not data.get("mtp-head"):
             raise HTTPException(status_code=400, detail="'mtp-head' is required when speculative-type is 'mtp'")
-    if spec_type == "dflash":
-        draft = data.get("spec-draft-model") or data.get("draft")
-        if not draft:
-            raise HTTPException(status_code=400, detail="'spec-draft-model' is required when speculative-type is 'dflash'")
-    if data.get("pflash") and not data.get("drafter"):
-        raise HTTPException(status_code=400, detail="'drafter' is required when pflash is enabled")
 
 
 @router.get("/v1/models")
@@ -285,7 +273,7 @@ async def get_v1_models(request: Request):
         item["active"] = manager.get_active(name) is not None
         item["status"] = {"value": manager.get_status(name)}
         item["in_cache"] = True
-        # llama backends carry `file`; dflash carries `target`.
+        # llama backends carry `file`.
         item["path"] = cfg.get("file") or cfg.get("target") or ""
         item["context_window"] = cfg.get("ctx-size", DEFAULT_CTX_SIZE)
     return {"object": "list", "data": data}
@@ -1195,11 +1183,6 @@ def _register_model(task_id: str):
     # Strip incompatible combos
     if config.get("speculative-type") == "mtp" and not config.get("mtp-head"):
         config.pop("speculative-type", None)
-    if config.get("speculative-type") == "dflash" and not config.get("spec-draft-model"):
-        config.pop("speculative-type", None)
-    if config.get("pflash") and not config.get("drafter"):
-        config.pop("pflash", None)
-        config.pop("park-unpark", None)
     caps = config.get("capabilities") or []
     if ("multimodal" in caps or "vision" in caps) and not config.get("mmproj"):
         config["capabilities"] = [c for c in caps if c not in ("multimodal", "vision")]

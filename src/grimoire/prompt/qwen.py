@@ -224,7 +224,7 @@ def _qwen_prompt_block_specs(messages, add_generation_prompt=False):
                 tool_name = _tool_name_from_message(tool_msg, tool_call_names)
                 if isinstance(tool_name, str):
                     tool_names.append(tool_name)
-                    protected = protected or tool_name in config.DFLASH_PROTECTED_TOOLS
+                    protected = protected or tool_name in config.PROTECTED_TOOLS
                 index += 1
             parts.append("<|im_end|>\n")
             specs.append({

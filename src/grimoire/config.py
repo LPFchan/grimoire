@@ -28,10 +28,6 @@ def _env_bool(name, default=False):
 LLAMA_SERVER_BIN = "/opt/grimoire-llama-cpp/bin/llama-server"
 TURBOQUANT_LIB_DIR = os.environ.get("GRIMOIRE_TURBOQUANT_LIB_DIR", "/opt/grimoire-llama-cpp/lib")
 TURBOQUANT_LIB64_DIR = os.environ.get("GRIMOIRE_TURBOQUANT_LIB64_DIR", "/opt/grimoire-llama-cpp/lib64")
-PFLASH_HOME = os.environ.get("GRIMOIRE_PFLASH_HOME", "/opt/pflash")
-PFLASH_LIB_DIR = os.environ.get("GRIMOIRE_PFLASH_LIB_DIR", PFLASH_HOME)
-PFLASH_DAEMON_BIN = os.environ.get("GRIMOIRE_PFLASH_DAEMON_BIN", os.path.join(PFLASH_HOME, "pflash_daemon"))
-PFLASH_SHIM_PATH = os.environ.get("GRIMOIRE_PFLASH_SHIM_PATH", os.path.join(PFLASH_HOME, "pflash_shim.so"))
 
 # Model defaults
 DEFAULT_CTX_SIZE = 131072
@@ -106,14 +102,8 @@ DASHBOARD_WINDOWS_S = {
 }
 DASHBOARD_BINS = 60
 
-# DFlash
-DFLASH_PROTECTED_TOOLS = {"obsidian_read-note"}
-DFLASH_SUPPORTED_SAMPLING = {"temperature", "top_p", "top_k", "seed"}
-DFLASH_IGNORED_SAMPLING = {
-    "min_p", "repetition_penalty", "frequency_penalty",
-    "presence_penalty", "logit_bias", "typical_p", "tfs_z", "mirostat",
-}
-
+# Tool results whose blocks must never be dropped from a rendered prompt.
+PROTECTED_TOOLS = {"obsidian_read-note"}
 # Default generation parameters (for /props synthetic response)
 DEFAULT_GENERATION_PARAMS = {
     "n_predict": DEFAULT_PREDICT,

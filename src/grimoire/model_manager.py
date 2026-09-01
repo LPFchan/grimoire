@@ -23,7 +23,6 @@ from grimoire.chat_template import (
     configured_chat_template_kwargs,
     split_chat_template_kwargs,
 )
-from grimoire.dflash import PflashDaemon, PrefillConfig
 from grimoire.registry import (
     MODELS_DIR,
     registry,
@@ -210,44 +209,6 @@ def _extend_optional_arg(cmd, cfg, key, flag=None):
         cmd.extend([flag or f"--{key}", str(value)])
 
 
-def _append_native_dflash_args(cmd, cfg):
-    if cfg.get("backend", BACKEND_LLAMA) != BACKEND_LLAMA:
-        return
-    if cfg.get("speculative-type") != "dflash":
-        return
-
-    draft_model = _resolve_config_path(cfg.get("spec-draft-model") or cfg.get("draft"))
-    if not draft_model:
-        raise FileNotFoundError("Native DFlash requires a GGUF draft model path")
-    if not os.path.exists(draft_model):
-        raise FileNotFoundError(f"Native DFlash draft model not found at {draft_model}")
-
-    cmd.extend(["--spec-type", "dflash", "--spec-draft-model", draft_model])
-
-    cross_ctx = cfg.get("spec-dflash-cross-ctx")
-    if cross_ctx is not None:
-        cmd.extend(["--spec-dflash-cross-ctx", str(cross_ctx)])
-
-    max_slots = cfg.get("spec-dflash-max-slots")
-    if max_slots is not None:
-        cmd.extend(["--spec-dflash-max-slots", str(max_slots)])
-
-    draft_n_max = cfg.get("spec-draft-n-max")
-    if draft_n_max is not None:
-        cmd.extend(["--spec-draft-n-max", str(draft_n_max)])
-
-    branch_budget = cfg.get("spec-branch-budget")
-    if branch_budget is not None:
-        cmd.extend(["--spec-branch-budget", str(branch_budget)])
-
-    draft_topk = cfg.get("spec-draft-top-k")
-    if draft_topk is not None:
-        cmd.extend(["--spec-draft-top-k", str(draft_topk)])
-
-    draft_temp = cfg.get("spec-draft-temp")
-    if draft_temp is not None:
-        cmd.extend(["--spec-draft-temp", str(draft_temp)])
-
 
 def _prepend_library_paths(env, paths, exclude_prefixes=()):
     existing = []
@@ -325,7 +286,6 @@ def build_cmd(cfg, port, alias=None):
 
     _extend_optional_arg(cmd, cfg, "image-min-tokens")
     _extend_optional_arg(cmd, cfg, "image-max-tokens")
-    _append_native_dflash_args(cmd, cfg)
 
     spec_type = cfg.get("speculative-type")
     if spec_type in ("nextn", "mtp"):
@@ -343,7 +303,7 @@ def build_cmd(cfg, port, alias=None):
     if spec_type in ("nextn", "mtp"):
         model_extra_args = [
             arg for arg in model_extra_args
-            if arg != "--spec-type" and arg not in ("nextn", "mtp", "dflash", "draft-mtp", "draft-nextn")
+            if arg != "--spec-type" and arg not in ("nextn", "mtp", "draft-mtp", "draft-nextn")
         ]
 
     for bias in cfg.get("logit-bias", []) or []:
@@ -375,7 +335,7 @@ def runtime_command_signature(cfg):
 
 
 class ActiveModel:
-    """Manage a running model backend process (llama-server or dflash daemon)."""
+    """Manage a running model backend process (llama-server)."""
 
     def __init__(self, name, cfg, port, gpu):
         self.name = name
@@ -395,8 +355,6 @@ class ActiveModel:
         self.status = config.MODEL_STATUS_LOADING
         self.backend_type = cfg.get("backend", BACKEND_LLAMA)
 
-        self.pflash_daemon: Optional[PflashDaemon] = None
-        self.prefill_config: Optional[PrefillConfig] = None
         self.kv_cache_store = None
         self.snapshot_staging_slot: int = 7
         self._tokenizer = None
@@ -412,109 +370,18 @@ class ActiveModel:
         env = os.environ.copy()
         if self.placement is not None:
             configure_gpu_environment(env, self.cfg, self.placement)
-            # Put turboquant ggml libraries first so llama-server doesn't
-            # accidentally load dflash's (older) ggml-cuda which lacks the
-            # turboquant-specific symbols (e.g. g_innerq_scale_inv_host).
+            # Put turboquant ggml libraries first for llama-server.
             _prepend_library_paths(
                 env,
                 [config.TURBOQUANT_LIB_DIR, config.TURBOQUANT_LIB64_DIR],
-                exclude_prefixes=(config.PFLASH_HOME,),
             )
         else:
             # CPU-only: hide GPUs entirely so llama-server's CUDA backend
             # doesn't try to init (and OOM) when VRAM is full.
             env["CUDA_VISIBLE_DEVICES"] = ""
 
-        # LD_PRELOAD the park/unpark shim for park models
-        if self.cfg.get("park-unpark"):
-            existing_pre = env.get("LD_PRELOAD", "")
-            shim_path = config.PFLASH_SHIM_PATH
-            env["LD_PRELOAD"] = f"{shim_path}:" + existing_pre if existing_pre else shim_path
-            env["PFLASH_SHIM_FIFO_BASE"] = f"/tmp/pflash_shim.{self.name}"
-            logger.info(f"park-unpark enabled, LD_PRELOAD={env['LD_PRELOAD']}")
-
-        # Auto-derive GGML_DFLASH_MAX_VERIFY_TOKENS from DFlash tree config
-        # so the C++ binary's tape/hidden-GPU path isn't silently capped at 25.
-        if self.cfg.get("speculative-type") == "dflash":
-            n_max = self.cfg.get("spec-draft-n-max", 16)
-            branch_budget = self.cfg.get("spec-branch-budget", 0)
-            draft_topk = self.cfg.get("spec-draft-top-k", 1)
-            tree_budget = min(n_max + branch_budget, n_max * max(1, draft_topk))
-            verify_tokens = tree_budget + 4  # small headroom for root + bonus
-            if "GGML_DFLASH_MAX_VERIFY_TOKENS" not in env:
-                env["GGML_DFLASH_MAX_VERIFY_TOKENS"] = str(verify_tokens)
-                logger.info(
-                    "Auto-set GGML_DFLASH_MAX_VERIFY_TOKENS=%d "
-                    "(n_max=%d, branch_budget=%d, topk=%d, tree_budget=%d)",
-                    verify_tokens, n_max, branch_budget, draft_topk, tree_budget
-                )
-
-        device_label = "CPU" if self.placement is None else f"GPU(s) {','.join(map(str, self.gpus))}"
-        logger.info(f"Starting {self.name} (llama) on {device_label}, port {self.port}")
-        logger.info(f"Command: {' '.join(cmd)}")
-
         self.process = subprocess.Popen(cmd, env=env, preexec_fn=_spawn_child_preexec)
         return self.process
-
-    def _park_llama(self):
-        """Park llama-server GPU memory via shim FIFO (VMM unmap + host save)."""
-        try:
-            import os, select
-            base = f"/tmp/pflash_shim.{self.name}"
-            fd = os.open(f"{base}.ctl", os.O_WRONLY | os.O_NONBLOCK)
-            os.write(fd, b"park\n")
-            os.close(fd)
-            with open(f"{base}.ack", "r") as f:
-                poll = select.poll()
-                poll.register(f, select.POLLIN)
-                if poll.poll(30000):
-                    resp = f.read().strip()
-                    return resp == "ok"
-            logger.warning("park: ack timeout")
-            return False
-        except Exception as e:
-            logger.warning(f"park failed: {e}")
-            return False
-
-    def _unpark_llama(self):
-        """Unpark llama-server GPU memory via shim FIFO (VMM remap + host restore)."""
-        try:
-            import os, select
-            base = f"/tmp/pflash_shim.{self.name}"
-            fd = os.open(f"{base}.ctl", os.O_WRONLY | os.O_NONBLOCK)
-            os.write(fd, b"unpark\n")
-            os.close(fd)
-            with open(f"{base}.ack", "r") as f:
-                poll = select.poll()
-                poll.register(f, select.POLLIN)
-                if poll.poll(30000):
-                    resp = f.read().strip()
-                    return resp == "ok"
-            logger.warning("unpark: ack timeout")
-            return False
-        except Exception as e:
-            logger.warning(f"unpark failed: {e}")
-            return False
-
-    def _start_pflash_daemon(self):
-        """Start the PFlash compression daemon on the same GPU."""
-        drafter_path = resolve_path(self.cfg, "drafter")
-        if not drafter_path:
-            raise RuntimeError(f"pflash requested but no drafter configured for {self.name}")
-
-        # Pre-build PrefillConfig from model config
-        self.prefill_config = PrefillConfig(
-            enabled=True,
-            threshold=int(self.cfg.get("prefill-threshold", 48000)),
-            keep_ratio=float(self.cfg.get("prefill-keep-ratio", 0.05)),
-            drafter_path=drafter_path,
-            tail_budget=int(self.cfg.get("prefill-tail-budget", 16000)),
-        )
-
-        daemon = PflashDaemon(drafter_path=drafter_path, gpu_id=self.gpu)
-        daemon.start()
-        self.pflash_daemon = daemon
-        logger.info(f"Started pflash daemon for {self.name} on GPU {self.gpu}")
 
     async def wait_ready(self, timeout=config.DEFAULT_STARTUP_TIMEOUT):
         """Wait until the backend is ready."""
@@ -560,16 +427,6 @@ class ActiveModel:
     def stop(self):
         """Stop the backend process."""
         self._stop_llama()
-        self._stop_pflash_daemon()
-
-    def _stop_pflash_daemon(self):
-        if self.pflash_daemon:
-            try:
-                self.pflash_daemon.stop()
-            except Exception:
-                pass
-            self.pflash_daemon = None
-        self.prefill_config = None
 
     def _stop_llama(self):
         """Stop the llama-server process."""
@@ -613,7 +470,7 @@ class ActiveModel:
         if not spec:
             raise RuntimeError(
                 f"Model '{self.name}' has no 'tokenizer' configured; "
-                "dflash models require an explicit tokenizer (HF repo id or local path)"
+                "an explicit tokenizer (HF repo id or local path) is required"
             )
         from transformers import AutoTokenizer
         source = _strip_hf_prefix(resolve_path(self.cfg, "tokenizer") if _looks_like_local_path(spec) else spec)
@@ -762,8 +619,6 @@ class ModelManager:
                 key in requested_template_kwargs or key in active_template_kwargs
                 for key in REQUEST_ONLY_TEMPLATE_KWARGS
             ):
-                continue
-            if any(cfg.get(key) or active_cfg.get(key) for key in ("pflash", "drafter")):
                 continue
             if (cfg.get("replica_peers") or []) != (active_cfg.get("replica_peers") or []):
                 continue
@@ -1024,11 +879,6 @@ class ModelManager:
     async def _start_active_model(self, active: ActiveModel):
         """Start an ActiveModel and wait until it is ready."""
         active.status = config.MODEL_STATUS_LOADING
-        logger.warning(f"pflash: cfg.pflash={active.cfg.get('pflash')}")
-        if active.cfg.get("pflash"):
-            await asyncio.to_thread(active._start_pflash_daemon)
-            logger.warning(f"pflash: daemon started for {active.name}")
-
         await asyncio.to_thread(active.start)
         await active.wait_ready(timeout=self._startup_timeout(active.cfg))
         active.status = config.MODEL_STATUS_LOADED
@@ -1069,11 +919,9 @@ class ModelManager:
         if any(gpu >= self.gpu_count for gpu in gpu_ids):
             raise ValueError(f"gpu_ids contains a GPU outside range 0-{self.gpu_count - 1}")
         incompatible = []
-        for field in ("cpu-only", "vram-budget-mib", "pflash", "park-unpark"):
+        for field in ("cpu-only", "vram-budget-mib"):
             if cfg.get(field):
                 incompatible.append(field)
-        if cfg.get("speculative-type") == "dflash":
-            incompatible.append("speculative-type=dflash")
         if incompatible:
             raise ValueError(f"gpu_ids is incompatible with {', '.join(incompatible)}")
         pin = self.effective_fixed_gpu(model_name)

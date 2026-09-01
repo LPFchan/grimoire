@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
 # =============================================================================
-# Grimoire - Multi-GPU llama.cpp + DFlash inference server
+# Grimoire - Multi-GPU llama.cpp inference server
 # =============================================================================
 
 ARG CUDA_BASE=nvidia/cuda:12.8.1-devel-ubuntu22.04

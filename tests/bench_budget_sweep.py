@@ -51,7 +51,7 @@ PROMPTS = [
 def call_server(port, prompt, max_tokens=256, config_override=None):
     headers = {"Content-Type": "application/json"}
     body = {
-        "model": "dflash-qwen3.6-27B",
+        "model": "qwen3.8-27B-low",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": False,

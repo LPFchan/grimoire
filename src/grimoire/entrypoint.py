@@ -53,13 +53,8 @@ from grimoire.config import (
     MODEL_STATUS_FAILED,
     DASHBOARD_WINDOWS_S,
     DASHBOARD_BINS,
-    DFLASH_PROTECTED_TOOLS,
-    DFLASH_SUPPORTED_SAMPLING,
-    DFLASH_IGNORED_SAMPLING,
     DEFAULT_GENERATION_PARAMS,
 )
-from grimoire.dflash import PrefillConfig
-from grimoire.dflash.prefill import PromptBlock, materialize_blocks, maybe_compress
 from grimoire.history import history_store, identity_hash
 from grimoire.ingest import download_model_file, model_filename_from_url
 from grimoire.plugins import plugin_manager

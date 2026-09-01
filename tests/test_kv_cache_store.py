@@ -8,7 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from grimoire.dflash.kv_cache_store import KVCacheStore, KV_PREFIX, KV_SUFFIX
+from grimoire.cache.kv_cache_store import KVCacheStore, KV_PREFIX, KV_SUFFIX
 
 
 def _make_ids(n: int, seed: int = 0) -> list:
