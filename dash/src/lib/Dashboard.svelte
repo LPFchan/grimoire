@@ -352,7 +352,14 @@
 
 <div class="flex h-full w-full flex-col overflow-auto px-6 py-6 md:px-10 md:py-8">
 	<header class="sticky top-0 z-10 -mx-6 -mt-6 mb-8 flex flex-wrap items-center justify-end gap-4 px-6 py-3">
-		<div class="inline-flex rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Window">
+		<!-- Frosted rather than opaque: the header is sticky and cards scroll
+		     underneath, so the pill needs to stay legible without painting a
+		     full-width bar across the top of the page. -->
+		<div
+			class="inline-flex rounded-lg border bg-muted/60 p-1 shadow-md backdrop-blur-md"
+			role="tablist"
+			aria-label="Window"
+		>
 			{#each WINDOWS as w}
 				<button
 					type="button"
