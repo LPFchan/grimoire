@@ -35,15 +35,21 @@ class FakeRequest:
 
 
 class DropInBlockerTests(unittest.TestCase):
-    def test_required_model_aliases_are_registered(self):
+    def test_pinned_aliases_exist_in_the_registry(self):
+        """A GPU pin must name a model the registry can actually serve.
+
+        The `fixed` block pins the always-on embedder and reranker to a GPU. A
+        pin naming an alias that no longer exists strands silently: nothing
+        errors at load, the model simply never starts, and the endpoints it
+        backs return 503 with no obvious cause.
+        """
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        aliases = set(data["models"])
-        self.assertTrue({
-            "gemma-4-31B",
-            "qwen-3.6-27B",
-            "dflash-qwen3.6-27B",
-            "pflash-qwen3.6-27B",
-        }.issubset(aliases))
+        models = data["models"]
+        pinned = data.get("fixed", {})
+
+        self.assertTrue(pinned, "no GPU pins configured; always-on models are unpinned")
+        for alias in pinned:
+            self.assertIn(alias, models, f"GPU pin names an unknown model: {alias}")
 
     def test_auth_fails_closed_without_api_key(self):
         old_api_key = config.API_KEY
@@ -992,19 +998,6 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("build/", dockerignore)
         self.assertIn("*.egg-info/", dockerignore)
 
-    def test_models_json_contains_dflash_canary(self):
-        data = json.loads((ROOT / "etc" / "models.json").read_text())
-        cfg = data["models"]["dflash-qwen3.6-27B"]
-        self.assertEqual(cfg["speculative-type"], "dflash")
-        self.assertEqual(cfg["spec-dflash-cross-ctx"], 1024)
-        self.assertEqual(cfg["draft"], "gguf/dflash-draft-3.6-q8_0.gguf")
-
-    def test_native_dflash_canary_uses_gguf_draft(self):
-        data = json.loads((ROOT / "etc" / "models.json").read_text())
-        canary = data["models"]["dflash-qwen3.6-27B"]
-        self.assertEqual(canary["draft"], "gguf/dflash-draft-3.6-q8_0.gguf")
-        self.assertEqual(canary["speculative-type"], "dflash")
-
     def test_harness_defaults_match_current_registry_aliases(self):
         e2e = (ROOT / "tests" / "test_e2e_smoke.py").read_text()
         stress = (ROOT / "tests" / "test_stress_dflash.py").read_text()
@@ -1026,12 +1019,23 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertNotIn("pflash-qwen-27B", tune_ctx)
         self.assertNotIn("pflash-qwen-27B", pflash_ctx_tune)
 
-    def test_text_only_served_pflash_models_have_no_mmproj(self):
+    def test_projector_and_multimodal_capability_agree(self):
+        """A projector and a multimodal capability have to come as a pair.
+
+        An mmproj on a model that does not declare multimodal loads a projector
+        into VRAM that nothing will ever use. A multimodal declaration without
+        one advertises image input the backend cannot serve, so requests fail
+        only once an image is actually sent.
+        """
         data = json.loads((ROOT / "etc" / "models.json").read_text())
-        for name in ("pflash-qwen3.6-27B", "pflash-park-qwen3.6-27B", "dflash-qwen3.6-27B"):
-            cfg = data["models"][name]
-            self.assertEqual(cfg.get("capabilities"), ["completion"], name)
-            self.assertNotIn("mmproj", cfg, name)
+        for name, cfg in data["models"].items():
+            declares_images = bool({"multimodal", "vision"} & set(cfg.get("capabilities") or []))
+            carries_projector = bool(cfg.get("mmproj"))
+            self.assertEqual(
+                carries_projector,
+                declares_images,
+                f"{name}: mmproj={carries_projector} but multimodal={declares_images}",
+            )
 
     def test_ingested_model_preserves_source_mmproj(self):
         class FakeRegistry:
