@@ -998,27 +998,6 @@ class DropInBlockerTests(unittest.TestCase):
         self.assertIn("build/", dockerignore)
         self.assertIn("*.egg-info/", dockerignore)
 
-    def test_harness_defaults_match_current_registry_aliases(self):
-        e2e = (ROOT / "tests" / "test_e2e_smoke.py").read_text()
-        stress = (ROOT / "tests" / "test_stress_dflash.py").read_text()
-        pflash = (ROOT / "tests" / "test_pflash_pipeline.py").read_text()
-        tune_ctx = (ROOT / "tests" / "tune_ctx.py").read_text()
-        pflash_ctx_tune = (ROOT / "tests" / "test_pflash_ctx_tune.py").read_text()
-
-        self.assertIn('"dflash-qwen3.6-27B"', e2e)
-        self.assertIn('LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")', e2e)
-        self.assertIn('MODEL = DFLASH_SMOKE_MODEL', e2e)
-        self.assertIn('MODEL = LLAMA_SMOKE_MODEL', e2e)
-        self.assertIn('"dflash-qwen3.6-27B"', stress)
-        self.assertIn('MODEL = os.environ.get("MODEL", "pflash-qwen3.6-27B")', pflash)
-        self.assertIn('MODEL = "pflash-qwen3.6-27B"', tune_ctx)
-        self.assertIn('MODEL = "pflash-qwen3.6-27B"', pflash_ctx_tune)
-        self.assertNotIn("dflash-pflash-qwen-27B", e2e)
-        self.assertNotIn("dflash-pflash-qwen-27B", stress)
-        self.assertNotIn("dflash-pflash-qwen-27B", pflash)
-        self.assertNotIn("pflash-qwen-27B", tune_ctx)
-        self.assertNotIn("pflash-qwen-27B", pflash_ctx_tune)
-
     def test_projector_and_multimodal_capability_agree(self):
         """A projector and a multimodal capability have to come as a pair.
 

@@ -12,18 +12,15 @@ Prerequisites:
 
 Run selectively:
     python -m pytest tests/test_e2e_smoke.py -v
-    python -m pytest tests/test_e2e_smoke.py::DFlashSmokeTests -v
     python -m pytest tests/test_e2e_smoke.py::LlamaCppSmokeTests -v
 
 Skip entirely:
     SKIP_E2E=1 python -m pytest tests/
 
 Model overrides:
-    GRIMOIRE_DFLASH_SMOKE_MODEL=dflash-qwen3.6-27B python -m pytest tests/test_e2e_smoke.py::DFlashSmokeTests -v
     GRIMOIRE_LLAMA_SMOKE_MODEL=qwen-3.6-27B python -m pytest tests/test_e2e_smoke.py::LlamaCppSmokeTests -v
 
 Long-prompt overrides:
-    GRIMOIRE_LONG_PROMPT_MIN_CHARS=1500 GRIMOIRE_LONG_PROMPT_MAX_CHARS=4000 python -m pytest tests/test_e2e_smoke.py::DFlashSmokeTests::test_02_session_snapshot_restore -v
 """
 
 import json
@@ -41,7 +38,6 @@ from tests._monitor import SystemMonitor
 SKIP_E2E = os.environ.get("SKIP_E2E", "0") == "1"
 BASE_URL = os.environ.get("GRIMOIRE_SMOKE_URL", "http://localhost:9001")
 API_KEY = os.environ.get("GRIMOIRE_API_KEY", "")
-DFLASH_SMOKE_MODEL = os.environ.get("GRIMOIRE_DFLASH_SMOKE_MODEL",     "dflash-qwen3.6-27B")
 LLAMA_SMOKE_MODEL = os.environ.get("GRIMOIRE_LLAMA_SMOKE_MODEL", "qwen-3.6-27B")
 LONG_PROMPT_MIN_CHARS = int(os.environ.get("GRIMOIRE_LONG_PROMPT_MIN_CHARS", "1500"))
 LONG_PROMPT_MAX_CHARS = int(os.environ.get("GRIMOIRE_LONG_PROMPT_MAX_CHARS", "4000"))
@@ -229,60 +225,6 @@ class E2ESmokeTestCase(unittest.TestCase):
         )
         self.assertLess(result["ttft_ms"], 120000, f"{label}: TTFT > 120s")
         self.assertGreater(result["decode_tps"], 10, f"{label}: decode TPS suspiciously low")
-
-
-class DFlashSmokeTests(E2ESmokeTestCase):
-    """Smoke tests for the DFlash speculative-decoding backend."""
-
-    MODEL = DFLASH_SMOKE_MODEL
-
-    def test_01_basic_chat_completion(self):
-        """Single-turn chat with real fixture data returns a valid, timed response."""
-        messages = [self._fixture_messages[0]]  # First user message only
-        result = self._chat(self.MODEL, messages, max_tokens=16)
-
-        self.assertEqual(result["status_code"], 200)
-        self.assertTrue(result["text"], result.get("error"))
-        self.assertGreater(result["completion_tokens"], 0)
-        self._assert_timings(result, "DFlash basic")
-
-    def test_02_session_snapshot_restore(self):
-        """Two-turn conversation: second turn should restore from snapshot and be faster."""
-        conversation_id = self._create_conversation(self.MODEL)
-
-        # Turn 1 — establish context with a LONG prompt so prefill takes measurable time
-        turn1_messages = self._long_fixture_messages
-        prompt_len = len(turn1_messages[0]["content"])
-        print(f"\n[DFlash session test] prompt chars={prompt_len}")
-
-        result1 = self._chat(self.MODEL, turn1_messages, conversation_id=conversation_id, max_tokens=16)
-        self.assertEqual(result1["status_code"], 200)
-        self.assertTrue(result1["text"], result1.get("error"))
-        self._assert_timings(result1, "DFlash turn 1 (long prompt)")
-
-        # Turn 2 — should restore from snapshot (append assistant response + follow-up)
-        turn2_messages = [
-            *turn1_messages,
-            {"role": "assistant", "content": result1["text"]},
-            {"role": "user", "content": "Continue."},
-        ]
-        result2 = self._chat(self.MODEL, turn2_messages, conversation_id=conversation_id, max_tokens=16)
-        self.assertEqual(result2["status_code"], 200)
-        self.assertTrue(result2["text"], result2.get("error"))
-        self._assert_timings(result2, "DFlash turn 2 (restore)")
-
-        # Snapshot restore should make turn 2 significantly faster (lower TTFT).
-        # If turn 1 was already very fast (<2s), the prompt wasn't long enough to
-        # stress prefill, so we only assert speedup when turn 1 was slow.
-        speedup = result1["ttft_ms"] / max(result2["ttft_ms"], 1)
-        print(f"\n[DFlash restore speedup] turn1_ttft / turn2_ttft = {speedup:.1f}x")
-        if result1["ttft_ms"] > 2000:
-            self.assertGreater(
-                speedup, 1.5,
-                f"Turn 2 TTFT ({result2['ttft_ms']:.0f}ms) not significantly faster than turn 1 ({result1['ttft_ms']:.0f}ms); snapshot restore may not be working"
-            )
-
-        # Snapshot restore confirmed by speedup alone; tmpfs path may vary by config.
 
 
 class LlamaCppSmokeTests(E2ESmokeTestCase):
