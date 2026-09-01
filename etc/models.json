@@ -866,6 +866,102 @@
       ],
       "added": "2026-08-27T04:02:46.186967+00:00"
     },
+    "qwen3.8-27B-uncensored-low": {
+      "file": "gguf/Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-Qwen3.8-27B-Uncensored-F16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/Qwen3.8-27B-Uncensored-draft-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 237568,
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": [
+        "--no-mmproj-offload",
+        "--ubatch-size",
+        "128",
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"low\"}"
+      ],
+      "added": "2026-09-01T04:52:54.700897+00:00"
+    },
+    "qwen3.8-27B-uncensored-medium": {
+      "file": "gguf/Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-Qwen3.8-27B-Uncensored-F16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/Qwen3.8-27B-Uncensored-draft-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 237568,
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": [
+        "--no-mmproj-offload",
+        "--ubatch-size",
+        "128",
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"medium\"}"
+      ],
+      "added": "2026-09-01T04:52:54.715749+00:00"
+    },
+    "qwen3.8-27B-uncensored-xhigh": {
+      "file": "gguf/Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+      "mmproj": "gguf/mmproj-Qwen3.8-27B-Uncensored-F16.gguf",
+      "speculative-type": "mtp",
+      "mtp-head": "gguf/Qwen3.8-27B-Uncensored-draft-Q4_0.gguf",
+      "family": "qwen",
+      "capabilities": [
+        "completion",
+        "multimodal"
+      ],
+      "cost": {
+        "input": 0.33,
+        "output": 3.25,
+        "cache_read": 0.1
+      },
+      "ctx-size": 237568,
+      "predict": -1,
+      "parallel": 1,
+      "n-gpu-layers": 999,
+      "image-min-tokens": 1024,
+      "image-max-tokens": 1024,
+      "cache-type-k": "turbo4",
+      "cache-type-v": "turbo4",
+      "extra-args": [
+        "--no-mmproj-offload",
+        "--ubatch-size",
+        "128",
+        "--chat-template-kwargs",
+        "{\"reasoning_effort\":\"xhigh\"}"
+      ],
+      "added": "2026-09-01T04:52:54.727160+00:00"
+    },
     "gemma-4-12b-it-qat-q4_0": {
       "file": "gguf/gemma-4-12b-it-qat-q4_0.gguf",
       "capabilities": [
