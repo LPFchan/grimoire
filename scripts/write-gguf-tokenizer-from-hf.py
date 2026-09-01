@@ -142,7 +142,7 @@ def main() -> None:
     parser.add_argument(
         "--llama-cpp-dir",
         type=Path,
-        default=Path("src/grimoire/pflash/deps/llama.cpp"),
+        default=Path("vendor/llama.cpp"),
         help="llama.cpp checkout containing gguf-py",
     )
     parser.add_argument("--min-id", type=int, default=0, help="lowest token id to rewrite")

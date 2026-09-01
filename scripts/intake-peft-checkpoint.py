@@ -13,7 +13,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CONVERTER_IN_CONTAINER = "/app/src/grimoire/pflash/deps/llama.cpp/convert_lora_to_gguf.py"
+CONVERTER_IN_CONTAINER = "/app/vendor/llama.cpp/convert_lora_to_gguf.py"
 
 
 def _sha256(path: Path) -> str:

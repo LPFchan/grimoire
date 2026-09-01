@@ -232,6 +232,10 @@ COPY etc/models.json /etc/grimoire/models.json
 # Install Python dependencies
 COPY pyproject.toml README.md /app/
 COPY src/ /app/src/
+
+# llama.cpp conversion tooling used by scripts/intake-peft-checkpoint.py and
+# scripts/write-gguf-tokenizer-from-hf.py. Not imported by the gateway.
+COPY vendor/ /app/vendor/
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3.11 -m venv /opt/grimoire-venv \
     && /opt/grimoire-venv/bin/pip install --upgrade pip \
