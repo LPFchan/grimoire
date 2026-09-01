@@ -7,29 +7,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from grimoire.plugins import DFLASH_AWARENESS_MARKER, DflashPflashAwarenessPlugin
+# The package's __init__ re-exports plugin classes but not their constants,
+# so the marker comes from the module that defines it.
+from grimoire.plugins import PflashAwarenessPlugin
+from grimoire.plugins.pflash_awareness import PFLASH_AWARENESS_MARKER
 
 
-class DflashPflashAwarenessPluginTests(unittest.TestCase):
+class PflashAwarenessPluginTests(unittest.TestCase):
     def setUp(self):
-        self.plugin = DflashPflashAwarenessPlugin()
+        self.plugin = PflashAwarenessPlugin()
         self.model_cfg = {
-            "speculative-type": "dflash",
+            "speculative-type": "pflash",
             "drafter": "gguf/Qwen3-0.6B-BF16.gguf",
             "prefill-compression": "auto",
             "prefill-threshold": 48000,
         }
 
-    def test_injects_runtime_note_for_recall_aware_dflash_requests(self):
+    def test_injects_runtime_note_for_recall_aware_pflash_requests(self):
         payload = {
             "messages": [{"role": "user", "content": "ping"}],
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen3.6-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "pflash-model", dict(self.model_cfg))
 
         self.assertEqual(result["messages"][0]["role"], "system")
-        self.assertIn(DFLASH_AWARENESS_MARKER, result["messages"][0]["content"])
+        self.assertIn(PFLASH_AWARENESS_MARKER, result["messages"][0]["content"])
         self.assertIn("48,000+", result["messages"][0]["content"])
         self.assertIn("conversation_recall", result["messages"][0]["content"])
         self.assertEqual(result["messages"][1], payload["messages"][0])
@@ -43,11 +46,11 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "functions": [{"name": "conversation_recall"}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen3.6-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "pflash-model", dict(self.model_cfg))
 
         self.assertEqual(len(result["messages"]), 2)
         self.assertIn("You are terse.", result["messages"][0]["content"])
-        self.assertIn(DFLASH_AWARENESS_MARKER, result["messages"][0]["content"])
+        self.assertIn(PFLASH_AWARENESS_MARKER, result["messages"][0]["content"])
         self.assertIn("conversation_recall", result["messages"][0]["content"])
 
     def test_appends_to_existing_system_text_parts_without_second_system(self):
@@ -59,13 +62,13 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen3.6-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "pflash-model", dict(self.model_cfg))
 
         self.assertEqual([message["role"] for message in result["messages"]], ["system", "user"])
         self.assertIsInstance(result["messages"][0]["content"], list)
         rendered = "".join(part.get("text", "") for part in result["messages"][0]["content"])
         self.assertIn("You are terse.", rendered)
-        self.assertIn(DFLASH_AWARENESS_MARKER, rendered)
+        self.assertIn(PFLASH_AWARENESS_MARKER, rendered)
         self.assertIn("conversation_recall", rendered)
 
     def test_skips_requests_without_conversation_recall(self):
@@ -74,11 +77,11 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "bash"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen3.6-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "pflash-model", dict(self.model_cfg))
 
         self.assertEqual(result, payload)
 
-    def test_skips_when_dflash_pflash_is_not_available(self):
+    def test_skips_when_pflash_is_not_available(self):
         payload = {
             "messages": [{"role": "user", "content": "ping"}],
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
@@ -86,8 +89,8 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
 
         for cfg in [
             {"backend": "llama", "speculative-type": "none", "drafter": "gguf/Qwen3-0.6B-BF16.gguf", "prefill-compression": "auto"},
-            {"speculative-type": "dflash", "drafter": "gguf/Qwen3-0.6B-BF16.gguf", "prefill-compression": "never"},
-            {"speculative-type": "dflash", "prefill-compression": "auto"},
+            {"speculative-type": "pflash", "drafter": "gguf/Qwen3-0.6B-BF16.gguf", "prefill-compression": "never"},
+            {"speculative-type": "pflash", "prefill-compression": "auto"},
         ]:
             with self.subTest(cfg=cfg):
                 result = self.plugin.before_request(copy.deepcopy(payload), "model", cfg)
@@ -96,15 +99,15 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
     def test_does_not_duplicate_existing_runtime_note(self):
         payload = {
             "messages": [
-                {"role": "system", "content": f"Existing note\n\n{DFLASH_AWARENESS_MARKER} already here"},
+                {"role": "system", "content": f"Existing note\n\n{PFLASH_AWARENESS_MARKER} already here"},
                 {"role": "user", "content": "ping"},
             ],
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen3.6-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "pflash-model", dict(self.model_cfg))
 
-        self.assertEqual(result["messages"][0]["content"].count(DFLASH_AWARENESS_MARKER), 1)
+        self.assertEqual(result["messages"][0]["content"].count(PFLASH_AWARENESS_MARKER), 1)
 
     def test_does_not_duplicate_existing_runtime_note_in_text_parts(self):
         payload = {
@@ -112,7 +115,7 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
                 {
                     "role": "system",
                     "content": [
-                        {"type": "text", "text": f"Existing note\n\n{DFLASH_AWARENESS_MARKER} already here"},
+                        {"type": "text", "text": f"Existing note\n\n{PFLASH_AWARENESS_MARKER} already here"},
                     ],
                 },
                 {"role": "user", "content": "ping"},
@@ -120,10 +123,10 @@ class DflashPflashAwarenessPluginTests(unittest.TestCase):
             "tools": [{"type": "function", "function": {"name": "conversation_recall"}}],
         }
 
-        result = self.plugin.before_request(copy.deepcopy(payload), "dflash-qwen3.6-27B", dict(self.model_cfg))
+        result = self.plugin.before_request(copy.deepcopy(payload), "pflash-model", dict(self.model_cfg))
 
         rendered = "".join(part.get("text", "") for part in result["messages"][0]["content"])
-        self.assertEqual(rendered.count(DFLASH_AWARENESS_MARKER), 1)
+        self.assertEqual(rendered.count(PFLASH_AWARENESS_MARKER), 1)
 
 
 if __name__ == "__main__":
