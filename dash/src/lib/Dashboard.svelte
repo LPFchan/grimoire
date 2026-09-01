@@ -351,25 +351,21 @@
 </script>
 
 <div class="flex h-full w-full flex-col overflow-auto px-6 py-6 md:px-10 md:py-8">
-	<header class="sticky top-0 z-10 -mx-6 -mt-6 mb-8 flex flex-wrap items-center justify-between gap-4 bg-background/80 px-6 py-3 backdrop-blur">
-		<div class="text-sm font-medium tracking-widest text-muted-foreground uppercase">Grimoire</div>
-
-		<div class="flex items-center gap-3">
-			<div class="inline-flex rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Window">
-				{#each WINDOWS as w}
-					<button
-						type="button"
-						role="tab"
-						aria-selected={selectedWindow === w.id}
-						class="rounded-md px-3 py-1 text-sm transition {selectedWindow === w.id
-							? 'bg-background font-medium shadow-sm'
-							: 'text-muted-foreground hover:text-foreground'}"
-						onclick={() => (selectedWindow = w.id)}
-					>
-						{w.label}
-					</button>
-				{/each}
-			</div>
+	<header class="sticky top-0 z-10 -mx-6 -mt-6 mb-8 flex flex-wrap items-center justify-end gap-4 px-6 py-3">
+		<div class="inline-flex rounded-lg border bg-muted/30 p-1" role="tablist" aria-label="Window">
+			{#each WINDOWS as w}
+				<button
+					type="button"
+					role="tab"
+					aria-selected={selectedWindow === w.id}
+					class="rounded-md px-3 py-1 text-sm transition {selectedWindow === w.id
+						? 'bg-background font-medium shadow-sm'
+						: 'text-muted-foreground hover:text-foreground'}"
+					onclick={() => (selectedWindow = w.id)}
+				>
+					{w.label}
+				</button>
+			{/each}
 		</div>
 	</header>
 
