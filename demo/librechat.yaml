@@ -5,10 +5,10 @@ endpoints:
       apiKey: "${OPENAI_API_KEY}"
       baseURL: "http://grimoire:9001/v1"
       models:
-        default: ["dflash-qwen3.6-27B"]
+        default: ["qwen3.8-27B-low"]
         fetch: true
-      titleModel: "dflash-qwen3.6-27B"
-      summarizeModel: "dflash-qwen3.6-27B"
+      titleModel: "qwen3.8-27B-low"
+      summarizeModel: "qwen3.8-27B-low"
       dropParams:
         - user
         - stream_options

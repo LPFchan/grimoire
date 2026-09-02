@@ -9,7 +9,7 @@ services:
       - OPENAI_API_KEY=7JcW7xX82ypTQPlsYle6XdjlBSWfG3NwbtYSRSXZQ88
       - WEBUI_SECRET_KEY=QsE40suDucdlDeRaVpY1Dbh0ls4-ld_SYqEXr3k6RTI
       - ENABLE_SIGNUP=true
-      - DEFAULT_MODELS=dflash-qwen3.6-27B
+      - DEFAULT_MODELS=qwen3.8-27B-low
     volumes:
       - open-webui-data:/app/backend/data
     networks:

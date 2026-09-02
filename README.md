@@ -1,10 +1,10 @@
 # Grimoire
 
-Multi-GPU inference gateway: llama.cpp + DFlash speculative decoding behind an OpenAI-compatible `/v1` API.
+Multi-GPU inference gateway: llama.cpp with MTP/NextN speculative decoding behind an OpenAI-compatible `/v1` API.
 
 ```
 client ──/v1──► chat.lost.plus (CF Tunnel) ──► grimoire :9001 ──┬── GPU 0: llama model A
-                                                                 ├── GPU 1: dflash model
+                                                                 ├── GPU 1: llama model B
                                                                  └── GPU N: llama model Z
 ```
 
@@ -51,17 +51,16 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
       "cache-type-v": "turbo4",
       "extra-args": ["--tensor-split", "1,1"]
     },
-    "dflash-qwen3.6-27B": {
-      "file": "gguf/Qwen3.6-27B-Q4_K_M.gguf",
-      "draft": "gguf/dflash-draft-3.6-q8_0.gguf",
-      "speculative-type": "dflash",
-      "spec-dflash-cross-ctx": 1024,
+    "gemma-4-mtp-31B": {
+      "file": "gguf/Gemma4-31B-Q4_K_M.gguf",
+      "mtp-head": "gguf/gemma4-mtp-head-q8_0.gguf",
+      "speculative-type": "mtp",
       "ctx-size": 184832,
       "cache-type-k": "q8_0",
       "cache-type-v": "q8_0",
       "fa-window": 2048,
       "budget": 18,
-      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/dflash-qwen3.6-27B",
+      "kv-cache-disk-dir": "/var/lib/grimoire/kv_cache/gemma-4-mtp-31B",
       "kv-cache-ram-budget-mb": 512,
       "kv-cache-disk-budget-mb": 2048,
       "kv-cache-ttl-hours": 168
@@ -75,7 +74,7 @@ Seed at `/etc/grimoire/models.json`, persisted to `/var/lib/grimoire/models.json
 
 - `models` — model definitions; `gpu-ids` optionally assigns one ordinary llama-server process to an ordered list of physical GPUs
 - The first `gpu-ids` member is the primary physical GPU reported by the backward-compatible `gpu` field. llama.cpp defaults to layer splitting; `extra-args` may set `--tensor-split` proportions in the same visible-device order.
-- `gpu-ids` is initially incompatible with `cpu-only`, `vram-budget-mib`, PFlash, park/unpark, and native DFlash models
+- `gpu-ids` is initially incompatible with `cpu-only` and `vram-budget-mib`
 - `fixed` — alias → GPU ID (pinned, never evicted); for a model with `gpu-ids`, the fixed ID must equal the first member
 - `predict` — maximum generated tokens passed to llama-server; `-1` means no separate output cap, so generation is limited by the model context and stop conditions
 
@@ -93,7 +92,7 @@ curl -X POST "$GRIMOIRE_ORIGIN/models/qwen/unpin" -H "Authorization: Bearer $GRI
 
 `clone` runs one llama-server process sharded across the ordered GPUs; it does not create a replica. Clone/declone reload active models with rollback on failure. Pin reloads only when residency must move; unpin changes eviction protection without moving a running model. `/status` keeps `gpu`/`gpus` for actual residency and reports requested placement, placement/pin sources, and runtime overrides separately. Locked presets clear runtime overrides and reconcile target models; manual-control presets retain them but enforce their GPU mask.
 - Dynamic allocation: free GPU preferred, oldest non-pinned evicted when all busy
-- All models use `backend: "llama"` (Bee `llama-server` HTTP) — the legacy `backend: "dflash"` daemon path is retired
+- All models use `backend: "llama"` (`llama-server` HTTP); it is the only backend
 
 ### Prompt Cache Reuse
 
@@ -114,35 +113,26 @@ Content-hash KV caching replaces the legacy snapshot daemon. On every decode, th
 
 Content-hash deduplication means two conversations with the same system prompt share a single cached KV entry, skipping re-prefill entirely.
 
-### DFlash Speculative Decoding
+### Speculative Decoding
 
-DFlash uses Bee's native `--spec-type dflash` with a GGUF draft model (`dflash-draft-3.6-q8_0.gguf`). The canary serves text-only chat with `ctx-size=60000`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, and `fa-window=2048`.
+Two modes, both driven by `speculative-type` in the model config:
 
-### PFlash Compression
+- `nextn` — Qwen models whose MTP layers live in the same GGUF. The server
+  auto-detects them, so no separate draft model is loaded.
+- `mtp` — Gemma4 models with a separate assistant GGUF, passed via `mtp-head`.
 
-Prompt split on `len(prompt_ids) >= prefill_threshold`:
+Both emit `--spec-type draft-mtp`. Any other value is rejected at validation
+rather than silently ignored, because the launcher would otherwise load an
+ordinary non-speculative model that looks like it worked.
 
-```
-[ HEAD: system + first user block             ]
-[ MIDDLE: compressible blocks at 5%           ]
-[ TAIL: protected recent whole blocks         ]
-[ TOOLS: protected tool blocks stay exact     ]
-```
-
-Head, protected tool blocks, and recent tail blocks stay uncompressed. Compressible middle blocks are scored by the standalone `pflash_daemon` (extracted to `src/grimoire/pflash/`).
-
-**Tuned values**: `max-effective-context=60000`, `prefill-threshold=48000`, `prefill-tail-budget=16000`, `prefill-keep-ratio=0.05`, `cache-type-k=q8_0`, `cache-type-v=q8_0`, `fa-window=2048`, `budget=18`.
+DFlash and PFlash were retired in DEC-20260902-001.
 
 ## Building
 
 ```bash
 git clone --recursive <repo> ~/grimoire
 cd ~/grimoire
-docker compose build        # ~90 min first build (llama.cpp + DFlash)
-
-# update dflash submodule:
-git submodule update --remote dflash
-docker compose build
+docker compose build        # ~90 min first build (llama.cpp)
 ```
 
 ## Systemd
