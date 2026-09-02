@@ -1,11 +1,9 @@
-"""Prompt and KV caching.
+"""KV cache for llama-server slots.
 
-`KVCacheStore` holds llama.cpp KV slots keyed by a content hash of the prompt
-prefix, tiered RAM to disk. `PromptBlock` describes the block layout those
-prefixes are addressed by.
+`KVCacheStore` holds slots keyed by a content hash of the prompt prefix, tiered
+from RAM (tmpfs) to disk.
 """
 
-from grimoire.cache.blocks import PromptBlock
 from grimoire.cache.kv_cache_store import KVCacheStore
 
-__all__ = ["KVCacheStore", "PromptBlock"]
+__all__ = ["KVCacheStore"]

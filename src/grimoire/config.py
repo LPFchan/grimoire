@@ -109,8 +109,6 @@ DASHBOARD_BINS = 60
 SUPPORTED_SPECULATIVE_TYPES = {"nextn", "mtp"}
 RETIRED_MODEL_FIELDS = ("pflash", "park-unpark")
 
-# Tool results whose blocks must never be dropped from a rendered prompt.
-PROTECTED_TOOLS = {"obsidian_read-note"}
 # Default generation parameters (for /props synthetic response)
 DEFAULT_GENERATION_PARAMS = {
     "n_predict": DEFAULT_PREDICT,

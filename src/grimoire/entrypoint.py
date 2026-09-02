@@ -66,20 +66,6 @@ from grimoire.registry import (
     _looks_like_local_path,
     BACKEND_LLAMA,
 )
-from grimoire.prompt import _tool_name_from_message
-from grimoire.prompt.qwen import (
-    _qwen_prompt_block_specs,
-    _qwen_prompt_blocks,
-    _prompt_block_cache_for,
-    _tokenize_qwen_prompt_blocks,
-    _encode_qwen_prompt_blocks,
-)
-from grimoire.prompt.generic import (
-    _generic_prompt_blocks,
-    _prompt_layout_from_messages,
-    _prefix_cache_boundaries,
-    _prompt_ids_from_messages,
-)
 from grimoire.model_manager import (
     build_cmd,
     ActiveModel,
