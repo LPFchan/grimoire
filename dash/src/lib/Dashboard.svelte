@@ -113,8 +113,9 @@
 
 	$effect(() => {
 		const sync = () => {
+			const wasVisible = visible;
 			visible = document.visibilityState === 'visible';
-			if (visible) void refresh();
+			if (visible && !wasVisible) void refresh();
 		};
 		sync();
 		document.addEventListener('visibilitychange', sync);

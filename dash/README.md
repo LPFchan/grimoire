@@ -87,3 +87,8 @@ looks: the gateway process that answers `/stats` is the same one that serves
 chat. An earlier version polled every second regardless of window, which on the
 "All" view meant a permanent queue of multi-second database scans in front of
 every model request. The server caches payloads on the same schedule.
+
+Historical chart ceilings are maintained alongside incoming telemetry. A page
+load reads those small records directly; it never scans raw history to rediscover
+the same all-time peaks. The browser also issues only one initial refresh, then
+refreshes again when a hidden tab becomes visible.

@@ -132,8 +132,46 @@ class TelemetryStore:
                     bucket_s INTEGER PRIMARY KEY,
                     rolled_through_ts INTEGER NOT NULL
                 );
+
+                -- Chart ceilings need the all-time peak for a handful of
+                -- sensors. Keep those peaks current as samples arrive so a
+                -- dashboard render never rescans the raw telemetry history.
+                CREATE TABLE IF NOT EXISTS system_observed_max (
+                    metric TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL,
+                    max_value REAL NOT NULL,
+                    PRIMARY KEY (metric, gpu_index)
+                ) WITHOUT ROWID;
                 """
             )
+            # Populate the table once when upgrading an existing database. The
+            # raw history contains the true peaks; rollups preserve a usable
+            # value for installations that already prune old raw samples.
+            has_observed_max = conn.execute(
+                "SELECT 1 FROM system_observed_max LIMIT 1"
+            ).fetchone()
+            if not has_observed_max:
+                conn.execute(
+                    """
+                    INSERT INTO system_observed_max (metric, gpu_index, max_value)
+                    SELECT metric, gpu_index, MAX(value)
+                    FROM system_samples
+                    GROUP BY metric, gpu_index
+                    ON CONFLICT (metric, gpu_index) DO UPDATE SET
+                        max_value = MAX(system_observed_max.max_value, excluded.max_value)
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT INTO system_observed_max (metric, gpu_index, max_value)
+                    SELECT metric, gpu_index, MAX(sum_value / sample_count)
+                    FROM system_rollup
+                    WHERE sample_count > 0
+                    GROUP BY metric, gpu_index
+                    ON CONFLICT (metric, gpu_index) DO UPDATE SET
+                        max_value = MAX(system_observed_max.max_value, excluded.max_value)
+                    """
+                )
 
     def record(self, ts, samples):
         """Insert a batch of (gpu_index, metric, value) tuples at one timestamp."""
@@ -144,6 +182,15 @@ class TelemetryStore:
             conn.executemany(
                 "INSERT INTO system_samples (ts, gpu_index, metric, value) VALUES (?,?,?,?)",
                 rows,
+            )
+            conn.executemany(
+                """
+                INSERT INTO system_observed_max (metric, gpu_index, max_value)
+                VALUES (?, ?, ?)
+                ON CONFLICT (metric, gpu_index) DO UPDATE SET
+                    max_value = MAX(system_observed_max.max_value, excluded.max_value)
+                """,
+                [(metric, gpu, value) for _, gpu, metric, value in rows],
             )
 
     def prune(self, older_than_ts):
@@ -383,27 +430,11 @@ class TelemetryStore:
         return [sums[i] / counts[i] if counts[i] else None for i in range(bins)]
 
     def observed_max(self, metric, gpu_index):
-        """Highest value this host has been seen to reach for a metric.
-
-        Used to derive a chart ceiling for sensors whose hardware will not state
-        a limit — CPU temperature and package power, and fan speed. Prefers raw
-        samples, which hold true instantaneous peaks; falls back to the
-        per-minute tier when retention has pruned the raw rows away, accepting
-        that a one-minute mean understates a brief spike.
-        """
+        """Highest value this host has been seen to reach for a metric."""
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT MAX(value) AS v FROM system_samples WHERE metric=? AND gpu_index=?",
+                "SELECT max_value AS v FROM system_observed_max WHERE metric=? AND gpu_index=?",
                 (metric, gpu_index),
-            ).fetchone()
-            if row and row["v"] is not None:
-                return float(row["v"])
-            row = conn.execute(
-                """
-                SELECT MAX(sum_value / sample_count) AS v FROM system_rollup
-                WHERE bucket_s=? AND metric=? AND gpu_index=? AND sample_count > 0
-                """,
-                (ROLLUP_TIERS[0], metric, gpu_index),
             ).fetchone()
         return float(row["v"]) if row and row["v"] is not None else None
 

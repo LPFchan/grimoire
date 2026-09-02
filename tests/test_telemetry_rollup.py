@@ -172,6 +172,47 @@ def test_wal_is_enabled(store):
         assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
 
 
+def test_observed_max_is_maintained_with_samples(store):
+    """Chart scales read one precomputed row rather than scanning raw history."""
+    s, _ = store
+    s.record(100, [(0, "cpu_temp", 51.0), (0, "cpu_temp", 63.0)])
+    s.record(105, [(0, "cpu_temp", 58.0)])
+
+    assert s.observed_max("cpu_temp", 0) == 63.0
+
+    with sqlite3.connect(s.path) as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN "
+            "SELECT max_value FROM system_observed_max WHERE metric=? AND gpu_index=?",
+            ("cpu_temp", 0),
+        ).fetchall()
+    assert any("PRIMARY KEY" in row[-1] for row in plan)
+
+
+def test_observed_max_backfills_existing_history(store):
+    """An upgraded database makes old peaks immediately available."""
+    s, telemetry = store
+    s.record(100, [(0, "fan1_rpm", 1200.0), (0, "fan1_rpm", 2400.0)])
+    with sqlite3.connect(s.path) as conn:
+        conn.execute("DELETE FROM system_observed_max")
+
+    reopened = telemetry.TelemetryStore(s.path)
+    assert reopened.observed_max("fan1_rpm", 0) == 2400.0
+
+
+def test_observed_max_survives_raw_retention(store):
+    """Pruning detail must not discard the all-time chart ceiling."""
+    s, telemetry = store
+    base = 1_700_000_000 // telemetry.ROLLUP_BUCKET_S * telemetry.ROLLUP_BUCKET_S
+    s.record(base, [(0, "cpu_power", 212.0)])
+    s.record(base + 5, [(0, "cpu_power", 80.0)])
+    while s.roll_up(now_ts=base + 120):
+        pass
+    s.prune(base + 120)
+
+    assert s.observed_max("cpu_power", 0) == 212.0
+
+
 # --- tiering ---------------------------------------------------------------
 
 
