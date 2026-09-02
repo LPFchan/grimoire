@@ -1,9 +1,9 @@
 .git
 .gitignore
 .gitattributes
-__pycache__/
-*.pyc
-*.pyo
+**/__pycache__/
+**/*.pyc
+**/*.pyo
 *.egg-info/
 .eggs/
 build/
@@ -25,3 +25,4 @@ tmp/
 records/
 skills/
 node_modules/
+**/.DS_Store
