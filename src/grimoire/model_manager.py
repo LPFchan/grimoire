@@ -427,6 +427,10 @@ class ActiveModel:
     def stop(self):
         """Stop the backend process."""
         self._stop_llama()
+        # The server's KV slots die with the process. Clear the marker for the
+        # conversation that was resident, or the next request for it sees a
+        # match, skips the restore, and runs against an empty slot.
+        self._current_conv_id = None
 
     def _stop_llama(self):
         """Stop the llama-server process."""

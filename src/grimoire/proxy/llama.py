@@ -18,6 +18,11 @@ from grimoire.registry import registry
 
 logger = logging.getLogger(__name__)
 
+# llama-server slot reserved for conversation KV save/restore. The slot lock
+# serialises access to it, and requests carrying a conversation id are pinned
+# here so the cache is restored into the slot that actually serves them.
+CONVERSATION_SLOT = 0
+
 
 def _slot_lock(active):
     lock = getattr(active, "_kv_slot_lock", None)
@@ -186,10 +191,18 @@ async def _proxy_chat(
 
         if needs_slot_guard:
             # Three-tier KV cache: VRAM -> RAM (tmpfs) -> SSD.
-            # The guard is only for slot-0 save/restore mutations; ordinary
-            # chat completions must stay concurrent so llama-server can use
-            # its configured parallel slots.
-            slot_url = f"http://127.0.0.1:{active.port}/slots/0"
+            # The guard is only for slot save/restore mutations; ordinary chat
+            # completions carry no conversation id, skip this branch entirely,
+            # and stay concurrent across llama-server's configured slots.
+            #
+            # Pin the request to the same slot we save and restore. Without
+            # this, llama-server assigns any idle slot (`id_slot` defaults to
+            # -1), so on a model running more than one slot the cache would be
+            # restored into slot 0 while the request ran somewhere else. That is
+            # invisible today only because every registered model sets
+            # parallel=1.
+            payload["id_slot"] = CONVERSATION_SLOT
+            slot_url = f"http://127.0.0.1:{active.port}/slots/{CONVERSATION_SLOT}"
             prev_conv = getattr(active, "_current_conv_id", None)
             if validated_conversation_id and validated_conversation_id != prev_conv:
                 # Same-model conversation switch: save old to tmpfs, restore target.
