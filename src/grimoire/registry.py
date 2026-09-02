@@ -410,6 +410,16 @@ class ModelRegistry:
             model_path = os.path.join(MODELS_DIR, cfg["file"])
             if not os.path.exists(model_path):
                 return False, f"Model file not found at {model_path}"
+            spec_type = cfg.get("speculative-type")
+            if spec_type and spec_type not in config.SUPPORTED_SPECULATIVE_TYPES:
+                supported = ", ".join(sorted(config.SUPPORTED_SPECULATIVE_TYPES))
+                return False, (
+                    f"Unsupported speculative-type '{spec_type}' "
+                    f"(supported: {supported})"
+                )
+            for field in config.RETIRED_MODEL_FIELDS:
+                if cfg.get(field):
+                    return False, f"'{field}' is no longer supported"
         else:
             return False, f"Unknown backend '{backend}'"
 

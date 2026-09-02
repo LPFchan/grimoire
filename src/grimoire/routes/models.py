@@ -11,7 +11,12 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from grimoire.auth import require_api, require_admin
-from grimoire.config import DEFAULT_CTX_SIZE, DEFAULT_GENERATION_PARAMS
+from grimoire.config import (
+    DEFAULT_CTX_SIZE,
+    DEFAULT_GENERATION_PARAMS,
+    RETIRED_MODEL_FIELDS,
+    SUPPORTED_SPECULATIVE_TYPES,
+)
 from grimoire.ingest import download_model_file, model_filename_from_url, parse_hf_url, download_model_file_with_progress, _DownloadCancelled, MAX_BYTES as INGEST_MAX_BYTES
 from grimoire.registry import MODELS_DIR, registry
 
@@ -256,6 +261,15 @@ def _validate_model_config(data: dict, gpu_count=None) -> None:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     spec_type = data.get("speculative-type")
+    if spec_type and spec_type not in SUPPORTED_SPECULATIVE_TYPES:
+        supported = ", ".join(sorted(SUPPORTED_SPECULATIVE_TYPES))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported speculative-type '{spec_type}' (supported: {supported})",
+        )
+    for field in RETIRED_MODEL_FIELDS:
+        if data.get(field):
+            raise HTTPException(status_code=400, detail=f"'{field}' is no longer supported")
     if spec_type == "mtp":
         if not data.get("mtp-head"):
             raise HTTPException(status_code=400, detail="'mtp-head' is required when speculative-type is 'mtp'")

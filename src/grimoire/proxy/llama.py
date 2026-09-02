@@ -7,8 +7,6 @@ import json
 import logging
 import re
 
-import httpx
-from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from grimoire import config
@@ -16,8 +14,7 @@ from grimoire.chat_template import apply_chat_template_kwargs
 from grimoire.proxy.client import get_proxy_client
 from grimoire.cache import KVCacheStore
 from grimoire.plugins import plugin_manager
-from grimoire.prompt.generic import _prefix_cache_boundaries, _prompt_layout_from_messages
-from grimoire.registry import registry, resolve_path
+from grimoire.registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -125,34 +122,6 @@ def _apply_model_logit_bias(payload, model_cfg):
     if merged:
         payload["logit_bias"] = merged
     return payload
-
-
-async def _try_restore_kv(client, slot_url, prompt_ids, store, log, override_hash=None):
-    h = override_hash or store.hash_prefix(prompt_ids)
-    path = store.lookup(h)
-    if not path:
-        return None
-    try:
-        rr = await client.post(f"{slot_url}?action=restore",
-            json={"filename": path.name}, timeout=5)
-        if rr.status_code == 200:
-            return h
-    except Exception:
-        pass
-    return None
-
-
-async def _save_kv(sc, slot_url, hash_bytes, store, log):
-    filename = store.kv_filename(hash_bytes)
-    try:
-        rr = await sc.post(f"{slot_url}?action=save",
-            json={"filename": filename}, timeout=10)
-        if rr.status_code == 200:
-            store.register(hash_bytes)
-            return True
-    except Exception as e:
-        log.warning(f"kv cache: save failed for {filename}: {e}")
-    return False
 
 
 def _telemetry_gpu_index(active):

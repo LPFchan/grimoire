@@ -796,12 +796,17 @@ class DropInBlockerTests(unittest.TestCase):
         finally:
             mm_module.registry = old_registry
 
-    def test_llama_proxy_scopes_slot_files_and_serializes_slot_zero_per_model(self):
+    def test_llama_proxy_serializes_slot_zero_mutations(self):
+        """Slot-0 save/restore must stay behind the per-model guard.
+
+        Scoping of the lock itself is covered behaviourally by
+        tests/test_llama_proxy.py::LlamaProxyTests::test_slot_lock_is_scoped_per_active_model;
+        this only pins that the guard is acquired and always released.
+        """
         llama_proxy = (ROOT / "src" / "grimoire" / "proxy" / "llama.py").read_text()
         self.assertIn('lock = getattr(active, "_kv_slot_lock", None)', llama_proxy)
         self.assertIn('await slot_guard.acquire()', llama_proxy)
         self.assertIn('slot_guard.release()', llama_proxy)
-        self.assertIn('store.kv_filename(hash_bytes)', llama_proxy)
 
     def test_invalid_history_id_is_ignored_without_orphan_creation(self):
         class FakeHistoryStore:

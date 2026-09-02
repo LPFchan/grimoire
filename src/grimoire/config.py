@@ -102,6 +102,13 @@ DASHBOARD_WINDOWS_S = {
 }
 DASHBOARD_BINS = 60
 
+# Speculative decoding modes the launcher actually implements. Anything else is
+# rejected rather than quietly ignored: model_manager only emits --spec-type for
+# these, so an unrecognised value would load a plain non-speculative model and
+# look like it worked. DFlash and PFlash were retired in DEC-20260902-001.
+SUPPORTED_SPECULATIVE_TYPES = {"nextn", "mtp"}
+RETIRED_MODEL_FIELDS = ("pflash", "park-unpark")
+
 # Tool results whose blocks must never be dropped from a rendered prompt.
 PROTECTED_TOOLS = {"obsidian_read-note"}
 # Default generation parameters (for /props synthetic response)
